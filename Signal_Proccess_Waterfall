@@ -1,0 +1,3142 @@
+import os
+import sys
+import numpy as np
+import pandas as pd
+
+from PyQt5.QtCore import Qt, QObject, QThread, pyqtSignal, pyqtSlot, QRectF
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QFileDialog, QComboBox, QDoubleSpinBox,
+    QCheckBox, QMessageBox, QListWidget, QListWidgetItem,
+    QAbstractItemView, QTabWidget, QSpinBox, QSizePolicy, QProgressBar,
+    QScrollArea, QGridLayout, QFrame, QToolButton, QLineEdit,
+    QDialog, QDialogButtonBox, QFormLayout,
+)
+
+# --- PyQtGraph: interactive / fast plotting ---
+try:
+    import pyqtgraph as pg
+    _HAVE_PG = True
+except Exception:
+    pg = None
+    _HAVE_PG = False
+
+try:
+    import pyqtgraph.opengl as gl
+    _HAVE_PG_GL = True
+except Exception:
+    gl = None
+    _HAVE_PG_GL = False
+
+# --- Matplotlib: export/report only ---
+import matplotlib
+matplotlib.use("Agg")
+matplotlib.rcParams["path.simplify"] = True
+matplotlib.rcParams["path.simplify_threshold"] = 1.0
+matplotlib.rcParams["agg.path.chunksize"] = 10000
+from matplotlib.figure import Figure
+
+# --- TDMS (npTDMS) ---
+try:
+    from nptdms import TdmsFile
+    _HAVE_TDMS = True
+except Exception:
+    TdmsFile = None
+    _HAVE_TDMS = False
+
+# --- SciPy (Butterworth + zero-phase) ---
+try:
+    from scipy.signal import butter, sosfiltfilt
+    _HAVE_SCIPY = True
+except Exception:
+    butter = None
+    sosfiltfilt = None
+    _HAVE_SCIPY = False
+
+if _HAVE_PG:
+    pg.setConfigOptions(antialias=False, imageAxisOrder="row-major")
+
+G0 = 9.80665           # m/s^2 per g
+VEL_SCALE = 1000.0     # m/s -> mm/s
+VEL_UNIT = "mm/s"
+
+
+class InteractivePlotWidget(QWidget):
+    clicked = pyqtSignal()
+
+    def __init__(self, mini=False):
+        super().__init__()
+        self.mini = bool(mini)
+        self.plot_state = None
+        self.plot_key = None
+
+        self._plot_widget = None
+        self._plot_item = None
+        self._view_box = None
+        self._mouse_proxy = None
+        self._home_range = None
+        self._rect_zoom_active = False
+
+        self.enable_click_annotations = not self.mini
+        self._click_annotations = []
+
+        self.hover_label = QLabel(self)
+        self.hover_label.setVisible(False)
+        self.hover_label.setStyleSheet(
+            "background: rgba(255,255,255,230); border: 1px solid #666; padding: 2px 4px;"
+        )
+
+        self.root = QVBoxLayout(self)
+        self.root.setContentsMargins(0, 0, 0, 0)
+
+    def clear_plot(self):
+        self._clear_click_annotations()
+
+        self.plot_state = None
+        self.plot_key = None
+        self._home_range = None
+        self.hover_label.setVisible(False)
+
+        if self._plot_widget is not None:
+            self.root.removeWidget(self._plot_widget)
+            self._plot_widget.deleteLater()
+            self._plot_widget = None
+            self._plot_item = None
+            self._view_box = None
+            self._mouse_proxy = None
+
+    def _create_plot_widget(self):
+        pw = pg.PlotWidget(background="w")
+        pw.setMenuEnabled(False)
+        pw.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        pi = pw.getPlotItem()
+        vb = pi.getViewBox()
+        vb.setMouseMode(pg.ViewBox.RectMode if self._rect_zoom_active else pg.ViewBox.PanMode)
+        vb.enableAutoRange(pg.ViewBox.XYAxes, False)
+        vb.sigRangeChanged.connect(self._update_annotation_buttons)
+        pi.showGrid(x=True, y=True, alpha=0.25)
+        self.root.addWidget(pw)
+
+        pw.scene().sigMouseClicked.connect(self._on_mouse_clicked)
+        self._mouse_proxy = pg.SignalProxy(
+            pw.scene().sigMouseMoved,
+            rateLimit=35,
+            slot=self._on_mouse_moved,
+        )
+
+        self._plot_widget = pw
+        self._plot_item = pi
+        self._view_box = vb
+
+    def set_rect_zoom_active(self, active: bool):
+        self._rect_zoom_active = bool(active)
+        if self._view_box is not None:
+            self._view_box.setMouseMode(pg.ViewBox.RectMode if active else pg.ViewBox.PanMode)
+
+    def _on_mouse_clicked(self, event):
+        if self._plot_widget is None or self._view_box is None:
+            return
+
+        try:
+            if event.button() == Qt.LeftButton:
+                self.clicked.emit()
+
+                if self._rect_zoom_active or not self.enable_click_annotations:
+                    return
+
+                pos = event.scenePos()
+                if not self._view_box.sceneBoundingRect().contains(pos):
+                    return
+
+                mp = self._view_box.mapSceneToView(pos)
+                self._add_click_annotation(float(mp.x()), float(mp.y()))
+        except Exception:
+            self.clicked.emit()
+
+    def _on_mouse_moved(self, evt):
+        if self._plot_widget is None or self._view_box is None:
+            return
+
+        pos = evt[0] if isinstance(evt, tuple) else evt
+        if pos is None:
+            self.hover_label.setVisible(False)
+            return
+
+        try:
+            scene_rect = self._plot_widget.sceneBoundingRect()
+            if not scene_rect.contains(pos):
+                self.hover_label.setVisible(False)
+                return
+
+            mp = self._view_box.mapSceneToView(pos)
+            text = f"({mp.x():.6g}, {mp.y():.6g})"
+            self.hover_label.setText(text)
+            self.hover_label.adjustSize()
+
+            local = self.mapFromGlobal(self.cursor().pos())
+            x = min(max(0, local.x() + 14), max(0, self.width() - self.hover_label.width() - 4))
+            y = min(max(0, local.y() + 14), max(0, self.height() - self.hover_label.height() - 4))
+            self.hover_label.move(x, y)
+            self.hover_label.setVisible(True)
+            self.hover_label.raise_()
+        except Exception:
+            self.hover_label.setVisible(False)
+
+    def _clear_click_annotations(self):
+        for ann in self._click_annotations[:]:
+            self._remove_click_annotation(ann)
+
+    def _remove_click_annotation(self, ann):
+        try:
+            if self._plot_item is not None and ann.get("marker") is not None:
+                self._plot_item.removeItem(ann["marker"])
+        except Exception:
+            pass
+
+        try:
+            if self._plot_item is not None and ann.get("label") is not None:
+                self._plot_item.removeItem(ann["label"])
+        except Exception:
+            pass
+
+        try:
+            btn = ann.get("close_btn")
+            if btn is not None:
+                btn.hide()
+                btn.deleteLater()
+        except Exception:
+            pass
+
+        try:
+            self._click_annotations.remove(ann)
+        except ValueError:
+            pass
+
+    def _add_click_annotation(self, x: float, y: float):
+        if self._plot_item is None or self._plot_widget is None:
+            return
+
+        marker = pg.ScatterPlotItem(
+            [x], [y],
+            symbol="o",
+            size=8,
+            pen=pg.mkPen((200, 40, 40), width=1.2),
+            brush=pg.mkBrush(255, 255, 255, 220),
+        )
+        marker.setZValue(1000)
+
+        html = (
+            "<div style='background: rgba(255,255,255,230); "
+            "border: 1px solid #666; padding: 2px 6px;'>"
+            f"({x:.6g}, {y:.6g})"
+            "</div>"
+        )
+        label = pg.TextItem(html=html, anchor=(0, 1))
+        label.setPos(x, y)
+        label.setZValue(1001)
+
+        self._plot_item.addItem(marker)
+        self._plot_item.addItem(label)
+
+        btn = QToolButton(self._plot_widget.viewport())
+        btn.setText("×")
+        btn.setAutoRaise(True)
+        btn.setFixedSize(16, 16)
+        btn.setStyleSheet(
+            "QToolButton {"
+            "background: rgba(255,255,255,230);"
+            "border: 1px solid #666;"
+            "border-radius: 8px;"
+            "font-weight: bold;"
+            "padding: 0px;"
+            "}"
+        )
+
+        ann = {
+            "x": float(x),
+            "y": float(y),
+            "marker": marker,
+            "label": label,
+            "close_btn": btn,
+        }
+
+        btn.clicked.connect(lambda _=False, a=ann: self._remove_click_annotation(a))
+
+        self._click_annotations.append(ann)
+        btn.show()
+        self._update_single_annotation_button(ann)
+
+    def _update_single_annotation_button(self, ann):
+        if self._plot_widget is None:
+            return
+
+        btn = ann.get("close_btn")
+        label = ann.get("label")
+        if btn is None or label is None:
+            return
+
+        try:
+            sr = label.sceneBoundingRect()
+            vp_pt = self._plot_widget.mapFromScene(sr.topRight())
+
+            x = int(vp_pt.x()) - btn.width() // 2
+            y = int(vp_pt.y()) - btn.height() // 2
+            btn.move(x, y)
+            btn.raise_()
+
+            viewport_rect = self._plot_widget.viewport().rect()
+            btn.setVisible(viewport_rect.adjusted(-20, -20, 20, 20).contains(vp_pt))
+        except Exception:
+            btn.setVisible(False)
+
+    def _update_annotation_buttons(self, *args):
+        for ann in self._click_annotations[:]:
+            self._update_single_annotation_button(ann)
+
+    def clear_click_annotations(self):
+        self._clear_click_annotations()
+
+    def get_export_annotations(self):
+        out = []
+        for ann in self._click_annotations:
+            try:
+                x = float(ann["x"])
+                y = float(ann["y"])
+                if np.isfinite(x) and np.isfinite(y):
+                    out.append({
+                        "x": x,
+                        "y": y,
+                        "text": f"({x:.6g}, {y:.6g})"
+                    })
+            except Exception:
+                pass
+        return out
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_annotation_buttons()
+
+    def _set_home_range(self, x0, x1, y0, y1, padding=0.02):
+        if not np.isfinite([x0, x1, y0, y1]).all():
+            self._home_range = None
+            return
+
+        if x0 == x1:
+            x0 -= 0.5
+            x1 += 0.5
+        if y0 == y1:
+            y0 -= 0.5
+            y1 += 0.5
+
+        dx = x1 - x0
+        dy = y1 - y0
+        self._home_range = (
+            x0 - padding * dx,
+            x1 + padding * dx,
+            y0 - padding * dy,
+            y1 + padding * dy,
+        )
+
+    def store_home_view(self):
+        if self._view_box is None:
+            return
+        try:
+            xr, yr = self._view_box.viewRange()
+            self._home_range = (xr[0], xr[1], yr[0], yr[1])
+        except Exception:
+            pass
+
+    def reset_view(self):
+        if self._view_box is None or self._home_range is None:
+            return
+        x0, x1, y0, y1 = self._home_range
+        self._view_box.setXRange(x0, x1, padding=0.0)
+        self._view_box.setYRange(y0, y1, padding=0.0)
+        self.clear_click_annotations()
+
+    def zoom_axes(self, factor: float):
+        if self._view_box is None:
+            return
+        try:
+            self._view_box.scaleBy((factor, factor))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _safe_pen():
+        return pg.mkPen((35, 110, 210), width=1)
+
+    @staticmethod
+    def _state_y_bounds(state: dict):
+        if state["kind"] in ("time", "avg"):
+            all_y = []
+            for s in state.get("series", []):
+                y = np.asarray(s["y"], dtype=np.float64)
+                y = y[np.isfinite(y)]
+                if y.size:
+                    all_y.append((float(np.min(y)), float(np.max(y))))
+            if not all_y:
+                return -1.0, 1.0
+            return min(v[0] for v in all_y), max(v[1] for v in all_y)
+
+        S = np.asarray(state["S"], dtype=np.float64)
+        S = S[np.isfinite(S)]
+        if S.size == 0:
+            return 0.0, 1.0
+        return float(np.min(S)), float(np.max(S))
+
+    @staticmethod
+    def _pg_colormap(name: str, reverse: bool = False):
+        desired = f"{name}_r" if reverse else name
+        try:
+            return pg.colormap.get(desired, source="matplotlib")
+        except Exception:
+            try:
+                return pg.colormap.get(desired)
+            except Exception:
+                fallback = "viridis_r" if reverse else "viridis"
+                try:
+                    return pg.colormap.get(fallback, source="matplotlib")
+                except Exception:
+                    return pg.colormap.get("viridis")
+
+    def set_state(self, state: dict, color_cfg=None, preserve_view=False, preserve_annotations=False):
+        old_range = None
+        old_annotations = self.get_export_annotations() if preserve_annotations else []
+
+        if preserve_view and self._view_box is not None:
+            try:
+                xr, yr = self._view_box.viewRange()
+                old_range = (xr[0], xr[1], yr[0], yr[1])
+            except Exception:
+                old_range = None
+
+        self.clear_plot()
+        self._create_plot_widget()
+
+        self.plot_state = state
+        self.plot_key = state["key"]
+
+        self._plot_item.setLabel("bottom", state.get("xlabel", ""))
+        self._plot_item.setLabel("left", state.get("ylabel", ""))
+
+        if state["kind"] in ("time", "avg"):
+            self._draw_line_state(state)
+        else:
+            self._draw_image_state(state, color_cfg or {})
+
+        if old_range is not None:
+            x0, x1, y0, y1 = old_range
+            self._view_box.setXRange(x0, x1, padding=0.0)
+            self._view_box.setYRange(y0, y1, padding=0.0)
+        else:
+            self.reset_view()
+
+        if old_annotations:
+            for ann in old_annotations:
+                self._add_click_annotation(ann["x"], ann["y"])
+            self._update_annotation_buttons()
+
+    def _draw_line_state(self, state: dict):
+        x_bounds = []
+        y_bounds = []
+
+        for series in state.get("series", []):
+            x = np.asarray(series["x"], dtype=np.float64)
+            y = np.asarray(series["y"], dtype=np.float64)
+
+            if self.mini and x.size > 3500:
+                step = max(1, x.size // 3500)
+                x = x[::step]
+                y = y[::step]
+
+            item = pg.PlotDataItem(
+                x=x,
+                y=y,
+                pen=self._safe_pen(),
+                antialias=False,
+                connect="finite",
+                autoDownsample=True,
+                clipToView=True,
+                downsampleMethod="peak",
+            )
+            try:
+                item.setSkipFiniteCheck(True)
+            except Exception:
+                pass
+
+            self._plot_item.addItem(item)
+
+            x = x[np.isfinite(x)]
+            y = y[np.isfinite(y)]
+            if x.size:
+                x_bounds.append((float(np.min(x)), float(np.max(x))))
+            if y.size:
+                y_bounds.append((float(np.min(y)), float(np.max(y))))
+
+        if x_bounds and y_bounds:
+            self._set_home_range(
+                min(v[0] for v in x_bounds),
+                max(v[1] for v in x_bounds),
+                min(v[0] for v in y_bounds),
+                max(v[1] for v in y_bounds),
+                padding=0.02,
+            )
+        else:
+            self._set_home_range(0.0, 1.0, -1.0, 1.0)
+
+    def _draw_image_state(self, state: dict, color_cfg: dict):
+        times = np.asarray(state["times"], dtype=np.float64)
+        freqs = np.asarray(state["freqs"], dtype=np.float64)
+        S = np.asarray(state["S"], dtype=np.float64)
+
+        if times.size == 0 or freqs.size == 0 or S.size == 0:
+            self._set_home_range(0.0, 1.0, 0.0, 1.0)
+            return
+
+        if times.size > 1:
+            dx = float(np.median(np.diff(times)))
+        else:
+            dx = 1.0
+        if freqs.size > 1:
+            dy = float(np.median(np.diff(freqs)))
+        else:
+            dy = 1.0
+
+        x0 = float(times[0] - 0.5 * dx)
+        x1 = float(times[-1] + 0.5 * dx)
+        y0 = float(freqs[0] - 0.5 * dy)
+        y1 = float(freqs[-1] + 0.5 * dy)
+
+        finite = S[np.isfinite(S)]
+        auto_vmin = float(np.min(finite)) if finite.size else 0.0
+        auto_vmax = float(np.max(finite)) if finite.size else 1.0
+        if auto_vmin == auto_vmax:
+            auto_vmax = auto_vmin + 1e-12
+
+        manual = bool(color_cfg.get("manual_clim", False))
+        vmin = float(color_cfg.get("vmin", auto_vmin)) if manual else auto_vmin
+        vmax = float(color_cfg.get("vmax", auto_vmax)) if manual else auto_vmax
+        if vmax <= vmin:
+            vmax = vmin + 1e-12
+
+        cmap_name = color_cfg.get("cmap", "viridis")
+        reverse = bool(color_cfg.get("reverse", False))
+
+        image_item = pg.ImageItem(axisOrder="row-major")
+        image_item.setImage(S, autoLevels=False)
+        image_item.setRect(QRectF(x0, y0, x1 - x0, y1 - y0))
+        image_item.setLevels((vmin, vmax))
+        image_item.setColorMap(self._pg_colormap(cmap_name, reverse=reverse))
+        self._plot_item.addItem(image_item)
+
+        cbar = pg.ColorBarItem(
+            values=(vmin, vmax),
+            colorMap=self._pg_colormap(cmap_name, reverse=reverse),
+            label=state.get("colorbar_label", ""),
+            interactive=False,
+            width=12 if self.mini else 18,
+        )
+        cbar.setImageItem(image_item, insert_in=self._plot_item)
+
+        self._set_home_range(x0, x1, y0, y1, padding=0.0)
+
+
+class WaterfallSetupDialog(QDialog):
+    def __init__(self, channel_names, parent=None, rpm_guess="", acc_guess=""):
+        super().__init__(parent)
+        self.setWindowTitle("Waterfall setup")
+        self.setModal(True)
+
+        self.cmb_rpm = QComboBox()
+        self.cmb_acc = QComboBox()
+        self.cmb_filter_target = QComboBox()
+        self.cmb_filter_target.addItems(["None", "Acceleration", "RPM", "Both"])
+        self.chk_open_3d = QCheckBox("Open 3D waterfall in separate window after plotting")
+        self.chk_open_3d.setChecked(False)
+
+        self.cmb_rpm.addItems(channel_names)
+        self.cmb_acc.addItems(channel_names)
+
+        if rpm_guess and rpm_guess in channel_names:
+            self.cmb_rpm.setCurrentText(rpm_guess)
+        if acc_guess and acc_guess in channel_names:
+            self.cmb_acc.setCurrentText(acc_guess)
+
+        form = QFormLayout(self)
+        form.addRow("RPM channel:", self.cmb_rpm)
+        form.addRow("Acceleration channel:", self.cmb_acc)
+        form.addRow("Apply Butterworth filter to:", self.cmb_filter_target)
+        form.addRow("", self.chk_open_3d)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def _accept(self):
+        if self.cmb_rpm.currentText().strip() == self.cmb_acc.currentText().strip():
+            QMessageBox.warning(self, "Selection", "RPM and acceleration channels must be different.")
+            return
+        self.accept()
+
+    def values(self):
+        return {
+            "rpm_name": self.cmb_rpm.currentText().strip(),
+            "acc_name": self.cmb_acc.currentText().strip(),
+            "filter_target": self.cmb_filter_target.currentText().strip(),
+            "open_3d": self.chk_open_3d.isChecked(),
+        }
+
+
+class Waterfall3DWindow(QDialog):
+    def __init__(self, state: dict, parent=None):
+        super().__init__(parent)
+        self.state = state
+        self.setWindowTitle(state.get("title", "3D Waterfall"))
+        self.resize(1200, 800)
+
+        lay = QVBoxLayout(self)
+
+        if not _HAVE_PG_GL:
+            lbl = QLabel(
+                "pyqtgraph.opengl / PyOpenGL not found.\n"
+                "Install with: pip install PyOpenGL"
+            )
+            lbl.setWordWrap(True)
+            lay.addWidget(lbl)
+            return
+
+        self.view = gl.GLViewWidget()
+        self.view.opts["distance"] = 250
+        self.view.opts["elevation"] = 22
+        self.view.opts["azimuth"] = -55
+        lay.addWidget(self.view, 1)
+
+        self._build_scene()
+
+    def _build_scene(self):
+        freqs = np.asarray(self.state["freqs"], dtype=np.float64)
+        rpms = np.asarray(self.state["rpms"], dtype=np.float64)
+        S = np.asarray(self.state["S"], dtype=np.float64)
+
+        if freqs.size == 0 or rpms.size == 0 or S.size == 0:
+            return
+
+        max_fx = 220
+        max_ry = 220
+        sx = max(1, int(np.ceil(freqs.size / max_fx)))
+        sy = max(1, int(np.ceil(rpms.size / max_ry)))
+
+        freqs_ds = freqs[::sx]
+        rpms_ds = rpms[::sy]
+        S_ds = S[::sy, ::sx]
+
+        finite = S_ds[np.isfinite(S_ds)]
+        if finite.size == 0:
+            z = np.zeros_like(S_ds, dtype=np.float64)
+        else:
+            z0 = float(np.min(finite))
+            z1 = float(np.max(finite))
+            if z1 <= z0:
+                z1 = z0 + 1e-12
+            z = (np.nan_to_num(S_ds, nan=z0) - z0) / (z1 - z0)
+
+        z_gl = z.T.copy()
+
+        gx = gl.GLGridItem()
+        gy = gl.GLGridItem()
+        gz = gl.GLGridItem()
+        gx.rotate(90, 0, 1, 0)
+        gy.rotate(90, 1, 0, 0)
+
+        fx_span = float(freqs_ds[-1] - freqs_ds[0]) if freqs_ds.size > 1 else 1.0
+        rpm_span = float(rpms_ds[-1] - rpms_ds[0]) if rpms_ds.size > 1 else 1.0
+
+        gx.scale(max(1.0, fx_span / 10.0), max(1.0, rpm_span / 10.0), 1.0)
+        gy.scale(max(1.0, fx_span / 10.0), max(1.0, rpm_span / 10.0), 1.0)
+        gz.scale(max(1.0, fx_span / 10.0), max(1.0, rpm_span / 10.0), 1.0)
+
+        self.view.addItem(gx)
+        self.view.addItem(gy)
+        self.view.addItem(gz)
+
+        surf = gl.GLSurfacePlotItem(
+            x=freqs_ds,
+            y=rpms_ds,
+            z=z_gl,
+            shader="heightColor",
+            smooth=False,
+            computeNormals=False,
+        )
+        surf.translate(0, 0, 0)
+        self.view.addItem(surf)
+
+
+class WaterfallOrderCursor(QObject):
+    changed = pyqtSignal()
+
+    def __init__(self, owner, order_value: float, color):
+        super().__init__()
+        self.owner = owner
+        self.order = float(order_value)
+        self.color = color
+        self._guard = False
+
+        self.line = pg.PlotCurveItem(pen=pg.mkPen(color, width=2))
+        self.label = pg.TextItem(color=color, anchor=(0.5, 1.0))
+        self.handle = pg.TargetItem(
+            pos=(self.owner._freq_at_top(self.order), self.owner.rpm_max),
+            size=12,
+            pen=pg.mkPen(color, width=2),
+            brush=pg.mkBrush(255, 255, 255, 170),
+            movable=True,
+        )
+
+        self.owner.upper_item.addItem(self.line)
+        self.owner.upper_item.addItem(self.label)
+        self.owner.upper_item.addItem(self.handle)
+
+        self.handle.sigPositionChanged.connect(self._on_handle_moved)
+        self.redraw()
+
+    def _on_handle_moved(self):
+        if self._guard:
+            return
+        self._guard = True
+        try:
+            pos = self.handle.pos()
+            x = float(np.clip(pos.x(), self.owner.freq_min, self.owner.freq_max))
+            self.handle.setPos(x, self.owner.rpm_max)
+            self.order = max(1e-6, 60.0 * x / max(self.owner.rpm_max, 1e-12))
+            self.redraw()
+            self.changed.emit()
+        finally:
+            self._guard = False
+
+    def redraw(self):
+        y = self.owner.rpms
+        x = (self.order * y) / 60.0
+        m = np.isfinite(x) & np.isfinite(y) & (x >= self.owner.freq_min) & (x <= self.owner.freq_max)
+        self.line.setData(x[m], y[m])
+
+        x_top = float(np.clip(self.owner._freq_at_top(self.order), self.owner.freq_min, self.owner.freq_max))
+        self.label.setText(f"{self.order:.2f}x")
+        self.label.setPos(x_top, self.owner.rpm_max)
+
+    def remove(self):
+        for item in (self.line, self.label, self.handle):
+            try:
+                self.owner.upper_item.removeItem(item)
+            except Exception:
+                pass
+
+
+class WaterfallPlotWidget(QWidget):
+    clicked = pyqtSignal()
+
+    def __init__(self, mini=False, parent=None):
+        super().__init__(parent)
+        self.mini = bool(mini)
+        self.state = None
+        self.plot_key = None
+        self._rect_zoom_active = False
+        self._home_upper = None
+        self._home_lower = None
+        self._legend = None
+        self._cursors = []
+        self._cursor_colors = [
+            (220, 60, 60),
+            (70, 180, 90),
+            (60, 120, 220),
+            (210, 140, 30),
+            (180, 70, 190),
+        ]
+
+        self.freqs = np.array([], dtype=np.float64)
+        self.rpms = np.array([], dtype=np.float64)
+        self.S = np.empty((0, 0), dtype=np.float64)
+        self.freq_min = 0.0
+        self.freq_max = 1.0
+        self.rpm_min = 0.0
+        self.rpm_max = 1.0
+
+        self.btn_add_cursor = QPushButton("Add cursor")
+        self.btn_clear_cursors = QPushButton("Clear cursors")
+        self.btn_open_3d = QPushButton("Open 3D")
+
+        self.upper = pg.PlotWidget(background="w")
+        self.upper_item = self.upper.getPlotItem()
+        self.upper_item.showGrid(x=True, y=True, alpha=0.25)
+        self.upper_item.setLabel("bottom", "Frequency (Hz)")
+        self.upper_item.setLabel("left", "RPM")
+        self.upper.setMenuEnabled(False)
+
+        self.lower = pg.PlotWidget(background="w")
+        self.lower_item = self.lower.getPlotItem()
+        self.lower_item.showGrid(x=True, y=True, alpha=0.25)
+        self.lower_item.setLabel("bottom", "RPM")
+        self.lower_item.setLabel("left", "Amplitude")
+        self.lower.setMenuEnabled(False)
+
+        self.upper.scene().sigMouseClicked.connect(self._on_mouse_clicked)
+
+        topbar = QHBoxLayout()
+        topbar.addWidget(self.btn_add_cursor)
+        topbar.addWidget(self.btn_clear_cursors)
+        topbar.addWidget(self.btn_open_3d)
+        topbar.addStretch(1)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        if not self.mini:
+            lay.addLayout(topbar)
+        lay.addWidget(self.upper, 3)
+        if not self.mini:
+            lay.addWidget(self.lower, 2)
+
+        self.btn_add_cursor.clicked.connect(self._add_cursor_default)
+        self.btn_clear_cursors.clicked.connect(self.clear_cursors)
+        self.btn_open_3d.clicked.connect(self.open_3d_window)
+
+        if self.mini:
+            self.btn_add_cursor.hide()
+            self.btn_clear_cursors.hide()
+            self.btn_open_3d.hide()
+            self.lower.hide()
+
+    def _on_mouse_clicked(self, event):
+        try:
+            if event.button() == Qt.LeftButton:
+                self.clicked.emit()
+        except Exception:
+            self.clicked.emit()
+
+    def set_rect_zoom_active(self, active: bool):
+        self._rect_zoom_active = bool(active)
+        mode = pg.ViewBox.RectMode if active else pg.ViewBox.PanMode
+        self.upper_item.getViewBox().setMouseMode(mode)
+
+    def zoom_axes(self, factor: float):
+        try:
+            self.upper_item.getViewBox().scaleBy((factor, factor))
+        except Exception:
+            pass
+
+    def reset_view(self):
+        if self._home_upper is not None:
+            x0, x1, y0, y1 = self._home_upper
+            vb = self.upper_item.getViewBox()
+            vb.setXRange(x0, x1, padding=0.0)
+            vb.setYRange(y0, y1, padding=0.0)
+        if self._home_lower is not None and not self.mini:
+            x0, x1, y0, y1 = self._home_lower
+            vb = self.lower_item.getViewBox()
+            vb.setXRange(x0, x1, padding=0.0)
+            vb.setYRange(y0, y1, padding=0.0)
+
+    def get_export_annotations(self):
+        return [{"order": float(c.order)} for c in self._cursors]
+
+    def _freq_at_top(self, order_value: float) -> float:
+        return float(order_value) * self.rpm_max / 60.0
+
+    def clear_cursors(self):
+        for c in self._cursors[:]:
+            c.remove()
+        self._cursors.clear()
+        self._update_lower_plot()
+
+    def _add_cursor_default(self):
+        if self.rpms.size == 0:
+            return
+        if not self._cursors:
+            order = 1.0
+        else:
+            order = float(self._cursors[-1].order + 1.0)
+        self.add_cursor(order)
+
+    def add_cursor(self, order_value: float):
+        color = self._cursor_colors[len(self._cursors) % len(self._cursor_colors)]
+        cursor = WaterfallOrderCursor(self, order_value, color)
+        cursor.changed.connect(self._update_lower_plot)
+        self._cursors.append(cursor)
+        self._update_lower_plot()
+
+    def export_order_cursor_specs(self):
+        out = []
+        for c in self._cursors:
+            out.append({"order": float(c.order), "color": c.color})
+        return out
+
+    def _extract_order_trace(self, order_value: float):
+        if self.S.size == 0 or self.rpms.size == 0 or self.freqs.size == 0:
+            return np.array([], dtype=np.float64)
+        freq_track = (float(order_value) * self.rpms) / 60.0
+        out = np.full(self.rpms.shape, np.nan, dtype=np.float64)
+        for i in range(self.rpms.size):
+            f = freq_track[i]
+            if f < self.freq_min or f > self.freq_max:
+                continue
+            out[i] = np.interp(f, self.freqs, self.S[i, :], left=np.nan, right=np.nan)
+        return out
+
+    def _set_home(self):
+        self._home_upper = (self.freq_min, self.freq_max, self.rpm_min, self.rpm_max)
+        if not self.mini:
+            finite = self.S[np.isfinite(self.S)]
+            y0 = float(np.min(finite)) if finite.size else 0.0
+            y1 = float(np.max(finite)) if finite.size else 1.0
+            if y1 <= y0:
+                y1 = y0 + 1.0
+            self._home_lower = (self.rpm_min, self.rpm_max, y0, y1)
+
+    def _update_lower_plot(self):
+        if self.mini:
+            return
+
+        self.lower_item.clear()
+        if self._legend is not None:
+            try:
+                self._legend.scene().removeItem(self._legend)
+            except Exception:
+                pass
+            self._legend = None
+        self._legend = self.lower_item.addLegend(offset=(10, 10))
+
+        self.lower_item.setLabel("bottom", "RPM")
+        self.lower_item.setLabel("left", self.state.get("colorbar_label", "Amplitude") if self.state else "Amplitude")
+
+        ymins = []
+        ymaxs = []
+        for c in self._cursors:
+            tr = self._extract_order_trace(c.order)
+            m = np.isfinite(tr) & np.isfinite(self.rpms)
+            if not np.any(m):
+                continue
+            self.lower_item.plot(
+                self.rpms[m], tr[m],
+                pen=pg.mkPen(c.color, width=2),
+                name=f"Order {c.order:.2f}x",
+            )
+            ymins.append(float(np.min(tr[m])))
+            ymaxs.append(float(np.max(tr[m])))
+
+        if ymins and ymaxs:
+            y0 = min(ymins)
+            y1 = max(ymaxs)
+            if y1 <= y0:
+                y1 = y0 + 1.0
+            self.lower_item.getViewBox().setXRange(self.rpm_min, self.rpm_max, padding=0.0)
+            self.lower_item.getViewBox().setYRange(y0, y1, padding=0.05)
+
+    def open_3d_window(self):
+        if self.state is None:
+            return
+        dlg = Waterfall3DWindow(self.state, self)
+        dlg.exec_()
+
+    def set_state(self, state: dict, color_cfg=None, preserve_view=False, preserve_annotations=False):
+        color_cfg = color_cfg or {}
+
+        old_upper = None
+        old_orders = [float(c.order) for c in self._cursors] if preserve_annotations else []
+
+        if preserve_view:
+            try:
+                xr, yr = self.upper_item.getViewBox().viewRange()
+                old_upper = (xr[0], xr[1], yr[0], yr[1])
+            except Exception:
+                old_upper = None
+
+        self.state = state
+        self.plot_key = state["key"]
+        self.freqs = np.asarray(state["freqs"], dtype=np.float64)
+        self.rpms = np.asarray(state["rpms"], dtype=np.float64)
+        self.S = np.asarray(state["S"], dtype=np.float64)
+
+        self.freq_min = float(self.freqs[0]) if self.freqs.size else 0.0
+        self.freq_max = float(self.freqs[-1]) if self.freqs.size else 1.0
+        self.rpm_min = float(self.rpms[0]) if self.rpms.size else 0.0
+        self.rpm_max = float(self.rpms[-1]) if self.rpms.size else 1.0
+
+        self.upper_item.clear()
+        self.lower_item.clear()
+        self.clear_cursors()
+
+        if self.freqs.size == 0 or self.rpms.size == 0 or self.S.size == 0:
+            return
+
+        if self.freqs.size > 1:
+            dx = float(np.median(np.diff(self.freqs)))
+        else:
+            dx = 1.0
+        if self.rpms.size > 1:
+            dy = float(np.median(np.diff(self.rpms)))
+        else:
+            dy = 1.0
+
+        x0 = float(self.freqs[0] - 0.5 * dx)
+        x1 = float(self.freqs[-1] + 0.5 * dx)
+        y0 = float(self.rpms[0] - 0.5 * dy)
+        y1 = float(self.rpms[-1] + 0.5 * dy)
+
+        finite = self.S[np.isfinite(self.S)]
+        auto_vmin = float(np.min(finite)) if finite.size else 0.0
+        auto_vmax = float(np.max(finite)) if finite.size else 1.0
+        if auto_vmax <= auto_vmin:
+            auto_vmax = auto_vmin + 1e-12
+
+        manual = bool(color_cfg.get("manual_clim", False))
+        vmin = float(color_cfg.get("vmin", auto_vmin)) if manual else auto_vmin
+        vmax = float(color_cfg.get("vmax", auto_vmax)) if manual else auto_vmax
+        if vmax <= vmin:
+            vmax = vmin + 1e-12
+
+        cmap_name = color_cfg.get("cmap", "viridis")
+        reverse = bool(color_cfg.get("reverse", False))
+        cm = InteractivePlotWidget._pg_colormap(cmap_name, reverse=reverse)
+
+        img = pg.ImageItem(axisOrder="row-major")
+        img.setImage(self.S, autoLevels=False)
+        img.setRect(QRectF(x0, y0, x1 - x0, y1 - y0))
+        img.setLevels((vmin, vmax))
+        img.setColorMap(cm)
+        self.upper_item.addItem(img)
+
+        cbar = pg.ColorBarItem(
+            values=(vmin, vmax),
+            colorMap=cm,
+            label=state.get("colorbar_label", "Amplitude"),
+            interactive=False,
+            width=18,
+        )
+        cbar.setImageItem(img, insert_in=self.upper_item)
+
+        self.upper_item.setLabel("bottom", state.get("xlabel", "Frequency (Hz)"))
+        self.upper_item.setLabel("left", state.get("ylabel", "RPM"))
+        self._set_home()
+
+        if old_orders:
+            for od in old_orders:
+                self.add_cursor(od)
+        else:
+            self.add_cursor(1.0)
+            self.add_cursor(2.0)
+
+        if old_upper is not None:
+            self.upper_item.getViewBox().setXRange(old_upper[0], old_upper[1], padding=0.0)
+            self.upper_item.getViewBox().setYRange(old_upper[2], old_upper[3], padding=0.0)
+        else:
+            self.reset_view()
+
+
+class PlotMiniWidget(QFrame):
+    request_open = pyqtSignal(str)
+    request_close = pyqtSignal(str)
+    activated = pyqtSignal(object, str)
+
+    def __init__(self, state: dict):
+        super().__init__()
+        self.state = state
+        self.plot_key = state["key"]
+
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setFrameShadow(QFrame.Raised)
+
+        self.lbl = QLabel(state.get("short_title", self.plot_key))
+        self.lbl.setStyleSheet("font-weight: bold;")
+
+        self.btn_open = QPushButton("Open Large")
+        self.btn_close = QPushButton("Close")
+        self.btn_open.setFixedWidth(95)
+        self.btn_close.setFixedWidth(70)
+
+        self.canvas = InteractivePlotWidget(mini=True)
+        self.canvas.setMinimumHeight(220)
+
+        top = QHBoxLayout()
+        top.addWidget(self.lbl, 1)
+        top.addWidget(self.btn_open)
+        top.addWidget(self.btn_close)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.addLayout(top)
+        lay.addWidget(self.canvas)
+
+        self.btn_open.clicked.connect(lambda: self.request_open.emit(self.plot_key))
+        self.btn_close.clicked.connect(lambda: self.request_close.emit(self.plot_key))
+        self.canvas.clicked.connect(self._on_canvas_clicked)
+
+    def _on_canvas_clicked(self):
+        self.activated.emit(self.canvas, self.plot_key)
+        self.request_open.emit(self.plot_key)
+
+    def set_selected(self, selected: bool):
+        if selected:
+            self.setStyleSheet("QFrame { border: 2px solid #2d89ef; }")
+        else:
+            self.setStyleSheet("")
+
+
+class DetailPlotWidget(QWidget):
+    activated = pyqtSignal(object, str)
+
+    def __init__(self, state: dict):
+        super().__init__()
+        self.state = state
+        self.plot_key = state["key"]
+
+        self.title = QLabel(state.get("title", self.plot_key))
+        self.title.setWordWrap(True)
+        self.title.setStyleSheet("font-weight: bold;")
+
+        self.canvas = InteractivePlotWidget(mini=False)
+        self.canvas.setMinimumHeight(620)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(self.title)
+        lay.addWidget(self.canvas, 1)
+
+        self.canvas.clicked.connect(self._emit_active)
+
+    def _emit_active(self):
+        self.activated.emit(self.canvas, self.plot_key)
+
+
+class WaterfallDetailWidget(QWidget):
+    activated = pyqtSignal(object, str)
+
+    def __init__(self, state: dict):
+        super().__init__()
+        self.state = state
+        self.plot_key = state["key"]
+
+        self.title = QLabel(state.get("title", self.plot_key))
+        self.title.setWordWrap(True)
+        self.title.setStyleSheet("font-weight: bold;")
+
+        self.canvas = WaterfallPlotWidget(mini=False)
+        self.canvas.setMinimumHeight(780)
+        self.canvas.clicked.connect(self._emit_active)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(self.title)
+        lay.addWidget(self.canvas, 1)
+
+    def _emit_active(self):
+        self.activated.emit(self.canvas, self.plot_key)
+
+
+class FileOpenWorker(QObject):
+    finished = pyqtSignal(object)
+    error = pyqtSignal(str)
+
+    def __init__(self, path: str):
+        super().__init__()
+        self.path = path
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            ext = os.path.splitext(self.path)[1].lower()
+
+            if ext in [".xlsx", ".xls"]:
+                xls = pd.ExcelFile(self.path)
+                names = list(xls.sheet_names)
+                if not names:
+                    raise RuntimeError("No sheets found in the Excel file.")
+                self.finished.emit({
+                    "file_type": "excel",
+                    "sheet_names": names,
+                    "default_index": 1 if len(names) > 1 else 0,
+                })
+                return
+
+            if ext == ".tdms":
+                if not _HAVE_TDMS:
+                    raise RuntimeError("npTDMS is not available. Install with: pip install npTDMS")
+
+                tdms = TdmsFile.read_metadata(self.path) if hasattr(TdmsFile, "read_metadata") else TdmsFile.read(self.path)
+                names = [g.name for g in tdms.groups()]
+                if not names:
+                    raise RuntimeError("No groups found in the TDMS file.")
+
+                self.finished.emit({
+                    "file_type": "tdms",
+                    "sheet_names": names,
+                    "default_index": 0,
+                })
+                return
+
+            raise RuntimeError("Unsupported file extension.")
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class SheetLoadWorker(QObject):
+    finished = pyqtSignal(object)
+    error = pyqtSignal(str)
+
+    def __init__(self, file_path: str, file_type: str, name: str):
+        super().__init__()
+        self.file_path = file_path
+        self.file_type = file_type
+        self.name = name
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            if self.file_type == "excel":
+                df0 = pd.read_excel(self.file_path, sheet_name=self.name, header=0, nrows=0)
+                cols = list(df0.columns)
+                if not cols:
+                    raise RuntimeError("No columns found in the selected sheet.")
+
+                self.finished.emit({
+                    "kind": "excel",
+                    "name": self.name,
+                    "names": [str(c) for c in cols],
+                    "prefer_index": 9,
+                })
+                return
+
+            if self.file_type == "tdms":
+                if not _HAVE_TDMS:
+                    raise RuntimeError("npTDMS is not available. Install with: pip install npTDMS")
+
+                tdms = TdmsFile.read_metadata(self.file_path) if hasattr(TdmsFile, "read_metadata") else TdmsFile.read(self.file_path)
+                group = tdms[self.name]
+                ch_names = [ch.name for ch in group.channels()]
+                if not ch_names:
+                    raise RuntimeError("No channels found in the TDMS file.")
+
+                self.finished.emit({
+                    "kind": "tdms",
+                    "name": self.name,
+                    "names": ch_names,
+                    "prefer_index": 0,
+                })
+                return
+
+            raise RuntimeError("Unknown file type.")
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class PlotWorker(QObject):
+    finished = pyqtSignal(object)
+    error = pyqtSignal(str)
+
+    def __init__(self, cfg: dict):
+        super().__init__()
+        self.cfg = cfg
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            self.finished.emit(self._build_plot_states())
+        except Exception as e:
+            self.error.emit(str(e))
+
+    def _signal_unit_short(self, signal_kind=None) -> str:
+        sk = signal_kind or self.cfg["signal_kind"]
+        return VEL_UNIT if sk == "vel" else "g"
+
+    def _signal_ylabel(self, signal_kind=None) -> str:
+        sk = signal_kind or self.cfg["signal_kind"]
+        return f"Velocity ({VEL_UNIT})" if sk == "vel" else "Acceleration (g)"
+
+    def _amp_conv_factor_label(self, signal_kind=None):
+        sk = signal_kind or self.cfg["signal_kind"]
+        unit = self._signal_unit_short(sk)
+        sel = self.cfg["amp_conv"]
+
+        if sel == "Peak":
+            return 1.0, f"{unit} (peak)"
+        if sel == "RMS":
+            return 1.0 / np.sqrt(2.0), f"{unit} RMS"
+        return 2.0, f"{unit} p-p"
+
+    def _make_time_axis(self, n: int, fs: float, start_offset_s: float = 0.0):
+        return start_offset_s + (np.arange(n, dtype=np.float64) / fs)
+
+    def _slice_by_time_window(self, y: np.ndarray, fs: float, t0: float, t1: float):
+        n = int(y.size)
+        i0 = int(np.floor(t0 * fs))
+        i1 = int(np.ceil(t1 * fs))
+        i0 = max(0, i0)
+        i1 = min(n, i1)
+
+        if i0 >= n:
+            raise ValueError("Start time exceeds signal length.")
+        if i1 <= i0:
+            raise ValueError("End time must be greater than start time.")
+
+        return y[i0:i1]
+
+    def _prep_signal(self, y: np.ndarray) -> np.ndarray:
+        fs = float(self.cfg["fs"])
+        crop = bool(self.cfg["crop"])
+        t0 = float(self.cfg["t0"])
+        t1 = float(self.cfg["t1"])
+        skip_first = bool(self.cfg["skip_first"])
+
+        if skip_first and y.size > 0:
+            y = y[1:]
+        if crop:
+            y = self._slice_by_time_window(y, fs, t0, t1)
+
+        return np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64, copy=False)
+
+    def _prep_paired_signals(self, a: np.ndarray, b: np.ndarray):
+        fs = float(self.cfg["fs"])
+        crop = bool(self.cfg["crop"])
+        t0 = float(self.cfg["t0"])
+        t1 = float(self.cfg["t1"])
+        skip_first = bool(self.cfg["skip_first"])
+
+        a = np.asarray(a)
+        b = np.asarray(b)
+
+        if skip_first:
+            if a.size > 0:
+                a = a[1:]
+            if b.size > 0:
+                b = b[1:]
+
+        n = min(int(a.size), int(b.size))
+        if n <= 0:
+            raise RuntimeError("RPM and acceleration signals are empty after preprocessing.")
+        a = a[:n]
+        b = b[:n]
+
+        if crop:
+            i0 = max(0, int(np.floor(t0 * fs)))
+            i1 = min(n, int(np.ceil(t1 * fs)))
+            if i0 >= n:
+                raise ValueError("Start time exceeds signal length.")
+            if i1 <= i0:
+                raise ValueError("End time must be greater than start time.")
+            a = a[i0:i1]
+            b = b[i0:i1]
+
+        a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64, copy=False)
+        b = np.nan_to_num(b, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64, copy=False)
+        return a, b
+
+    def _time_stats_text(self, name: str, y: np.ndarray, signal_kind: str) -> str:
+        unit = self._signal_unit_short(signal_kind)
+        if y.size == 0:
+            return f"{name}: empty"
+
+        y = y[np.isfinite(y)]
+        if y.size == 0:
+            return f"{name}: non-finite"
+
+        rms = float(np.sqrt(np.mean(y * y)))
+        pk = float(np.max(np.abs(y)))
+        p2p = float(np.max(y) - np.min(y))
+        return f"{name}: RMS={rms:.5g} {unit}, Peak={pk:.5g} {unit}, Pk-Pk={p2p:.5g} {unit}"
+
+    def _load_selected_signals(self):
+        file_type = self.cfg["file_type"]
+        file_path = self.cfg["file_path"]
+        group_or_sheet = self.cfg["group_or_sheet"]
+        names = self.cfg["names"]
+
+        out = {}
+
+        if file_type == "excel":
+            df = pd.read_excel(file_path, sheet_name=group_or_sheet, header=0)
+            for nm in names:
+                if nm not in df.columns:
+                    raise KeyError(f"Column not found: {nm}")
+                out[nm] = pd.to_numeric(df[nm], errors="coerce").to_numpy()
+            return out
+
+        if file_type == "tdms":
+            if not _HAVE_TDMS:
+                raise RuntimeError("npTDMS is not available. Install with: pip install npTDMS")
+
+            tdms = TdmsFile.read(file_path)
+            group = tdms[group_or_sheet]
+
+            for nm in names:
+                if nm not in group:
+                    raise KeyError(f"Channel not found in group '{group_or_sheet}': {nm}")
+                out[nm] = np.asarray(group[nm][:])
+
+            return out
+
+        raise RuntimeError("No file opened.")
+
+    def _filter_params(self):
+        ft = self.cfg["filter_type"]
+        order = int(self.cfg["filter_order"])
+        f1 = float(self.cfg["cut1"])
+        f2 = float(self.cfg["cut2"])
+
+        if ft == "Low-pass":
+            return "lowpass", order, f1, None
+        if ft == "High-pass":
+            return "highpass", order, f1, None
+        if ft == "Band-pass":
+            return "bandpass", order, f1, f2
+        return "bandstop", order, f1, f2
+
+    def _apply_custom_butterworth_zero_phase(self, y: np.ndarray, fs: float, btype: str, order: int, f1: float, f2=None) -> np.ndarray:
+        if not _HAVE_SCIPY:
+            raise RuntimeError("SciPy is required for filtering. Install: pip install scipy")
+
+        nyq = 0.5 * fs
+
+        def _chk_fc(fc: float, name: str):
+            if not np.isfinite(fc) or fc <= 0 or fc >= nyq:
+                raise ValueError(f"{name} must be between 0 and Nyquist ({nyq:.6g} Hz).")
+
+        _chk_fc(f1, "Cutoff 1")
+
+        if btype in ("bandpass", "bandstop"):
+            if f2 is None:
+                raise ValueError("Band filters require two cutoff frequencies.")
+            _chk_fc(f2, "Cutoff 2")
+            if f2 <= f1:
+                raise ValueError("For band filters, Cutoff 2 must be greater than Cutoff 1.")
+            wn = [f1 / nyq, f2 / nyq]
+        else:
+            wn = f1 / nyq
+
+        y0 = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64, copy=False)
+        sos = butter(order, wn, btype=btype, output="sos")
+        return sosfiltfilt(sos, y0)
+
+    def _apply_butterworth_zero_phase(self, y: np.ndarray, fs: float) -> np.ndarray:
+        if not bool(self.cfg["filter_enabled"]):
+            raise RuntimeError("Filtered data selected but filter is not enabled.")
+        return self._apply_custom_butterworth_zero_phase(y, fs, *self._filter_params())
+
+    def _maybe_apply_filter_target(self, y: np.ndarray, target_name: str) -> np.ndarray:
+        if not bool(self.cfg.get("filter_enabled", False)):
+            return y
+
+        filt_target = str(self.cfg.get("waterfall_filter_target", "None"))
+        apply_it = (
+            (filt_target == "Acceleration" and target_name == "acc") or
+            (filt_target == "RPM" and target_name == "rpm") or
+            (filt_target == "Both")
+        )
+        if not apply_it:
+            return y
+
+        return self._apply_custom_butterworth_zero_phase(y, float(self.cfg["fs"]), *self._filter_params())
+
+    def _apply_velocity_highpass(self, acc_g: np.ndarray, fs: float) -> np.ndarray:
+        return self._apply_custom_butterworth_zero_phase(acc_g, fs, "highpass", 4, 10.0, None)
+
+    def _integrate_acc_to_velocity(self, acc_g: np.ndarray, fs: float) -> np.ndarray:
+        if acc_g.size == 0:
+            return np.array([], dtype=np.float64)
+
+        dt = 1.0 / fs
+        acc_si = acc_g * G0
+
+        v = np.zeros_like(acc_si, dtype=np.float64)
+        if acc_si.size > 1:
+            v[1:] = np.cumsum(0.5 * (acc_si[:-1] + acc_si[1:]) * dt)
+
+        return v * VEL_SCALE
+
+    def _get_processed_signal(self, raw: np.ndarray) -> np.ndarray:
+        fs = float(self.cfg["fs"])
+        signal_kind = self.cfg["signal_kind"]
+        use_filtered = bool(self.cfg["use_filtered"]) if signal_kind == "acc" else False
+
+        y = self._prep_signal(raw)
+
+        if signal_kind == "acc":
+            return self._apply_butterworth_zero_phase(y, fs) if use_filtered else y
+
+        if not _HAVE_SCIPY:
+            raise RuntimeError("Velocity mode requires SciPy because automatic high-pass filtering is applied before integration.")
+
+        return self._integrate_acc_to_velocity(self._apply_velocity_highpass(y, fs), fs)
+
+    def _compute_avg_spectrum(self, y: np.ndarray, fs: float, nfft: int, overlap_pct: float,
+                              output_type: str, scale: str, signal_kind: str):
+        ovl = np.clip(overlap_pct / 100.0, 0.0, 0.95)
+        hop = max(1, int(round(nfft * (1.0 - ovl))))
+
+        w = np.hanning(nfft).astype(np.float64)
+        w_sum = np.sum(w)
+
+        if y.size < nfft:
+            frame = np.zeros(nfft, dtype=np.float64)
+            frame[:y.size] = y
+            frames = [frame]
+        else:
+            frames = [y[start:start + nfft] for start in range(0, y.size - nfft + 1, hop)]
+            if not frames:
+                frame = np.zeros(nfft, dtype=np.float64)
+                frame[:min(y.size, nfft)] = y[:min(y.size, nfft)]
+                frames = [frame]
+
+        conv, _ = self._amp_conv_factor_label(signal_kind)
+        acc = None
+
+        for frame in frames:
+            X = np.fft.rfft(frame * w, n=nfft)
+            mag = np.abs(X)
+            A_peak = (2.0 * mag) / w_sum
+            A_peak[0] *= 0.5
+            if (nfft % 2 == 0) and (A_peak.size > 1):
+                A_peak[-1] *= 0.5
+            A = A_peak * conv
+            S = A if output_type == "Amplitude" else (A * A)
+            acc = S if acc is None else (acc + S)
+
+        spec = acc / float(len(frames))
+        freqs = np.fft.rfftfreq(nfft, d=1.0 / fs)
+
+        if scale == "dB":
+            eps = 1e-20
+            spec = (20.0 * np.log10(spec + eps)) if output_type == "Amplitude" else (10.0 * np.log10(spec + eps))
+
+        return freqs, spec
+
+    def _compute_stft(self, y: np.ndarray, fs: float, nfft: int, overlap_pct: float,
+                      output_type: str, scale: str, signal_kind: str):
+        ovl = np.clip(overlap_pct / 100.0, 0.0, 0.95)
+        hop = max(1, int(round(nfft * (1.0 - ovl))))
+
+        w = np.hanning(nfft).astype(np.float64)
+        w_sum = np.sum(w)
+
+        n_frames = 1 if y.size < nfft else max(1, 1 + (y.size - nfft) // hop)
+        freqs = np.fft.rfftfreq(nfft, d=1.0 / fs)
+        S = np.zeros((freqs.size, n_frames), dtype=np.float64)
+        times = np.zeros((n_frames,), dtype=np.float64)
+
+        conv, _ = self._amp_conv_factor_label(signal_kind)
+
+        for i in range(n_frames):
+            start = i * hop
+            times[i] = start / fs
+
+            if start + nfft <= y.size:
+                frame = y[start:start + nfft]
+            else:
+                frame = np.zeros(nfft, dtype=np.float64)
+                take = max(0, y.size - start)
+                if take > 0:
+                    frame[:take] = y[start:start + take]
+
+            X = np.fft.rfft(frame * w, n=nfft)
+            mag = np.abs(X)
+            A_peak = (2.0 * mag) / w_sum
+            A_peak[0] *= 0.5
+            if (nfft % 2 == 0) and (A_peak.size > 1):
+                A_peak[-1] *= 0.5
+            A = A_peak * conv
+            P = A if output_type == "Amplitude" else (A * A)
+            S[:, i] = P
+
+        if scale == "dB":
+            eps = 1e-20
+            S = (20.0 * np.log10(S + eps)) if output_type == "Amplitude" else (10.0 * np.log10(S + eps))
+
+        return freqs, times, S
+
+    def _compute_waterfall_map(self, acc: np.ndarray, rpm: np.ndarray, fs: float,
+                               nfft: int, overlap_pct: float,
+                               output_type: str, scale: str):
+        ovl = np.clip(overlap_pct / 100.0, 0.0, 0.95)
+        hop = max(1, int(round(nfft * (1.0 - ovl))))
+
+        w = np.hanning(nfft).astype(np.float64)
+        w_sum = np.sum(w)
+
+        if acc.size < nfft:
+            n_frames = 1
+        else:
+            n_frames = max(1, 1 + (acc.size - nfft) // hop)
+
+        freqs = np.fft.rfftfreq(nfft, d=1.0 / fs)
+        conv, _ = self._amp_conv_factor_label("acc")
+
+        spectra = []
+        frame_rpm = []
+
+        for i in range(n_frames):
+            start = i * hop
+
+            if start + nfft <= acc.size:
+                a = acc[start:start + nfft]
+                r = rpm[start:start + nfft]
+            else:
+                a = np.zeros(nfft, dtype=np.float64)
+                r = np.zeros(nfft, dtype=np.float64)
+                take = max(0, acc.size - start)
+                if take > 0:
+                    a[:take] = acc[start:start + take]
+                    r[:take] = rpm[start:start + take]
+
+            rpm_value = float(np.nanmedian(r[np.isfinite(r)])) if np.any(np.isfinite(r)) else np.nan
+            if not np.isfinite(rpm_value):
+                continue
+
+            X = np.fft.rfft(a * w, n=nfft)
+            mag = np.abs(X)
+            A_peak = (2.0 * mag) / w_sum
+            A_peak[0] *= 0.5
+            if (nfft % 2 == 0) and (A_peak.size > 1):
+                A_peak[-1] *= 0.5
+            A = A_peak * conv
+            P = A if output_type == "Amplitude" else (A * A)
+
+            spectra.append(P)
+            frame_rpm.append(rpm_value)
+
+        if not spectra:
+            raise RuntimeError("Could not build waterfall frames.")
+
+        spectra = np.asarray(spectra, dtype=np.float64)
+        frame_rpm = np.asarray(frame_rpm, dtype=np.float64)
+
+        m = np.isfinite(frame_rpm)
+        spectra = spectra[m]
+        frame_rpm = frame_rpm[m]
+        if frame_rpm.size < 2:
+            raise RuntimeError("Not enough valid RPM frames for waterfall plotting.")
+
+        order = np.argsort(frame_rpm)
+        frame_rpm = frame_rpm[order]
+        spectra = spectra[order, :]
+
+        rpm_round = np.round(frame_rpm, 1)
+        uniq, inv = np.unique(rpm_round, return_inverse=True)
+        grouped = np.zeros((uniq.size, spectra.shape[1]), dtype=np.float64)
+        counts = np.zeros(uniq.size, dtype=np.float64)
+        for i, g in enumerate(inv):
+            grouped[g] += spectra[i]
+            counts[g] += 1.0
+        grouped /= np.maximum(counts[:, None], 1.0)
+
+        if uniq.size == 1:
+            rpms = uniq.copy()
+            S_map = grouped.copy()
+        else:
+            n_rpm = int(np.clip(max(80, uniq.size), 80, 320))
+            rpms = np.linspace(float(uniq[0]), float(uniq[-1]), n_rpm)
+            S_map = np.vstack([
+                np.interp(rpms, uniq, grouped[:, j], left=np.nan, right=np.nan)
+                for j in range(grouped.shape[1])
+            ]).T
+
+        if scale == "dB":
+            eps = 1e-20
+            S_map = 20.0 * np.log10(S_map + eps) if output_type == "Amplitude" else 10.0 * np.log10(S_map + eps)
+
+        return freqs, rpms, S_map
+
+    def _processing_title(self, use_filtered: bool, signal_kind: str) -> str:
+        if signal_kind == "vel":
+            return " | Source=Raw acceleration | AutoVel: HP 10 Hz | order=4 | zero-phase | integrate"
+
+        if use_filtered:
+            btype, order, f1, f2 = self._filter_params()
+            if btype in ("bandpass", "bandstop"):
+                return f" | Source=Filtered | Butterworth {btype} | order={order} | fc=[{f1:g}, {f2:g}] Hz | zero-phase"
+            return f" | Source=Filtered | Butterworth {btype} | order={order} | fc={f1:g} Hz | zero-phase"
+
+        return " | Source=Unfiltered"
+
+    def _build_waterfall_state(self, raw_signals: dict):
+        fs = float(self.cfg["fs"])
+        nfft = int(self.cfg["nfft"])
+        overlap_pct = float(self.cfg["overlap_pct"])
+        out_type = self.cfg["out_type"]
+        scale = self.cfg["scale"]
+
+        group_or_sheet = self.cfg["group_or_sheet"]
+        file_base = os.path.splitext(os.path.basename(self.cfg["file_path"]))[0]
+        rpm_name = self.cfg["waterfall_rpm_name"]
+        acc_name = self.cfg["waterfall_acc_name"]
+        filt_target = self.cfg.get("waterfall_filter_target", "None")
+
+        if rpm_name not in raw_signals:
+            raise KeyError(f"RPM channel not found: {rpm_name}")
+        if acc_name not in raw_signals:
+            raise KeyError(f"Acceleration channel not found: {acc_name}")
+
+        acc, rpm = self._prep_paired_signals(raw_signals[acc_name], raw_signals[rpm_name])
+        acc = self._maybe_apply_filter_target(acc, "acc")
+        rpm = self._maybe_apply_filter_target(rpm, "rpm")
+
+        freqs, rpms, S_map = self._compute_waterfall_map(acc, rpm, fs, nfft, overlap_pct, out_type, scale)
+        _, unit_lbl = self._amp_conv_factor_label("acc")
+
+        colorbar_label = (
+            f"Amplitude (dB re 1 {unit_lbl})" if scale == "dB" else f"Amplitude ({unit_lbl})"
+        ) if out_type == "Amplitude" else (
+            f"Power (dB re 1 ({unit_lbl})²)" if scale == "dB" else f"Power ({unit_lbl}²)"
+        )
+
+        proc_title = f" | FilterTarget={filt_target}"
+        key = f"waterfall|{group_or_sheet}|{acc_name}|{rpm_name}"
+
+        return {
+            "key": key,
+            "kind": "waterfall",
+            "name": acc_name,
+            "short_title": f"{acc_name} | Waterfall",
+            "title": (
+                f"{file_base} | {group_or_sheet} | Waterfall | Acc={acc_name} | RPM={rpm_name}"
+                f"{proc_title} | NFFT={nfft}, Overlap={overlap_pct:.1f}% | {out_type} ({scale})"
+            ),
+            "xlabel": "Frequency (Hz)",
+            "ylabel": "RPM",
+            "freqs": freqs,
+            "rpms": rpms,
+            "S": S_map,
+            "colorbar_label": colorbar_label,
+            "stats_text": f"Waterfall built from Acc={acc_name}, RPM={rpm_name}",
+        }
+
+    def _build_plot_states(self):
+        fs = float(self.cfg["fs"])
+        crop = bool(self.cfg["crop"])
+        t0 = float(self.cfg["t0"])
+        mode = self.cfg["mode"]
+        signal_kind = self.cfg["signal_kind"]
+        signal_name = self.cfg["signal_name"]
+        names = self.cfg["names"]
+        group_or_sheet = self.cfg["group_or_sheet"]
+        file_base = os.path.splitext(os.path.basename(self.cfg["file_path"]))[0]
+        use_filtered = bool(self.cfg["use_filtered"]) if signal_kind == "acc" else False
+
+        raw_signals = self._load_selected_signals()
+
+        if mode == "Waterfall (RPM + Acceleration)":
+            return [self._build_waterfall_state(raw_signals)]
+
+        states = []
+
+        for nm in names:
+            y = self._get_processed_signal(np.asarray(raw_signals[nm]))
+            short_title = f"{nm} | {signal_name}"
+            proc_title = self._processing_title(use_filtered, signal_kind)
+            key = f"{mode}|{signal_kind}|{group_or_sheet}|{nm}"
+
+            if mode.startswith("Time Domain"):
+                start_offset = t0 if crop else 0.0
+                t = self._make_time_axis(y.size, fs, start_offset_s=start_offset)
+
+                states.append({
+                    "key": key,
+                    "kind": "time",
+                    "name": nm,
+                    "short_title": short_title,
+                    "title": f"{file_base} | {group_or_sheet} | {signal_name}{proc_title} | {nm}",
+                    "xlabel": "Time (s)",
+                    "ylabel": self._signal_ylabel(signal_kind),
+                    "grid": True,
+                    "series": [{"x": t, "y": y, "label": nm}],
+                    "stats_text": self._time_stats_text(nm, y, signal_kind),
+                })
+                continue
+
+            nfft = int(self.cfg["nfft"])
+            overlap_pct = float(self.cfg["overlap_pct"])
+            out_type = self.cfg["out_type"]
+            scale = self.cfg["scale"]
+            method = self.cfg["method"]
+            _, unit_lbl = self._amp_conv_factor_label(signal_kind)
+
+            if method == "Averaged Spectrum":
+                freqs, spec = self._compute_avg_spectrum(y, fs, nfft, overlap_pct, out_type, scale, signal_kind)
+
+                ylabel = (
+                    f"Amplitude (dB re 1 {unit_lbl})" if scale == "dB" else f"Amplitude ({unit_lbl})"
+                ) if out_type == "Amplitude" else (
+                    f"Power (dB re 1 ({unit_lbl})²)" if scale == "dB" else f"Power ({unit_lbl}²)"
+                )
+
+                states.append({
+                    "key": key,
+                    "kind": "avg",
+                    "name": nm,
+                    "short_title": short_title,
+                    "title": f"{file_base} | {group_or_sheet} | Averaged Spectrum ({signal_name}){proc_title} | {nm} | NFFT={nfft}, Overlap={overlap_pct:.1f}% | {out_type} ({scale}) | {unit_lbl}",
+                    "xlabel": "Frequency (Hz)",
+                    "ylabel": ylabel,
+                    "grid": True,
+                    "series": [{"x": freqs, "y": spec, "label": nm}],
+                    "stats_text": "",
+                })
+                continue
+
+            freqs, times, S = self._compute_stft(y, fs, nfft, overlap_pct, out_type, scale, signal_kind)
+            if crop:
+                times = times + t0
+
+            colorbar_label = (
+                f"Amplitude (dB re 1 {unit_lbl})" if scale == "dB" else f"Amplitude ({unit_lbl})"
+            ) if out_type == "Amplitude" else (
+                f"Power (dB re 1 ({unit_lbl})²)" if scale == "dB" else f"Power ({unit_lbl}²)"
+            )
+
+            states.append({
+                "key": key,
+                "kind": "stft",
+                "name": nm,
+                "short_title": short_title,
+                "title": f"{file_base} | {group_or_sheet} | STFT Spectrogram ({signal_name}){proc_title} | {nm} | NFFT={nfft}, Overlap={overlap_pct:.1f}% | {out_type} ({scale}) | {unit_lbl}",
+                "xlabel": "Time (s)",
+                "ylabel": "Frequency (Hz)",
+                "freqs": freqs,
+                "times": times,
+                "S": S,
+                "out_type": out_type,
+                "scale": scale,
+                "unit_lbl": unit_lbl,
+                "colorbar_label": colorbar_label,
+                "stats_text": "",
+            })
+
+        if not states:
+            raise RuntimeError("No data left to plot after preprocessing.")
+
+        return states
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Excel/TDMS Signal Plotter (PyQt5 + PyQtGraph)")
+
+        self.file_path = None
+        self.file_type = None
+        self.sheet_names = []
+
+        self._file_thread = None
+        self._file_worker = None
+        self._sheet_thread = None
+        self._sheet_worker = None
+        self._plot_thread = None
+        self._plot_worker = None
+
+        self._plot_states = {}
+        self._mini_widgets = {}
+        self._detail_widgets = {}
+        self._overview_order = []
+        self._active_canvas = None
+        self._active_plot_key = None
+        self._pending_waterfall_open_3d = False
+
+        self.btn_open = QPushButton("Open File (.xlsx / .tdms)")
+        self.lbl_file = QLabel("Selected file: -")
+        self.lbl_file.setWordWrap(True)
+
+        self.progress = QProgressBar()
+        self.progress.setVisible(False)
+        self.progress.setTextVisible(False)
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        self.progress.setFixedHeight(10)
+
+        self.lbl_status = QLabel("")
+        self.lbl_status.setStyleSheet("color: #444;")
+        self.lbl_status.setWordWrap(True)
+
+        self.cmb_sheet = QComboBox()
+        self.cmb_sheet.setEnabled(False)
+
+        self.list_channels = QListWidget()
+        self.list_channels.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.list_channels.setEnabled(False)
+        self.list_channels.setMinimumHeight(110)
+
+        self.btn_select_all = QPushButton("Select All")
+        self.btn_clear_sel = QPushButton("Clear Selection")
+        self.btn_select_all.setEnabled(False)
+        self.btn_clear_sel.setEnabled(False)
+
+        self.fs_spin = QDoubleSpinBox()
+        self.fs_spin.setRange(0.1, 1_000_000.0)
+        self.fs_spin.setDecimals(2)
+        self.fs_spin.setValue(10000.0)
+
+        self.chk_skip_first = QCheckBox("Skip first sample (y[1:])")
+
+        self.chk_crop = QCheckBox("Enable time window (crop)")
+        self.t0_spin = QDoubleSpinBox()
+        self.t0_spin.setRange(0.0, 1_000_000_000.0)
+        self.t0_spin.setDecimals(3)
+        self.t0_spin.setValue(10.0)
+        self.t0_spin.setEnabled(False)
+
+        self.t1_spin = QDoubleSpinBox()
+        self.t1_spin.setRange(0.0, 1_000_000_000.0)
+        self.t1_spin.setDecimals(3)
+        self.t1_spin.setValue(30.0)
+        self.t1_spin.setEnabled(False)
+
+        self.cmb_mode = QComboBox()
+        self.cmb_mode.addItems([
+            "Time Domain (Acceleration)",
+            "Time Domain (Velocity)",
+            "Fourier Transform (Acceleration)",
+            "Waterfall (RPM + Acceleration)",
+        ])
+
+        self.cmb_fourier_method = QComboBox()
+        self.cmb_fourier_method.addItems(["Averaged Spectrum", "STFT (Spectrogram)"])
+
+        self.cmb_nfft = QComboBox()
+        self.cmb_nfft.addItems([str(x) for x in [256, 512, 1024, 2048, 4096, 8192, 16384, 32768]])
+        self.cmb_nfft.setCurrentText("8192")
+
+        self.ovl_spin = QDoubleSpinBox()
+        self.ovl_spin.setRange(0.0, 95.0)
+        self.ovl_spin.setDecimals(1)
+        self.ovl_spin.setSingleStep(5.0)
+        self.ovl_spin.setValue(67.0)
+
+        self.cmb_out = QComboBox()
+        self.cmb_out.addItems(["Amplitude", "Power"])
+
+        self.cmb_scale = QComboBox()
+        self.cmb_scale.addItems(["Linear", "dB"])
+
+        self.cmb_amp_conv = QComboBox()
+        self.cmb_amp_conv.addItems(["Peak", "RMS", "Peak-to-Peak"])
+        self.cmb_amp_conv.setCurrentText("RMS")
+
+        self.cmb_data_source = QComboBox()
+        self.cmb_data_source.addItems(["Unfiltered", "Filtered"])
+        self.cmb_data_source.setCurrentText("Unfiltered")
+
+        self.lbl_fft_info = QLabel("Frequency resolution: -")
+        self.lbl_fft_info.setStyleSheet("color: #444;")
+
+        self.lbl_stats = QLabel("")
+        self.lbl_stats.setStyleSheet("color: #444;")
+        self.lbl_stats.setWordWrap(True)
+
+        self.chk_filter = QCheckBox("Enable Butterworth filter (zero-phase: forward+backward)")
+        self.chk_filter.setChecked(False)
+        if not _HAVE_SCIPY:
+            self.chk_filter.setEnabled(False)
+            self.chk_filter.setToolTip("SciPy not found. Install: pip install scipy")
+
+        self.cmb_filter_type = QComboBox()
+        self.cmb_filter_type.addItems(["Low-pass", "High-pass", "Band-pass", "Band-reject"])
+        self.cmb_filter_type.setEnabled(False)
+
+        self.cmb_filter_order = QComboBox()
+        self.cmb_filter_order.addItems([str(i) for i in range(1, 9)])
+        self.cmb_filter_order.setCurrentText("4")
+        self.cmb_filter_order.setEnabled(False)
+
+        self.cut1_spin = QDoubleSpinBox()
+        self.cut1_spin.setRange(0.0, 1_000_000.0)
+        self.cut1_spin.setDecimals(3)
+        self.cut1_spin.setValue(100.0)
+        self.cut1_spin.setEnabled(False)
+
+        self.lbl_cut2 = QLabel("Cutoff 2 (Hz):")
+        self.cut2_spin = QDoubleSpinBox()
+        self.cut2_spin.setRange(0.0, 1_000_000.0)
+        self.cut2_spin.setDecimals(3)
+        self.cut2_spin.setValue(300.0)
+        self.cut2_spin.setEnabled(False)
+
+        self.btn_plot = QPushButton("Plot")
+        self.btn_plot.setEnabled(False)
+
+        self.lbl_wf_hint = QLabel("Waterfall mode asks you to choose one RPM channel and one acceleration channel.")
+        self.lbl_wf_hint.setStyleSheet("color: #666;")
+        self.lbl_wf_hint.setWordWrap(True)
+
+        self.btn_zoom_in = QPushButton("Zoom In")
+        self.btn_zoom_out = QPushButton("Zoom Out")
+        self.btn_reset_view = QPushButton("Reset View")
+        self.btn_rect_zoom = QPushButton("Rectangle Zoom")
+        self.btn_rect_zoom.setCheckable(True)
+        self.btn_apply_plot_view = QPushButton("Apply Plot View")
+        self.btn_export_plot = QPushButton("Export Current Plot")
+
+        self.edit_xlabel = QLineEdit()
+        self.edit_ylabel = QLineEdit()
+        self.edit_xlabel.setPlaceholderText("X axis label")
+        self.edit_ylabel.setPlaceholderText("Y axis label")
+        self.edit_xlabel.setEnabled(False)
+        self.edit_ylabel.setEnabled(False)
+
+        self.cmb_spec_render = QComboBox()
+        self.cmb_spec_render.addItems(["ImageItem"])
+        self.cmb_spec_render.setCurrentText("ImageItem")
+
+        self.cmb_spec_cmap = QComboBox()
+        self.cmb_spec_cmap.addItems([
+            "viridis", "plasma", "inferno", "magma", "cividis",
+            "turbo", "jet", "hot", "cool", "coolwarm",
+            "nipy_spectral", "gist_rainbow"
+        ])
+        self.cmb_spec_cmap.setCurrentText("viridis")
+
+        self.chk_spec_cmap_reverse = QCheckBox("Reverse colors")
+
+        self.spec_levels_spin = QSpinBox()
+        self.spec_levels_spin.setRange(4, 512)
+        self.spec_levels_spin.setValue(80)
+        self.spec_levels_spin.setEnabled(False)
+
+        self.chk_manual_clim = QCheckBox("Manual color range (vmin/vmax)")
+
+        self.spec_vmin_spin = QDoubleSpinBox()
+        self.spec_vmin_spin.setRange(-1_000_000_000.0, 1_000_000_000.0)
+        self.spec_vmin_spin.setDecimals(6)
+        self.spec_vmin_spin.setValue(-80.0)
+        self.spec_vmin_spin.setEnabled(False)
+
+        self.spec_vmax_spin = QDoubleSpinBox()
+        self.spec_vmax_spin.setRange(-1_000_000_000.0, 1_000_000_000.0)
+        self.spec_vmax_spin.setDecimals(6)
+        self.spec_vmax_spin.setValue(0.0)
+        self.spec_vmax_spin.setEnabled(False)
+
+        self.plot_pages = QTabWidget()
+        self.plot_pages.setTabsClosable(True)
+        self.plot_pages.tabCloseRequested.connect(self._on_plot_page_close)
+        self.plot_pages.currentChanged.connect(self._on_plot_page_changed)
+
+        self.overview_page = QWidget()
+        self.plot_pages.addTab(self.overview_page, "Overview")
+
+        self.overview_scroll = QScrollArea()
+        self.overview_scroll.setWidgetResizable(True)
+
+        self.overview_inner = QWidget()
+        self.overview_grid = QGridLayout(self.overview_inner)
+        self.overview_grid.setContentsMargins(6, 6, 6, 6)
+        self.overview_grid.setSpacing(8)
+
+        self.overview_scroll.setWidget(self.overview_inner)
+
+        self.lbl_overview_empty = QLabel("No plots yet.")
+        self.lbl_overview_empty.setStyleSheet("color: #666;")
+
+        ovlay = QVBoxLayout(self.overview_page)
+        ovlay.addWidget(self.lbl_overview_empty)
+        ovlay.addWidget(self.overview_scroll, 1)
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(6, 6, 6, 6)
+
+        self.tabs = QTabWidget()
+        root.addWidget(self.tabs)
+
+        self.tab_controls = QWidget()
+        self.tab_plot = QWidget()
+        self.tabs.addTab(self.tab_controls, "Controls")
+        self.tabs.addTab(self.tab_plot, "Plot View")
+
+        ctl = QVBoxLayout(self.tab_controls)
+        ctl.addWidget(self.btn_open)
+        ctl.addWidget(self.lbl_file)
+        ctl.addWidget(self.progress)
+        ctl.addWidget(self.lbl_status)
+
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("Sheet / Group:"))
+        row1.addWidget(self.cmb_sheet, 2)
+        row1.addSpacing(12)
+        row1.addWidget(QLabel("Plot Mode:"))
+        row1.addWidget(self.cmb_mode, 1)
+        ctl.addLayout(row1)
+
+        ctl.addWidget(self.lbl_wf_hint)
+        ctl.addWidget(QLabel("Channel(s) / Column(s):"))
+        ctl.addWidget(self.list_channels)
+
+        row_ch = QHBoxLayout()
+        row_ch.addWidget(self.btn_select_all)
+        row_ch.addWidget(self.btn_clear_sel)
+        row_ch.addStretch(1)
+        ctl.addLayout(row_ch)
+
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("fs (Hz):"))
+        row2.addWidget(self.fs_spin)
+        row2.addSpacing(14)
+        row2.addWidget(self.chk_skip_first)
+        row2.addSpacing(14)
+        row2.addWidget(QLabel("Data Source:"))
+        row2.addWidget(self.cmb_data_source)
+        row2.addStretch(1)
+        ctl.addLayout(row2)
+
+        row_filt = QHBoxLayout()
+        row_filt.addWidget(self.chk_filter)
+        row_filt.addSpacing(12)
+        row_filt.addWidget(QLabel("Type:"))
+        row_filt.addWidget(self.cmb_filter_type)
+        row_filt.addSpacing(8)
+        row_filt.addWidget(QLabel("Order:"))
+        row_filt.addWidget(self.cmb_filter_order)
+        row_filt.addSpacing(8)
+        row_filt.addWidget(QLabel("Cutoff 1 (Hz):"))
+        row_filt.addWidget(self.cut1_spin)
+        row_filt.addWidget(self.lbl_cut2)
+        row_filt.addWidget(self.cut2_spin)
+        row_filt.addStretch(1)
+        ctl.addLayout(row_filt)
+
+        row3 = QHBoxLayout()
+        row3.addWidget(self.chk_crop)
+        row3.addWidget(QLabel("Start (s):"))
+        row3.addWidget(self.t0_spin)
+        row3.addWidget(QLabel("End (s):"))
+        row3.addWidget(self.t1_spin)
+        row3.addStretch(1)
+        row3.addWidget(self.btn_plot)
+        ctl.addLayout(row3)
+
+        row_fft = QHBoxLayout()
+        row_fft.addWidget(QLabel("Fourier Method:"))
+        row_fft.addWidget(self.cmb_fourier_method)
+        row_fft.addSpacing(12)
+        row_fft.addWidget(QLabel("Buffer Size (NFFT):"))
+        row_fft.addWidget(self.cmb_nfft)
+        row_fft.addWidget(QLabel("Overlap (%):"))
+        row_fft.addWidget(self.ovl_spin)
+        row_fft.addWidget(QLabel("Output:"))
+        row_fft.addWidget(self.cmb_out)
+        row_fft.addWidget(QLabel("Scale:"))
+        row_fft.addWidget(self.cmb_scale)
+        row_fft.addWidget(QLabel("Amplitude convention:"))
+        row_fft.addWidget(self.cmb_amp_conv)
+        row_fft.addStretch(1)
+        ctl.addLayout(row_fft)
+
+        ctl.addWidget(self.lbl_fft_info)
+        ctl.addWidget(self.lbl_stats)
+        ctl.addStretch(1)
+
+        ptab = QVBoxLayout(self.tab_plot)
+
+        row_nav = QHBoxLayout()
+        row_nav.addWidget(self.btn_zoom_in)
+        row_nav.addWidget(self.btn_zoom_out)
+        row_nav.addWidget(self.btn_reset_view)
+        row_nav.addWidget(self.btn_rect_zoom)
+        row_nav.addSpacing(12)
+        row_nav.addWidget(self.btn_apply_plot_view)
+        row_nav.addWidget(self.btn_export_plot)
+        row_nav.addStretch(1)
+        ptab.addLayout(row_nav)
+
+        row_axis = QHBoxLayout()
+        row_axis.addWidget(QLabel("X Axis Name:"))
+        row_axis.addWidget(self.edit_xlabel, 1)
+        row_axis.addSpacing(10)
+        row_axis.addWidget(QLabel("Y Axis Name:"))
+        row_axis.addWidget(self.edit_ylabel, 1)
+        ptab.addLayout(row_axis)
+
+        row_spec = QHBoxLayout()
+        row_spec.addWidget(QLabel("Spectrogram render:"))
+        row_spec.addWidget(self.cmb_spec_render)
+        row_spec.addSpacing(8)
+        row_spec.addWidget(QLabel("Colormap:"))
+        row_spec.addWidget(self.cmb_spec_cmap)
+        row_spec.addWidget(self.chk_spec_cmap_reverse)
+        row_spec.addSpacing(8)
+        row_spec.addWidget(QLabel("Levels:"))
+        row_spec.addWidget(self.spec_levels_spin)
+        row_spec.addSpacing(8)
+        row_spec.addWidget(self.chk_manual_clim)
+        row_spec.addWidget(QLabel("vmin:"))
+        row_spec.addWidget(self.spec_vmin_spin)
+        row_spec.addWidget(QLabel("vmax:"))
+        row_spec.addWidget(self.spec_vmax_spin)
+        row_spec.addStretch(1)
+        ptab.addLayout(row_spec)
+
+        ptab.addWidget(self.plot_pages, 1)
+
+        self.btn_open.clicked.connect(self.open_file)
+        self.cmb_sheet.currentIndexChanged.connect(self.load_sheet_or_group)
+        self.btn_plot.clicked.connect(self.plot)
+        self.chk_crop.stateChanged.connect(self._on_crop_toggle)
+        self.btn_select_all.clicked.connect(self._select_all_channels)
+        self.btn_clear_sel.clicked.connect(self._clear_channel_selection)
+
+        self.cmb_mode.currentIndexChanged.connect(self._on_mode_change)
+        self.cmb_fourier_method.currentIndexChanged.connect(self._sync_spectrogram_controls)
+
+        self.fs_spin.valueChanged.connect(self._update_fft_info)
+        self.cmb_nfft.currentTextChanged.connect(self._update_fft_info)
+        self.ovl_spin.valueChanged.connect(self._update_fft_info)
+        self.cmb_amp_conv.currentIndexChanged.connect(self._update_fft_info)
+        self.cmb_mode.currentIndexChanged.connect(self._update_fft_info)
+
+        self.cmb_data_source.currentIndexChanged.connect(self._on_data_source_change)
+        self.chk_filter.stateChanged.connect(self._on_filter_toggle)
+        self.cmb_filter_type.currentIndexChanged.connect(self._on_filter_type_change)
+
+        self.btn_zoom_in.clicked.connect(lambda: self._zoom_active(0.8))
+        self.btn_zoom_out.clicked.connect(lambda: self._zoom_active(1.25))
+        self.btn_reset_view.clicked.connect(self._reset_active_view)
+        self.btn_rect_zoom.toggled.connect(self._on_rect_zoom_toggled)
+        self.chk_manual_clim.stateChanged.connect(self._on_manual_clim_toggle)
+        self.btn_apply_plot_view.clicked.connect(self._apply_plot_view)
+        self.btn_export_plot.clicked.connect(self._export_current_plot)
+
+        self._sync_data_source_items()
+        self._on_mode_change()
+        self._on_filter_type_change()
+        self._sync_spectrogram_controls()
+        self._update_fft_info()
+        self._refresh_enabled_state()
+
+    def _set_busy(self, active: bool, text: str = ""):
+        if active:
+            self.progress.setVisible(True)
+            self.progress.setRange(0, 0)
+        else:
+            self.progress.setVisible(False)
+            self.progress.setRange(0, 1)
+            self.progress.setValue(0)
+
+        self.lbl_status.setText(text)
+
+    def _thread_running(self, thread_obj):
+        try:
+            return thread_obj is not None and thread_obj.isRunning()
+        except Exception:
+            return False
+
+    def _refresh_enabled_state(self):
+        busy = (
+            self._thread_running(self._file_thread) or
+            self._thread_running(self._sheet_thread) or
+            self._thread_running(self._plot_thread)
+        )
+
+        self.btn_open.setEnabled(not busy)
+        self.cmb_sheet.setEnabled(bool(self.sheet_names) and not busy)
+
+        ready = (self.list_channels.count() > 0) and not busy
+        self.list_channels.setEnabled(ready)
+        self.btn_select_all.setEnabled(ready)
+        self.btn_clear_sel.setEnabled(ready)
+        self.btn_plot.setEnabled(ready)
+
+    def _plot_color_cfg(self):
+        return {
+            "cmap": self.cmb_spec_cmap.currentText().strip(),
+            "reverse": self.chk_spec_cmap_reverse.isChecked(),
+            "manual_clim": self.chk_manual_clim.isChecked(),
+            "vmin": float(self.spec_vmin_spin.value()),
+            "vmax": float(self.spec_vmax_spin.value()),
+        }
+
+    def _load_axis_editors_from_state(self, state=None):
+        st = state or (self._plot_states.get(self._active_plot_key) if self._active_plot_key else None)
+
+        self.edit_xlabel.blockSignals(True)
+        self.edit_ylabel.blockSignals(True)
+
+        if st is None:
+            self.edit_xlabel.setText("")
+            self.edit_ylabel.setText("")
+        else:
+            self.edit_xlabel.setText(str(st.get("xlabel", "")))
+            self.edit_ylabel.setText(str(st.get("ylabel", "")))
+
+        self.edit_xlabel.blockSignals(False)
+        self.edit_ylabel.blockSignals(False)
+
+    def _refresh_plot_views_for_key(self, key, preserve_active_limits=True, preserve_active_annotations=True):
+        if key not in self._plot_states:
+            return
+
+        state = self._plot_states[key]
+
+        canvases = []
+        mini = self._mini_widgets.get(key)
+        detail = self._detail_widgets.get(key)
+
+        if mini is not None:
+            canvases.append(mini.canvas)
+        if detail is not None:
+            canvases.append(detail.canvas)
+
+        for canvas in canvases:
+            is_active = (canvas is self._active_canvas and self._active_plot_key == key)
+            canvas.set_state(
+                state,
+                color_cfg=self._plot_color_cfg(),
+                preserve_view=(preserve_active_limits and is_active),
+                preserve_annotations=(preserve_active_annotations and is_active),
+            )
+
+    def _clear_overview_widgets(self):
+        for w in list(self._mini_widgets.values()):
+            w.setParent(None)
+            w.deleteLater()
+        self._mini_widgets.clear()
+        self._overview_order.clear()
+
+        while self.overview_grid.count():
+            item = self.overview_grid.takeAt(0)
+            w = item.widget()
+            if w:
+                w.setParent(None)
+                w.deleteLater()
+
+    def _clear_detail_tabs(self):
+        for key, widget in list(self._detail_widgets.items()):
+            idx = self.plot_pages.indexOf(widget)
+            if idx >= 0:
+                self.plot_pages.removeTab(idx)
+            widget.deleteLater()
+        self._detail_widgets.clear()
+
+    def _reset_plot_workspace(self):
+        self._plot_states.clear()
+        self._clear_overview_widgets()
+        self._clear_detail_tabs()
+
+        self.lbl_overview_empty.setVisible(True)
+        self._active_canvas = None
+        self._active_plot_key = None
+        self.plot_pages.setCurrentIndex(0)
+        self._sync_spectrogram_controls()
+        self._load_axis_editors_from_state(None)
+
+    def _reset_loaded_state(self, keep_path=False):
+        if not keep_path:
+            self.file_path = None
+            self.lbl_file.setText("Selected file: -")
+
+        self.file_type = None
+        self.sheet_names = []
+
+        self.cmb_sheet.blockSignals(True)
+        self.cmb_sheet.clear()
+        self.cmb_sheet.blockSignals(False)
+
+        self.list_channels.clear()
+        self.lbl_stats.setText("")
+        self._reset_plot_workspace()
+        self._refresh_enabled_state()
+
+    def _cleanup_file_thread(self):
+        if self._file_worker is not None:
+            self._file_worker.deleteLater()
+            self._file_worker = None
+        if self._file_thread is not None:
+            self._file_thread.deleteLater()
+            self._file_thread = None
+
+        self._set_busy(False, "")
+        self._refresh_enabled_state()
+
+    def _cleanup_sheet_thread(self):
+        if self._sheet_worker is not None:
+            self._sheet_worker.deleteLater()
+            self._sheet_worker = None
+        if self._sheet_thread is not None:
+            self._sheet_thread.deleteLater()
+            self._sheet_thread = None
+
+        self._set_busy(False, "")
+        self._refresh_enabled_state()
+
+    def _cleanup_plot_thread(self):
+        if self._plot_worker is not None:
+            self._plot_worker.deleteLater()
+            self._plot_worker = None
+        if self._plot_thread is not None:
+            self._plot_thread.deleteLater()
+            self._plot_thread = None
+
+        self._set_busy(False, "")
+        self._refresh_enabled_state()
+
+    def _start_file_open_worker(self, path: str):
+        if self._thread_running(self._file_thread) or self._thread_running(self._sheet_thread) or self._thread_running(self._plot_thread):
+            self._err("Another operation is already running.")
+            return
+
+        self._set_busy(True, "Reading file metadata in background...")
+        self._refresh_enabled_state()
+
+        self._file_thread = QThread(self)
+        self._file_worker = FileOpenWorker(path)
+        self._file_worker.moveToThread(self._file_thread)
+
+        self._file_thread.started.connect(self._file_worker.run)
+        self._file_worker.finished.connect(self._on_file_open_finished)
+        self._file_worker.error.connect(self._on_file_open_error)
+
+        self._file_worker.finished.connect(self._file_thread.quit)
+        self._file_worker.error.connect(self._file_thread.quit)
+        self._file_thread.finished.connect(self._cleanup_file_thread)
+
+        self._file_thread.start()
+
+    def _start_sheet_load_worker(self, name: str):
+        if not self.file_path or not self.file_type or not name:
+            return
+        if self._thread_running(self._sheet_thread) or self._thread_running(self._plot_thread):
+            return
+
+        self._set_busy(True, f"Loading '{name}' in background...")
+        self.list_channels.clear()
+        self.lbl_stats.setText("")
+        self._refresh_enabled_state()
+
+        self._sheet_thread = QThread(self)
+        self._sheet_worker = SheetLoadWorker(self.file_path, self.file_type, name)
+        self._sheet_worker.moveToThread(self._sheet_thread)
+
+        self._sheet_thread.started.connect(self._sheet_worker.run)
+        self._sheet_worker.finished.connect(self._on_sheet_load_finished)
+        self._sheet_worker.error.connect(self._on_sheet_load_error)
+
+        self._sheet_worker.finished.connect(self._sheet_thread.quit)
+        self._sheet_worker.error.connect(self._sheet_thread.quit)
+        self._sheet_thread.finished.connect(self._cleanup_sheet_thread)
+
+        self._sheet_thread.start()
+
+    def _on_file_open_finished(self, meta):
+        self.file_type = meta["file_type"]
+        self.sheet_names = list(meta["sheet_names"])
+
+        self.cmb_sheet.blockSignals(True)
+        self.cmb_sheet.clear()
+        self.cmb_sheet.addItems(self.sheet_names)
+
+        idx = max(0, min(int(meta.get("default_index", 0)), len(self.sheet_names) - 1))
+        self.cmb_sheet.setCurrentIndex(idx)
+        self.cmb_sheet.blockSignals(False)
+
+        self._refresh_enabled_state()
+        self.load_sheet_or_group()
+
+    def _on_file_open_error(self, msg: str):
+        self._err(f"Failed to open file:\n{msg}")
+
+    def _on_sheet_load_finished(self, result):
+        self._fill_channel_list(result["names"], result.get("prefer_index", 0))
+        self._refresh_enabled_state()
+
+    def _on_sheet_load_error(self, msg: str):
+        self._err(f"Failed to load selected sheet/group:\n{msg}")
+
+    def _on_crop_toggle(self, _state):
+        enabled = self.chk_crop.isChecked()
+        self.t0_spin.setEnabled(enabled)
+        self.t1_spin.setEnabled(enabled)
+
+    def _select_all_channels(self):
+        self.list_channels.selectAll()
+
+    def _clear_channel_selection(self):
+        self.list_channels.clearSelection()
+
+    def _fill_channel_list(self, names, prefer_index=0):
+        self.list_channels.blockSignals(True)
+        self.list_channels.clear()
+        for nm in names:
+            self.list_channels.addItem(QListWidgetItem(nm))
+        self.list_channels.blockSignals(False)
+
+        idx = prefer_index if 0 <= prefer_index < len(names) else 0
+        if self.list_channels.count() > 0:
+            self.list_channels.setCurrentRow(idx)
+            self.list_channels.item(idx).setSelected(True)
+
+        self._refresh_enabled_state()
+
+    def _get_selected_names(self):
+        items = self.list_channels.selectedItems()
+        return [it.text() for it in items] if items else ([self.list_channels.currentItem().text()] if self.list_channels.currentItem() else [])
+
+    def _set_combo_item_enabled(self, combo, index, enabled):
+        try:
+            item = combo.model().item(index)
+            if item is not None:
+                item.setEnabled(enabled)
+        except Exception:
+            pass
+
+    def _is_fourier_mode(self):
+        return self.cmb_mode.currentText().startswith("Fourier Transform")
+
+    def _is_velocity_mode(self):
+        return self.cmb_mode.currentText() == "Time Domain (Velocity)"
+
+    def _is_velocity_time_mode(self):
+        return self.cmb_mode.currentText() == "Time Domain (Velocity)"
+
+    def _is_waterfall_mode(self):
+        return self.cmb_mode.currentText() == "Waterfall (RPM + Acceleration)"
+
+    def _guess_rpm_channel(self):
+        names = [self.list_channels.item(i).text() for i in range(self.list_channels.count())]
+        if not names:
+            return ""
+        keys = ["rpm", "tach", "speed", "rev", "rot"]
+        for nm in names:
+            lo = nm.lower()
+            if any(k in lo for k in keys):
+                return nm
+        return names[0]
+
+    def _guess_acc_channel(self):
+        names = [self.list_channels.item(i).text() for i in range(self.list_channels.count())]
+        if not names:
+            return ""
+        keys = ["acc", "vib", "g", "z", "x", "y"]
+        for nm in names:
+            lo = nm.lower()
+            if any(k in lo for k in keys) and ("rpm" not in lo) and ("tach" not in lo):
+                return nm
+        return names[min(1, len(names) - 1)]
+
+    def _selected_signal_kind(self):
+        if self._is_velocity_time_mode():
+            return "vel"
+        return "acc"
+
+    def _signal_name(self):
+        return "Velocity" if self._selected_signal_kind() == "vel" else "Acceleration"
+
+    def _signal_unit_short(self):
+        return VEL_UNIT if self._selected_signal_kind() == "vel" else "g"
+
+    def _amp_conv_factor_label(self):
+        unit = self._signal_unit_short()
+        sel = self.cmb_amp_conv.currentText()
+
+        if sel == "Peak":
+            return 1.0, f"{unit} (peak)"
+        if sel == "RMS":
+            return 1.0 / np.sqrt(2.0), f"{unit} RMS"
+        return 2.0, f"{unit} p-p"
+
+    def _sync_data_source_items(self):
+        velocity_mode = self._is_velocity_time_mode()
+
+        self._set_combo_item_enabled(self.cmb_data_source, 0, True)
+        self._set_combo_item_enabled(self.cmb_data_source, 1, bool(_HAVE_SCIPY) and not velocity_mode)
+
+        if velocity_mode:
+            self.cmb_data_source.blockSignals(True)
+            self.cmb_data_source.setCurrentText("Unfiltered")
+            self.cmb_data_source.blockSignals(False)
+            self.cmb_data_source.setEnabled(False)
+        else:
+            self.cmb_data_source.setEnabled(True)
+            if (not _HAVE_SCIPY) and self.cmb_data_source.currentText() == "Filtered":
+                self.cmb_data_source.setCurrentText("Unfiltered")
+
+    def _on_data_source_change(self, *_):
+        self._sync_data_source_items()
+
+        if self.cmb_data_source.currentText() == "Filtered":
+            if not _HAVE_SCIPY:
+                self._err("Filtered data requires SciPy.\nInstall with: pip install scipy")
+                self.cmb_data_source.setCurrentText("Unfiltered")
+                return
+            if not self.chk_filter.isChecked():
+                self.chk_filter.setChecked(True)
+
+        self._sync_filter_enabled_state()
+        self._update_fft_info()
+
+    def _on_filter_type_change(self, *_):
+        is_band = self.cmb_filter_type.currentText().startswith("Band-")
+        self.lbl_cut2.setVisible(is_band)
+        self.cut2_spin.setVisible(is_band)
+        self._sync_filter_enabled_state()
+
+    def _on_filter_toggle(self, *_):
+        self._sync_filter_enabled_state()
+
+    def _sync_filter_enabled_state(self):
+        if self._is_velocity_time_mode():
+            if self.chk_filter.isChecked():
+                self.chk_filter.blockSignals(True)
+                self.chk_filter.setChecked(False)
+                self.chk_filter.blockSignals(False)
+
+            self.chk_filter.setEnabled(False)
+            self.cmb_filter_type.setEnabled(False)
+            self.cmb_filter_order.setEnabled(False)
+            self.cut1_spin.setEnabled(False)
+            self.cut2_spin.setEnabled(False)
+            return
+
+        self.chk_filter.setEnabled(bool(_HAVE_SCIPY))
+        enabled = self.chk_filter.isChecked() and _HAVE_SCIPY
+
+        self.cmb_filter_type.setEnabled(enabled)
+        self.cmb_filter_order.setEnabled(enabled)
+        self.cut1_spin.setEnabled(enabled)
+        self.cut2_spin.setEnabled(enabled and self.cmb_filter_type.currentText().startswith("Band-"))
+
+    def _sync_spectrogram_controls(self):
+        state = self._plot_states.get(self._active_plot_key) if self._active_plot_key else None
+        is_color_plot = bool(state and state.get("kind") in ("stft", "waterfall"))
+
+        self.cmb_spec_render.setEnabled(is_color_plot)
+        self.cmb_spec_cmap.setEnabled(is_color_plot)
+        self.chk_spec_cmap_reverse.setEnabled(is_color_plot)
+        self.spec_levels_spin.setEnabled(False)
+        self.chk_manual_clim.setEnabled(is_color_plot)
+        self.spec_vmin_spin.setEnabled(is_color_plot and self.chk_manual_clim.isChecked())
+        self.spec_vmax_spin.setEnabled(is_color_plot and self.chk_manual_clim.isChecked())
+        self.btn_apply_plot_view.setEnabled(state is not None)
+        self.btn_export_plot.setEnabled(state is not None)
+
+        axis_enabled = state is not None
+        self.edit_xlabel.setEnabled(axis_enabled)
+        self.edit_ylabel.setEnabled(axis_enabled)
+
+    def _on_manual_clim_toggle(self, *_):
+        self._sync_spectrogram_controls()
+
+    def _on_mode_change(self):
+        is_fourier = self._is_fourier_mode() or self._is_waterfall_mode()
+
+        self.cmb_fourier_method.setEnabled(not self._is_waterfall_mode() and self._is_fourier_mode())
+        self.cmb_nfft.setEnabled(is_fourier)
+        self.ovl_spin.setEnabled(is_fourier)
+        self.cmb_out.setEnabled(is_fourier)
+        self.cmb_scale.setEnabled(is_fourier)
+        self.cmb_amp_conv.setEnabled(is_fourier)
+        self.lbl_fft_info.setEnabled(is_fourier)
+
+        self._sync_data_source_items()
+        self._sync_filter_enabled_state()
+        self._sync_spectrogram_controls()
+        self._update_fft_info()
+
+    def _get_nfft(self):
+        nfft = int(self.cmb_nfft.currentText().strip())
+        if nfft <= 0:
+            raise ValueError("Invalid NFFT.")
+        return nfft
+
+    def _update_fft_info(self):
+        try:
+            fs = float(self.fs_spin.value())
+            nfft = self._get_nfft()
+            ovl = float(self.ovl_spin.value()) / 100.0
+            df = fs / nfft
+            win_t = nfft / fs
+            hop = max(1, int(round(nfft * (1.0 - ovl))))
+            hop_t = hop / fs
+            _, unit_lbl = self._amp_conv_factor_label()
+
+            base_info = (
+                "Velocity is auto-generated from raw acceleration: HP 10 Hz, order 4, then integrate"
+                if self._selected_signal_kind() == "vel"
+                else f"Data source: {self.cmb_data_source.currentText()}"
+            )
+
+            self.lbl_fft_info.setText(
+                f"Signal: {self._signal_name()}   |   {base_info}   |   Δf: {df:.6g} Hz   |   Window: {win_t:.6g} s   |   Hop: {hop} samples ({hop_t:.6g} s)   |   Amplitude convention: {unit_lbl}"
+            )
+        except Exception:
+            self.lbl_fft_info.setText("Frequency resolution: -")
+
+    def _set_active_canvas(self, canvas, plot_key):
+        if self._active_canvas is not None and self._active_canvas is not canvas:
+            self._active_canvas.set_rect_zoom_active(False)
+
+        self._active_canvas = canvas
+        self._active_plot_key = plot_key
+
+        for key, mini in self._mini_widgets.items():
+            mini.set_selected(key == plot_key and mini.canvas is canvas)
+
+        if self._active_canvas is not None:
+            self._active_canvas.set_rect_zoom_active(self.btn_rect_zoom.isChecked())
+
+        self._sync_spectrogram_controls()
+        self._load_axis_editors_from_state(self._plot_states.get(plot_key))
+
+    def _on_plot_page_changed(self, index):
+        if index <= 0:
+            return
+        widget = self.plot_pages.widget(index)
+        if hasattr(widget, "canvas") and hasattr(widget, "plot_key"):
+            self._set_active_canvas(widget.canvas, widget.plot_key)
+
+    def _on_plot_page_close(self, index):
+        if index <= 0:
+            return
+
+        widget = self.plot_pages.widget(index)
+        if hasattr(widget, "plot_key"):
+            key = widget.plot_key
+            self.plot_pages.removeTab(index)
+            self._detail_widgets.pop(key, None)
+            widget.deleteLater()
+
+            if self._active_plot_key == key and self._mini_widgets:
+                first_key = next(iter(self._mini_widgets))
+                self._set_active_canvas(self._mini_widgets[first_key].canvas, first_key)
+            elif not self._detail_widgets and self.plot_pages.currentIndex() != 0:
+                self.plot_pages.setCurrentIndex(0)
+
+        self._sync_spectrogram_controls()
+
+    def _reflow_overview_grid(self):
+        while self.overview_grid.count():
+            item = self.overview_grid.takeAt(0)
+            if item.widget():
+                item.widget().setParent(None)
+
+        for i, key in enumerate(self._overview_order):
+            if key not in self._mini_widgets:
+                continue
+            row = i // 2
+            col = i % 2
+            self.overview_grid.addWidget(self._mini_widgets[key], row, col)
+
+        self.lbl_overview_empty.setVisible(len(self._mini_widgets) == 0)
+
+    def _close_plot_by_key(self, key):
+        mini = self._mini_widgets.pop(key, None)
+        if mini is not None:
+            mini.setParent(None)
+            mini.deleteLater()
+
+        self._plot_states.pop(key, None)
+        self._overview_order = [k for k in self._overview_order if k != key]
+
+        detail = self._detail_widgets.pop(key, None)
+        if detail is not None:
+            idx = self.plot_pages.indexOf(detail)
+            if idx >= 0:
+                self.plot_pages.removeTab(idx)
+            detail.deleteLater()
+
+        self._reflow_overview_grid()
+
+        if self._active_plot_key == key:
+            self._active_canvas = None
+            self._active_plot_key = None
+            if self._mini_widgets:
+                first_key = next(iter(self._mini_widgets))
+                self._set_active_canvas(self._mini_widgets[first_key].canvas, first_key)
+            else:
+                self._load_axis_editors_from_state(None)
+
+        self._sync_spectrogram_controls()
+
+    def _draw_state_on_canvas(self, canvas, state: dict, preserve_limits=False):
+        canvas.set_state(
+            state,
+            color_cfg=self._plot_color_cfg(),
+            preserve_view=preserve_limits,
+            preserve_annotations=True,
+        )
+
+    def _open_large_plot(self, key):
+        if key not in self._plot_states:
+            return
+
+        if key in self._detail_widgets:
+            idx = self.plot_pages.indexOf(self._detail_widgets[key])
+            if idx >= 0:
+                self.plot_pages.setCurrentIndex(idx)
+                self._set_active_canvas(self._detail_widgets[key].canvas, key)
+            return
+
+        state = self._plot_states[key]
+        detail = DetailPlotWidget(state)
+        detail.activated.connect(self._set_active_canvas)
+
+        self._draw_state_on_canvas(detail.canvas, state, preserve_limits=False)
+
+        self._detail_widgets[key] = detail
+        idx = self.plot_pages.addTab(detail, f"Large: {state['name']}")
+        self.plot_pages.setCurrentIndex(idx)
+        self._set_active_canvas(detail.canvas, key)
+
+    def _on_plot_worker_finished(self, states):
+        self._plot_states = {st["key"]: st for st in states}
+        self._clear_overview_widgets()
+        self._clear_detail_tabs()
+
+        if states and states[0].get("kind") == "waterfall":
+            st = states[0]
+            detail = WaterfallDetailWidget(st)
+            detail.activated.connect(self._set_active_canvas)
+            self._draw_state_on_canvas(detail.canvas, st, preserve_limits=False)
+
+            self._detail_widgets[st["key"]] = detail
+            idx = self.plot_pages.addTab(detail, f"Waterfall: {st['name']}")
+            self.plot_pages.setCurrentIndex(idx)
+            self.tabs.setCurrentWidget(self.tab_plot)
+            self._set_active_canvas(detail.canvas, st["key"])
+            self.lbl_stats.setText(st.get("stats_text", ""))
+            self.lbl_overview_empty.setVisible(True)
+
+            if self._pending_waterfall_open_3d:
+                self._pending_waterfall_open_3d = False
+                detail.canvas.open_3d_window()
+            return
+
+        all_stats = []
+        for st in states:
+            w = PlotMiniWidget(st)
+            self._mini_widgets[st["key"]] = w
+            self._overview_order.append(st["key"])
+
+            w.request_open.connect(self._open_large_plot)
+            w.request_close.connect(self._close_plot_by_key)
+            w.activated.connect(self._set_active_canvas)
+
+            self._draw_state_on_canvas(w.canvas, st, preserve_limits=False)
+            if st.get("stats_text"):
+                all_stats.append(st["stats_text"])
+
+        self.lbl_stats.setText("\n".join(all_stats[:12]))
+        self._reflow_overview_grid()
+        self.tabs.setCurrentWidget(self.tab_plot)
+
+        if states:
+            first = states[0]
+            self._set_active_canvas(self._mini_widgets[first["key"]].canvas, first["key"])
+
+    def _on_plot_worker_error(self, msg: str):
+        self.lbl_stats.setText("")
+        self._err(f"Plot error:\n{msg}")
+
+    def _start_plot_worker(self, cfg: dict):
+        if self._thread_running(self._file_thread) or self._thread_running(self._sheet_thread) or self._thread_running(self._plot_thread):
+            self._err("Another operation is already running.")
+            return
+
+        self._set_busy(True, "Preparing plot(s) in background...")
+        self.lbl_stats.setText("Processing in background...")
+        self._refresh_enabled_state()
+
+        self._plot_thread = QThread(self)
+        self._plot_worker = PlotWorker(cfg)
+        self._plot_worker.moveToThread(self._plot_thread)
+
+        self._plot_thread.started.connect(self._plot_worker.run)
+        self._plot_worker.finished.connect(self._on_plot_worker_finished)
+        self._plot_worker.error.connect(self._on_plot_worker_error)
+
+        self._plot_worker.finished.connect(self._plot_thread.quit)
+        self._plot_worker.error.connect(self._plot_thread.quit)
+        self._plot_thread.finished.connect(self._cleanup_plot_thread)
+
+        self._plot_thread.start()
+
+    def _zoom_active(self, factor):
+        if self._active_canvas is not None:
+            self._active_canvas.zoom_axes(factor)
+
+    def _reset_active_view(self):
+        if self._active_canvas is not None:
+            self._active_canvas.reset_view()
+
+    def _on_rect_zoom_toggled(self, checked):
+        if self._active_canvas is not None:
+            self._active_canvas.set_rect_zoom_active(checked)
+
+    def _apply_plot_view(self):
+        if self._active_canvas is None or self._active_plot_key not in self._plot_states:
+            self._err("There is no active plot to update yet.")
+            return
+
+        state = self._plot_states[self._active_plot_key]
+        state["xlabel"] = self.edit_xlabel.text().strip()
+        state["ylabel"] = self.edit_ylabel.text().strip()
+
+        self._refresh_plot_views_for_key(
+            self._active_plot_key,
+            preserve_active_limits=True,
+            preserve_active_annotations=True,
+        )
+
+    def _export_current_plot(self):
+        if self._active_plot_key not in self._plot_states:
+            self._err("There is no active plot to export.")
+            return
+
+        state = self._plot_states[self._active_plot_key]
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export current plot",
+            f"{state['name']}.png",
+            "PNG (*.png);;PDF (*.pdf);;SVG (*.svg)"
+        )
+        if not path:
+            return
+
+        annotations = []
+        if self._active_canvas is not None:
+            try:
+                annotations = self._active_canvas.get_export_annotations()
+            except Exception:
+                annotations = []
+
+        xlabel = state.get("xlabel", "")
+        ylabel = state.get("ylabel", "")
+
+        if self._active_plot_key == state["key"]:
+            xlabel = self.edit_xlabel.text().strip()
+            ylabel = self.edit_ylabel.text().strip()
+
+        try:
+            if state["kind"] == "waterfall":
+                fig = Figure(figsize=(12, 9), dpi=150, constrained_layout=True)
+                gs = fig.add_gridspec(2, 1, height_ratios=[3.0, 1.6])
+                ax0 = fig.add_subplot(gs[0, 0])
+                ax1 = fig.add_subplot(gs[1, 0])
+
+                freqs = np.asarray(state["freqs"])
+                rpms = np.asarray(state["rpms"])
+                S = np.asarray(state["S"])
+                color_cfg = self._plot_color_cfg()
+
+                finite = S[np.isfinite(S)]
+                auto_vmin = float(np.min(finite)) if finite.size else 0.0
+                auto_vmax = float(np.max(finite)) if finite.size else 1.0
+                vmin = float(color_cfg["vmin"]) if color_cfg["manual_clim"] else auto_vmin
+                vmax = float(color_cfg["vmax"]) if color_cfg["manual_clim"] else auto_vmax
+                cmap = f"{color_cfg['cmap']}_r" if color_cfg["reverse"] else color_cfg["cmap"]
+
+                mesh = ax0.pcolormesh(freqs, rpms, S, shading="auto", cmap=cmap, vmin=vmin, vmax=vmax)
+                cbar = fig.colorbar(mesh, ax=ax0)
+                cbar.set_label(state.get("colorbar_label", ""))
+                ax0.set_xlabel(xlabel)
+                ax0.set_ylabel(ylabel)
+                ax0.set_title(state["title"])
+
+                lower_label = state.get("colorbar_label", "Amplitude")
+                ax1.set_xlabel("RPM")
+                ax1.set_ylabel(lower_label)
+                ax1.grid(True)
+
+                if hasattr(self._active_canvas, "export_order_cursor_specs") and hasattr(self._active_canvas, "_extract_order_trace"):
+                    for spec in self._active_canvas.export_order_cursor_specs():
+                        order_val = float(spec["order"])
+                        color = np.array(spec["color"], dtype=np.float64) / 255.0
+                        fx = (order_val * rpms) / 60.0
+                        m = np.isfinite(fx) & (fx >= freqs[0]) & (fx <= freqs[-1])
+                        ax0.plot(fx[m], rpms[m], color=color, linewidth=1.5)
+
+                        tr = self._active_canvas._extract_order_trace(order_val)
+                        mm = np.isfinite(tr) & np.isfinite(rpms)
+                        ax1.plot(rpms[mm], tr[mm], color=color, linewidth=1.6, label=f"Order {order_val:.2f}x")
+
+                    ax1.legend(loc="best")
+
+                fig.savefig(path, dpi=150)
+                QMessageBox.information(self, "Export", f"Plot exported successfully:\n{path}")
+                return
+
+            fig = Figure(figsize=(12, 6), dpi=150, constrained_layout=True)
+            ax = fig.add_subplot(111)
+
+            if state["kind"] in ("time", "avg"):
+                for series in state["series"]:
+                    ax.plot(np.asarray(series["x"]), np.asarray(series["y"]), linewidth=0.9, label=series["label"])
+                ax.set_xlabel(xlabel)
+                ax.set_ylabel(ylabel)
+                ax.grid(True)
+                ax.margins(x=0)
+            else:
+                times = np.asarray(state["times"])
+                freqs = np.asarray(state["freqs"])
+                S = np.asarray(state["S"])
+                color_cfg = self._plot_color_cfg()
+
+                finite = S[np.isfinite(S)]
+                auto_vmin = float(np.min(finite)) if finite.size else 0.0
+                auto_vmax = float(np.max(finite)) if finite.size else 1.0
+                vmin = float(color_cfg["vmin"]) if color_cfg["manual_clim"] else auto_vmin
+                vmax = float(color_cfg["vmax"]) if color_cfg["manual_clim"] else auto_vmax
+                cmap = f"{color_cfg['cmap']}_r" if color_cfg["reverse"] else color_cfg['cmap']
+
+                mesh = ax.pcolormesh(times, freqs, S, shading="auto", cmap=cmap, vmin=vmin, vmax=vmax)
+                cbar = fig.colorbar(mesh, ax=ax)
+                cbar.set_label(state.get("colorbar_label", ""))
+                ax.set_xlabel(xlabel)
+                ax.set_ylabel(ylabel)
+                ax.grid(False)
+
+            for ann in annotations:
+                try:
+                    if "x" in ann and "y" in ann:
+                        ax.plot(
+                            ann["x"], ann["y"],
+                            linestyle="None",
+                            marker="o",
+                            markersize=5,
+                            markerfacecolor="white",
+                            markeredgecolor="red",
+                            markeredgewidth=0.8,
+                            zorder=6,
+                        )
+                        ax.annotate(
+                            ann.get("text", ""),
+                            xy=(ann["x"], ann["y"]),
+                            xytext=(5, 5),
+                            textcoords="offset points",
+                            fontsize=8,
+                            bbox=dict(facecolor="white", edgecolor="#666", alpha=0.9, boxstyle="round,pad=0.2"),
+                            zorder=7,
+                        )
+                except Exception:
+                    pass
+
+            ax.set_title(state["title"])
+            fig.savefig(path, dpi=150)
+        except Exception as e:
+            self._err(f"Export failed:\n{e}")
+            return
+
+        QMessageBox.information(self, "Export", f"Plot exported successfully:\n{path}")
+
+    def open_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open data file",
+            "",
+            "Data Files (*.xlsx *.xls *.tdms);;Excel Files (*.xlsx *.xls);;TDMS Files (*.tdms)"
+        )
+        if not path:
+            return
+
+        self.file_path = path
+        self.lbl_file.setText(f"Selected file: {path}")
+        self._reset_loaded_state(keep_path=True)
+        self._start_file_open_worker(path)
+
+    def load_sheet_or_group(self):
+        if not self.file_path or not self.file_type:
+            return
+
+        name = self.cmb_sheet.currentText()
+        if not name:
+            return
+
+        self._start_sheet_load_worker(name)
+
+    def plot(self):
+        fs = float(self.fs_spin.value())
+        crop = self.chk_crop.isChecked()
+        t0 = float(self.t0_spin.value())
+        t1 = float(self.t1_spin.value())
+
+        if crop and t1 <= t0:
+            self._err("End time must be greater than start time.")
+            return
+
+        signal_kind = self._selected_signal_kind()
+        if signal_kind == "vel" and not _HAVE_SCIPY:
+            self._err("Velocity mode requires SciPy because automatic high-pass filtering is applied before integration.")
+            return
+
+        names = self._get_selected_names()
+        wf_cfg = None
+
+        if self._is_waterfall_mode():
+            all_names = [self.list_channels.item(i).text() for i in range(self.list_channels.count())]
+            if len(all_names) < 2:
+                self._err("At least two channels are needed for waterfall mode: one RPM and one acceleration.")
+                return
+
+            dlg = WaterfallSetupDialog(
+                all_names,
+                self,
+                rpm_guess=self._guess_rpm_channel(),
+                acc_guess=self._guess_acc_channel(),
+            )
+            if dlg.exec_() != QDialog.Accepted:
+                return
+            wf_cfg = dlg.values()
+            self._pending_waterfall_open_3d = bool(wf_cfg.get("open_3d", False))
+            names = [wf_cfg["rpm_name"], wf_cfg["acc_name"]]
+        else:
+            if not names:
+                self._err("No channel/column selected.")
+                return
+            self._pending_waterfall_open_3d = False
+
+        cfg = {
+            "file_path": self.file_path,
+            "file_type": self.file_type,
+            "group_or_sheet": self.cmb_sheet.currentText(),
+            "names": names,
+            "fs": fs,
+            "crop": crop,
+            "t0": t0,
+            "t1": t1,
+            "skip_first": self.chk_skip_first.isChecked(),
+
+            "mode": self.cmb_mode.currentText(),
+            "signal_kind": signal_kind,
+            "signal_name": self._signal_name(),
+
+            "use_filtered": (self.cmb_data_source.currentText() == "Filtered") if signal_kind == "acc" and not self._is_waterfall_mode() else False,
+            "filter_enabled": self.chk_filter.isChecked(),
+            "filter_type": self.cmb_filter_type.currentText(),
+            "filter_order": int(self.cmb_filter_order.currentText()),
+            "cut1": float(self.cut1_spin.value()),
+            "cut2": float(self.cut2_spin.value()),
+
+            "nfft": self._get_nfft(),
+            "overlap_pct": float(self.ovl_spin.value()),
+            "out_type": self.cmb_out.currentText(),
+            "scale": self.cmb_scale.currentText(),
+            "method": self.cmb_fourier_method.currentText(),
+            "amp_conv": self.cmb_amp_conv.currentText(),
+        }
+
+        if wf_cfg is not None:
+            cfg["waterfall_rpm_name"] = wf_cfg["rpm_name"]
+            cfg["waterfall_acc_name"] = wf_cfg["acc_name"]
+            cfg["waterfall_filter_target"] = wf_cfg["filter_target"]
+
+        self._start_plot_worker(cfg)
+
+    def _err(self, msg: str):
+        QMessageBox.critical(self, "Error", msg)
+
+
+def main():
+    app = QApplication(sys.argv)
+
+    if not _HAVE_PG:
+        QMessageBox.critical(None, "Missing dependency", "pyqtgraph is required. Install with: pip install pyqtgraph")
+        sys.exit(1)
+
+    w = MainWindow()
+    w.showMaximized()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()

@@ -35,6 +35,8 @@ matplotlib.rcParams["path.simplify"] = True
 matplotlib.rcParams["path.simplify_threshold"] = 1.0
 matplotlib.rcParams["agg.path.chunksize"] = 10000
 from matplotlib.figure import Figure
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 
 # --- TDMS (npTDMS) ---
 try:
@@ -132,6 +134,14 @@ class InteractivePlotWidget(QWidget):
         self._rect_zoom_active = bool(active)
         if self._view_box is not None:
             self._view_box.setMouseMode(pg.ViewBox.RectMode if active else pg.ViewBox.PanMode)
+
+    def _cursor_top_y(self):
+        span = max(self.rpm_max - self.rpm_min, 1e-12)
+        return self.rpm_max - 0.035 * span
+
+    def _cursor_label_x(self, x_value: float) -> float:
+        span = max(self.freq_max - self.freq_min, 1e-12)
+        return float(np.clip(x_value, self.freq_min + 0.02 * span, self.freq_max - 0.02 * span))
 
     def _on_mouse_clicked(self, event):
         if self._plot_widget is None or self._view_box is None:
@@ -594,24 +604,16 @@ class Waterfall3DWindow(QDialog):
         super().__init__(parent)
         self.state = state
         self.setWindowTitle(state.get("title", "3D Waterfall"))
-        self.resize(1200, 800)
+        self.resize(1280, 840)
 
         lay = QVBoxLayout(self)
 
-        if not _HAVE_PG_GL:
-            lbl = QLabel(
-                "pyqtgraph.opengl / PyOpenGL not found.\n"
-                "Install with: pip install PyOpenGL"
-            )
-            lbl.setWordWrap(True)
-            lay.addWidget(lbl)
-            return
+        self.fig = Figure(figsize=(11, 7), dpi=100, constrained_layout=True)
+        self.canvas = FigureCanvas(self.fig)
+        self.toolbar = NavigationToolbar(self.canvas, self)
 
-        self.view = gl.GLViewWidget()
-        self.view.opts["distance"] = 250
-        self.view.opts["elevation"] = 22
-        self.view.opts["azimuth"] = -55
-        lay.addWidget(self.view, 1)
+        lay.addWidget(self.toolbar)
+        lay.addWidget(self.canvas, 1)
 
         self._build_scene()
 
@@ -620,57 +622,72 @@ class Waterfall3DWindow(QDialog):
         rpms = np.asarray(self.state["rpms"], dtype=np.float64)
         S = np.asarray(self.state["S"], dtype=np.float64)
 
+        ax = self.fig.add_subplot(111, projection="3d")
+        ax.clear()
+
         if freqs.size == 0 or rpms.size == 0 or S.size == 0:
+            ax.set_title("3D waterfall")
+            self.canvas.draw_idle()
             return
 
-        max_fx = 220
-        max_ry = 220
-        sx = max(1, int(np.ceil(freqs.size / max_fx)))
-        sy = max(1, int(np.ceil(rpms.size / max_ry)))
+        max_freq_points = 900
+        max_rpm_lines = 55
+        sx = max(1, int(np.ceil(freqs.size / max_freq_points)))
+        sy = max(1, int(np.ceil(rpms.size / max_rpm_lines)))
 
-        freqs_ds = freqs[::sx]
-        rpms_ds = rpms[::sy]
-        S_ds = S[::sy, ::sx]
+        freqs_ds = np.asarray(freqs[::sx], dtype=np.float64)
+        rpms_ds = np.asarray(rpms[::sy], dtype=np.float64)
+        S_ds = np.asarray(S[::sy, ::sx], dtype=np.float64)
 
         finite = S_ds[np.isfinite(S_ds)]
         if finite.size == 0:
-            z = np.zeros_like(S_ds, dtype=np.float64)
+            z0, z1 = 0.0, 1.0
+            S_plot = np.zeros_like(S_ds, dtype=np.float64)
         else:
             z0 = float(np.min(finite))
             z1 = float(np.max(finite))
             if z1 <= z0:
-                z1 = z0 + 1e-12
-            z = (np.nan_to_num(S_ds, nan=z0) - z0) / (z1 - z0)
+                z1 = z0 + 1.0
+            S_plot = np.nan_to_num(S_ds, nan=z0, posinf=z1, neginf=z0)
 
-        z_gl = z.T.copy()
+        cmap = matplotlib.colormaps.get_cmap("Oranges")
+        n_lines = max(1, rpms_ds.size)
+        for i, rpm_val in enumerate(rpms_ds):
+            frac = i / max(n_lines - 1, 1)
+            color = cmap(0.35 + 0.55 * frac)
+            yline = np.full(freqs_ds.shape, float(rpm_val), dtype=np.float64)
+            ax.plot(freqs_ds, yline, S_plot[i, :], color=color, linewidth=1.0)
 
-        gx = gl.GLGridItem()
-        gy = gl.GLGridItem()
-        gz = gl.GLGridItem()
-        gx.rotate(90, 0, 1, 0)
-        gy.rotate(90, 1, 0, 0)
+        if freqs_ds.size > 1 and rpms_ds.size > 1:
+            fmesh, rmesh = np.meshgrid(freqs_ds, rpms_ds)
+            ax.plot_surface(
+                fmesh, rmesh, S_plot,
+                cmap="viridis",
+                linewidth=0,
+                antialiased=False,
+                alpha=0.22,
+                shade=True,
+            )
 
-        fx_span = float(freqs_ds[-1] - freqs_ds[0]) if freqs_ds.size > 1 else 1.0
-        rpm_span = float(rpms_ds[-1] - rpms_ds[0]) if rpms_ds.size > 1 else 1.0
+        ax.set_xlabel("Frequency (Hz)", labelpad=12)
+        ax.set_ylabel("RPM", labelpad=12)
+        ax.set_zlabel(self.state.get("colorbar_label", "Amplitude"), labelpad=10)
+        ax.set_title(self.state.get("title", "3D Waterfall"), pad=16)
 
-        gx.scale(max(1.0, fx_span / 10.0), max(1.0, rpm_span / 10.0), 1.0)
-        gy.scale(max(1.0, fx_span / 10.0), max(1.0, rpm_span / 10.0), 1.0)
-        gz.scale(max(1.0, fx_span / 10.0), max(1.0, rpm_span / 10.0), 1.0)
+        ax.set_xlim(float(freqs_ds[0]), float(freqs_ds[-1]))
+        ax.set_ylim(float(rpms_ds[0]), float(rpms_ds[-1]))
+        ax.set_zlim(z0, z1)
+        ax.view_init(elev=22, azim=-62)
 
-        self.view.addItem(gx)
-        self.view.addItem(gy)
-        self.view.addItem(gz)
+        try:
+            ax.xaxis.pane.set_facecolor((0.97, 0.97, 0.97, 1.0))
+            ax.yaxis.pane.set_facecolor((0.97, 0.97, 0.97, 1.0))
+            ax.zaxis.pane.set_facecolor((0.985, 0.985, 0.985, 1.0))
+        except Exception:
+            pass
 
-        surf = gl.GLSurfacePlotItem(
-            x=freqs_ds,
-            y=rpms_ds,
-            z=z_gl,
-            shader="heightColor",
-            smooth=False,
-            computeNormals=False,
-        )
-        surf.translate(0, 0, 0)
-        self.view.addItem(surf)
+        ax.grid(True)
+        self.canvas.draw_idle()
 
 
 class WaterfallOrderCursor(QObject):
@@ -684,9 +701,9 @@ class WaterfallOrderCursor(QObject):
         self._guard = False
 
         self.line = pg.PlotCurveItem(pen=pg.mkPen(color, width=2))
-        self.label = pg.TextItem(color=color, anchor=(0.5, 1.0))
+        self.label = pg.TextItem(text="", color=color, anchor=(0.5, 0.5), fill=pg.mkBrush(255, 255, 255, 215), border=pg.mkPen(color, width=1))
         self.handle = pg.TargetItem(
-            pos=(self.owner._freq_at_top(self.order), self.owner.rpm_max),
+            pos=(self.owner._cursor_label_x(self.owner._freq_at_top(self.order)), self.owner._cursor_top_y()),
             size=12,
             pen=pg.mkPen(color, width=2),
             brush=pg.mkBrush(255, 255, 255, 170),
@@ -707,7 +724,7 @@ class WaterfallOrderCursor(QObject):
         try:
             pos = self.handle.pos()
             x = float(np.clip(pos.x(), self.owner.freq_min, self.owner.freq_max))
-            self.handle.setPos(x, self.owner.rpm_max)
+            self.handle.setPos(self.owner._cursor_label_x(x), self.owner._cursor_top_y())
             self.order = max(1e-6, 60.0 * x / max(self.owner.rpm_max, 1e-12))
             self.redraw()
             self.changed.emit()
@@ -720,9 +737,9 @@ class WaterfallOrderCursor(QObject):
         m = np.isfinite(x) & np.isfinite(y) & (x >= self.owner.freq_min) & (x <= self.owner.freq_max)
         self.line.setData(x[m], y[m])
 
-        x_top = float(np.clip(self.owner._freq_at_top(self.order), self.owner.freq_min, self.owner.freq_max))
+        x_top = self.owner._cursor_label_x(self.owner._freq_at_top(self.order))
         self.label.setText(f"{self.order:.2f}x")
-        self.label.setPos(x_top, self.owner.rpm_max)
+        self.label.setPos(x_top, self.owner._cursor_top_y())
 
     def remove(self):
         for item in (self.line, self.label, self.handle):
@@ -764,6 +781,8 @@ class WaterfallPlotWidget(QWidget):
         self.btn_add_cursor = QPushButton("Add cursor")
         self.btn_clear_cursors = QPushButton("Clear cursors")
         self.btn_open_3d = QPushButton("Open 3D")
+        self.lbl_order_info = QLabel("Active orders: -")
+        self.lbl_order_info.setStyleSheet("color: #333; font-weight: 600;")
 
         self.upper = pg.PlotWidget(background="w")
         self.upper_item = self.upper.getPlotItem()
@@ -785,6 +804,8 @@ class WaterfallPlotWidget(QWidget):
         topbar.addWidget(self.btn_add_cursor)
         topbar.addWidget(self.btn_clear_cursors)
         topbar.addWidget(self.btn_open_3d)
+        topbar.addSpacing(10)
+        topbar.addWidget(self.lbl_order_info, 1)
         topbar.addStretch(1)
 
         lay = QVBoxLayout(self)
@@ -803,6 +824,7 @@ class WaterfallPlotWidget(QWidget):
             self.btn_add_cursor.hide()
             self.btn_clear_cursors.hide()
             self.btn_open_3d.hide()
+            self.lbl_order_info.hide()
             self.lower.hide()
 
     def _on_mouse_clicked(self, event):
@@ -841,10 +863,20 @@ class WaterfallPlotWidget(QWidget):
     def _freq_at_top(self, order_value: float) -> float:
         return float(order_value) * self.rpm_max / 60.0
 
+    def _cursor_top_y(self):
+        span = max(self.rpm_max - self.rpm_min, 1e-12)
+        return self.rpm_max - 0.035 * span
+
+    def _cursor_label_x(self, x_value: float) -> float:
+        span = max(self.freq_max - self.freq_min, 1e-12)
+        return float(np.clip(x_value, self.freq_min + 0.02 * span, self.freq_max - 0.02 * span))
+
     def clear_cursors(self):
         for c in self._cursors[:]:
             c.remove()
         self._cursors.clear()
+        if not self.mini:
+            self.lbl_order_info.setText("Active orders: -")
         self._update_lower_plot()
 
     def _add_cursor_default(self):
@@ -894,6 +926,12 @@ class WaterfallPlotWidget(QWidget):
     def _update_lower_plot(self):
         if self.mini:
             return
+
+        if self._cursors:
+            txt = ", ".join(f"{c.order:.2f}x" for c in self._cursors)
+            self.lbl_order_info.setText(f"Active orders: {txt}")
+        else:
+            self.lbl_order_info.setText("Active orders: -")
 
         self.lower_item.clear()
         if self._legend is not None:

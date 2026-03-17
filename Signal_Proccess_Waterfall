@@ -63,6 +63,118 @@ VEL_SCALE = 1000.0     # m/s -> mm/s
 VEL_UNIT = "mm/s"
 
 
+def _read_csv_df(path: str, nrows=None):
+    kwargs = {"sep": None, "engine": "python"}
+    if nrows is not None:
+        kwargs["nrows"] = nrows
+    try:
+        return pd.read_csv(path, **kwargs)
+    except Exception:
+        kwargs.pop("sep", None)
+        kwargs.pop("engine", None)
+        return pd.read_csv(path, **kwargs)
+
+
+def _series_to_numeric_array(series) -> np.ndarray:
+    s = series if isinstance(series, pd.Series) else pd.Series(series)
+    if pd.api.types.is_numeric_dtype(s):
+        return pd.to_numeric(s, errors="coerce").to_numpy(dtype=np.float64, copy=False)
+
+    s2 = s.astype(str).str.strip().str.replace("\u00a0", "", regex=False)
+    has_comma = s2.str.contains(",", regex=False, na=False).any()
+    has_dot = s2.str.contains(".", regex=False, na=False).any()
+    if has_comma and not has_dot:
+        s2 = s2.str.replace(",", ".", regex=False)
+    return pd.to_numeric(s2, errors="coerce").to_numpy(dtype=np.float64, copy=False)
+
+
+def detect_file_type(path: str) -> str:
+    ext = os.path.splitext(path)[1].lower()
+    if ext in [".xlsx", ".xls"]:
+        return "excel"
+    if ext == ".tdms":
+        return "tdms"
+    if ext == ".csv":
+        return "csv"
+    raise RuntimeError("Unsupported file extension.")
+
+
+def read_source_container_names(path: str, file_type: str):
+    if file_type == "excel":
+        xls = pd.ExcelFile(path)
+        names = list(xls.sheet_names)
+        if not names:
+            raise RuntimeError("No sheets found in the Excel file.")
+        return names
+
+    if file_type == "tdms":
+        if not _HAVE_TDMS:
+            raise RuntimeError("npTDMS is not available. Install with: pip install npTDMS")
+        tdms = TdmsFile.read_metadata(path) if hasattr(TdmsFile, "read_metadata") else TdmsFile.read(path)
+        names = [g.name for g in tdms.groups()]
+        if not names:
+            raise RuntimeError("No groups found in the TDMS file.")
+        return names
+
+    if file_type == "csv":
+        return ["CSV Data"]
+
+    raise RuntimeError("Unknown file type.")
+
+
+def read_source_signal_names(path: str, file_type: str, container_name: str):
+    if file_type == "excel":
+        df0 = pd.read_excel(path, sheet_name=container_name, header=0, nrows=0)
+        cols = list(df0.columns)
+        if not cols:
+            raise RuntimeError("No columns found in the selected sheet.")
+        return [str(c) for c in cols]
+
+    if file_type == "tdms":
+        if not _HAVE_TDMS:
+            raise RuntimeError("npTDMS is not available. Install with: pip install npTDMS")
+        tdms = TdmsFile.read_metadata(path) if hasattr(TdmsFile, "read_metadata") else TdmsFile.read(path)
+        group = tdms[container_name]
+        ch_names = [ch.name for ch in group.channels()]
+        if not ch_names:
+            raise RuntimeError("No channels found in the TDMS file.")
+        return ch_names
+
+    if file_type == "csv":
+        df0 = _read_csv_df(path, nrows=0)
+        cols = list(df0.columns)
+        if not cols:
+            raise RuntimeError("No columns found in the CSV file.")
+        return [str(c) for c in cols]
+
+    raise RuntimeError("Unknown file type.")
+
+
+def read_signal_from_source(path: str, file_type: str, container_name: str, signal_name: str) -> np.ndarray:
+    if file_type == "excel":
+        df = pd.read_excel(path, sheet_name=container_name, header=0)
+        if signal_name not in df.columns:
+            raise KeyError(f"Column not found: {signal_name}")
+        return _series_to_numeric_array(df[signal_name])
+
+    if file_type == "tdms":
+        if not _HAVE_TDMS:
+            raise RuntimeError("npTDMS is not available. Install with: pip install npTDMS")
+        tdms = TdmsFile.read(path)
+        group = tdms[container_name]
+        if signal_name not in group:
+            raise KeyError(f"Channel not found in group '{container_name}': {signal_name}")
+        return np.asarray(group[signal_name][:], dtype=np.float64)
+
+    if file_type == "csv":
+        df = _read_csv_df(path)
+        if signal_name not in df.columns:
+            raise KeyError(f"Column not found: {signal_name}")
+        return _series_to_numeric_array(df[signal_name])
+
+    raise RuntimeError("Unknown file type.")
+
+
 class InteractivePlotWidget(QWidget):
     clicked = pyqtSignal()
 
@@ -1178,39 +1290,17 @@ class FileOpenWorker(QObject):
     @pyqtSlot()
     def run(self):
         try:
-            ext = os.path.splitext(self.path)[1].lower()
-
-            if ext in [".xlsx", ".xls"]:
-                xls = pd.ExcelFile(self.path)
-                names = list(xls.sheet_names)
-                if not names:
-                    raise RuntimeError("No sheets found in the Excel file.")
-                self.finished.emit({
-                    "file_type": "excel",
-                    "sheet_names": names,
-                    "default_index": 1 if len(names) > 1 else 0,
-                })
-                return
-
-            if ext == ".tdms":
-                if not _HAVE_TDMS:
-                    raise RuntimeError("npTDMS is not available. Install with: pip install npTDMS")
-
-                tdms = TdmsFile.read_metadata(self.path) if hasattr(TdmsFile, "read_metadata") else TdmsFile.read(self.path)
-                names = [g.name for g in tdms.groups()]
-                if not names:
-                    raise RuntimeError("No groups found in the TDMS file.")
-
-                self.finished.emit({
-                    "file_type": "tdms",
-                    "sheet_names": names,
-                    "default_index": 0,
-                })
-                return
-
-            raise RuntimeError("Unsupported file extension.")
+            file_type = detect_file_type(self.path)
+            names = read_source_container_names(self.path, file_type)
+            default_index = 1 if file_type == "excel" and len(names) > 1 else 0
+            self.finished.emit({
+                "file_type": file_type,
+                "sheet_names": names,
+                "default_index": default_index,
+            })
         except Exception as e:
             self.error.emit(str(e))
+
 
 
 class SheetLoadWorker(QObject):
@@ -1226,41 +1316,17 @@ class SheetLoadWorker(QObject):
     @pyqtSlot()
     def run(self):
         try:
-            if self.file_type == "excel":
-                df0 = pd.read_excel(self.file_path, sheet_name=self.name, header=0, nrows=0)
-                cols = list(df0.columns)
-                if not cols:
-                    raise RuntimeError("No columns found in the selected sheet.")
-
-                self.finished.emit({
-                    "kind": "excel",
-                    "name": self.name,
-                    "names": [str(c) for c in cols],
-                    "prefer_index": 9,
-                })
-                return
-
-            if self.file_type == "tdms":
-                if not _HAVE_TDMS:
-                    raise RuntimeError("npTDMS is not available. Install with: pip install npTDMS")
-
-                tdms = TdmsFile.read_metadata(self.file_path) if hasattr(TdmsFile, "read_metadata") else TdmsFile.read(self.file_path)
-                group = tdms[self.name]
-                ch_names = [ch.name for ch in group.channels()]
-                if not ch_names:
-                    raise RuntimeError("No channels found in the TDMS file.")
-
-                self.finished.emit({
-                    "kind": "tdms",
-                    "name": self.name,
-                    "names": ch_names,
-                    "prefer_index": 0,
-                })
-                return
-
-            raise RuntimeError("Unknown file type.")
+            names = read_source_signal_names(self.file_path, self.file_type, self.name)
+            prefer_index = 9 if self.file_type == "excel" else 0
+            self.finished.emit({
+                "kind": self.file_type,
+                "name": self.name,
+                "names": names,
+                "prefer_index": prefer_index,
+            })
         except Exception as e:
             self.error.emit(str(e))
+
 
 
 class PlotWorker(QObject):
@@ -1385,30 +1451,10 @@ class PlotWorker(QObject):
         names = self.cfg["names"]
 
         out = {}
+        for nm in names:
+            out[nm] = read_signal_from_source(file_path, file_type, group_or_sheet, nm)
+        return out
 
-        if file_type == "excel":
-            df = pd.read_excel(file_path, sheet_name=group_or_sheet, header=0)
-            for nm in names:
-                if nm not in df.columns:
-                    raise KeyError(f"Column not found: {nm}")
-                out[nm] = pd.to_numeric(df[nm], errors="coerce").to_numpy()
-            return out
-
-        if file_type == "tdms":
-            if not _HAVE_TDMS:
-                raise RuntimeError("npTDMS is not available. Install with: pip install npTDMS")
-
-            tdms = TdmsFile.read(file_path)
-            group = tdms[group_or_sheet]
-
-            for nm in names:
-                if nm not in group:
-                    raise KeyError(f"Channel not found in group '{group_or_sheet}': {nm}")
-                out[nm] = np.asarray(group[nm][:])
-
-            return out
-
-        raise RuntimeError("No file opened.")
 
     def _filter_params(self):
         ft = self.cfg["filter_type"]
@@ -1690,25 +1736,42 @@ class PlotWorker(QObject):
 
         return " | Source=Unfiltered"
 
-    def _build_waterfall_state(self, raw_signals: dict):
+    def _build_waterfall_state(self):
         fs = float(self.cfg["fs"])
         nfft = int(self.cfg["nfft"])
         overlap_pct = float(self.cfg["overlap_pct"])
         out_type = self.cfg["out_type"]
         scale = self.cfg["scale"]
-
-        group_or_sheet = self.cfg["group_or_sheet"]
-        file_base = os.path.splitext(os.path.basename(self.cfg["file_path"]))[0]
-        rpm_name = self.cfg["waterfall_rpm_name"]
-        acc_name = self.cfg["waterfall_acc_name"]
         filt_target = self.cfg.get("waterfall_filter_target", "None")
 
-        if rpm_name not in raw_signals:
-            raise KeyError(f"RPM channel not found: {rpm_name}")
-        if acc_name not in raw_signals:
-            raise KeyError(f"Acceleration channel not found: {acc_name}")
+        acc_src = self.cfg.get("waterfall_acc_source")
+        rpm_src = self.cfg.get("waterfall_rpm_source")
 
-        acc, rpm = self._prep_paired_signals(raw_signals[acc_name], raw_signals[rpm_name])
+        if acc_src and rpm_src:
+            acc_name = acc_src["name"]
+            rpm_name = rpm_src["name"]
+            acc_group = acc_src.get("group_or_sheet", "CSV Data")
+            rpm_group = rpm_src.get("group_or_sheet", "CSV Data")
+            acc_file_base = os.path.splitext(os.path.basename(acc_src["file_path"]))[0]
+            rpm_file_base = os.path.splitext(os.path.basename(rpm_src["file_path"]))[0]
+            acc_raw = read_signal_from_source(acc_src["file_path"], acc_src["file_type"], acc_group, acc_name)
+            rpm_raw = read_signal_from_source(rpm_src["file_path"], rpm_src["file_type"], rpm_group, rpm_name)
+        else:
+            raw_signals = self._load_selected_signals()
+            acc_name = self.cfg["waterfall_acc_name"]
+            rpm_name = self.cfg["waterfall_rpm_name"]
+            acc_group = self.cfg["group_or_sheet"]
+            rpm_group = self.cfg["group_or_sheet"]
+            acc_file_base = os.path.splitext(os.path.basename(self.cfg["file_path"]))[0]
+            rpm_file_base = acc_file_base
+            if rpm_name not in raw_signals:
+                raise KeyError(f"RPM channel not found: {rpm_name}")
+            if acc_name not in raw_signals:
+                raise KeyError(f"Acceleration channel not found: {acc_name}")
+            acc_raw = raw_signals[acc_name]
+            rpm_raw = raw_signals[rpm_name]
+
+        acc, rpm = self._prep_paired_signals(acc_raw, rpm_raw)
         acc = self._maybe_apply_filter_target(acc, "acc")
         rpm = self._maybe_apply_filter_target(rpm, "rpm")
 
@@ -1721,26 +1784,44 @@ class PlotWorker(QObject):
             f"Power (dB re 1 ({unit_lbl})²)" if scale == "dB" else f"Power ({unit_lbl}²)"
         )
 
-        proc_title = f" | FilterTarget={filt_target}"
-        key = f"waterfall|{group_or_sheet}|{acc_name}|{rpm_name}"
+        same_source = (
+            acc_file_base == rpm_file_base and
+            str(acc_group) == str(rpm_group) and
+            acc_src is not None and rpm_src is not None
+        ) or (acc_src is None and rpm_src is None)
+
+        if same_source:
+            title = (
+                f"{acc_file_base} | {acc_group} | Waterfall | Acc={acc_name} | RPM={rpm_name}"
+                f" | FilterTarget={filt_target} | NFFT={nfft}, Overlap={overlap_pct:.1f}% | {out_type} ({scale})"
+            )
+        else:
+            title = (
+                f"Waterfall | Acc={acc_name} @ {acc_file_base}/{acc_group} | "
+                f"RPM={rpm_name} @ {rpm_file_base}/{rpm_group} | "
+                f"FilterTarget={filt_target} | NFFT={nfft}, Overlap={overlap_pct:.1f}% | {out_type} ({scale})"
+            )
+
+        key = f"waterfall|{acc_file_base}|{acc_group}|{acc_name}|{rpm_file_base}|{rpm_group}|{rpm_name}"
 
         return {
             "key": key,
             "kind": "waterfall",
             "name": acc_name,
             "short_title": f"{acc_name} | Waterfall",
-            "title": (
-                f"{file_base} | {group_or_sheet} | Waterfall | Acc={acc_name} | RPM={rpm_name}"
-                f"{proc_title} | NFFT={nfft}, Overlap={overlap_pct:.1f}% | {out_type} ({scale})"
-            ),
+            "title": title,
             "xlabel": "Frequency (Hz)",
             "ylabel": "RPM",
             "freqs": freqs,
             "rpms": rpms,
             "S": S_map,
             "colorbar_label": colorbar_label,
-            "stats_text": f"Waterfall built from Acc={acc_name}, RPM={rpm_name}",
+            "stats_text": (
+                f"Waterfall built from Acc={acc_name} ({acc_file_base}/{acc_group}) and "
+                f"RPM={rpm_name} ({rpm_file_base}/{rpm_group})"
+            ),
         }
+
 
     def _build_plot_states(self):
         fs = float(self.cfg["fs"])
@@ -1754,10 +1835,10 @@ class PlotWorker(QObject):
         file_base = os.path.splitext(os.path.basename(self.cfg["file_path"]))[0]
         use_filtered = bool(self.cfg["use_filtered"]) if signal_kind == "acc" else False
 
-        raw_signals = self._load_selected_signals()
-
         if mode == "Waterfall (RPM + Acceleration)":
-            return [self._build_waterfall_state(raw_signals)]
+            return [self._build_waterfall_state()]
+
+        raw_signals = self._load_selected_signals()
 
         states = []
 
@@ -1852,11 +1933,18 @@ class PlotWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Excel/TDMS Signal Plotter (PyQt5 + PyQtGraph)")
+        self.setWindowTitle("Excel/TDMS/CSV Signal Plotter (PyQt5 + PyQtGraph)")
 
         self.file_path = None
         self.file_type = None
         self.sheet_names = []
+
+        self.wf_acc_path = None
+        self.wf_acc_type = None
+        self.wf_acc_containers = []
+        self.wf_rpm_path = None
+        self.wf_rpm_type = None
+        self.wf_rpm_containers = []
 
         self._file_thread = None
         self._file_worker = None
@@ -1873,7 +1961,7 @@ class MainWindow(QMainWindow):
         self._active_plot_key = None
         self._pending_waterfall_open_3d = False
 
-        self.btn_open = QPushButton("Open File (.xlsx / .tdms)")
+        self.btn_open = QPushButton("Open File (.xlsx / .tdms / .csv)")
         self.lbl_file = QLabel("Selected file: -")
         self.lbl_file.setWordWrap(True)
 
@@ -1926,7 +2014,6 @@ class MainWindow(QMainWindow):
             "Time Domain (Acceleration)",
             "Time Domain (Velocity)",
             "Fourier Transform (Acceleration)",
-            "Waterfall (RPM + Acceleration)",
         ])
 
         self.cmb_fourier_method = QComboBox()
@@ -1994,7 +2081,7 @@ class MainWindow(QMainWindow):
         self.btn_plot = QPushButton("Plot")
         self.btn_plot.setEnabled(False)
 
-        self.lbl_wf_hint = QLabel("Waterfall mode asks you to choose one RPM channel and one acceleration channel.")
+        self.lbl_wf_hint = QLabel("Dedicated waterfall workflow is available in the Waterfall tab.")
         self.lbl_wf_hint.setStyleSheet("color: #666;")
         self.lbl_wf_hint.setWordWrap(True)
 
@@ -2080,8 +2167,10 @@ class MainWindow(QMainWindow):
         root.addWidget(self.tabs)
 
         self.tab_controls = QWidget()
+        self.tab_waterfall = QWidget()
         self.tab_plot = QWidget()
         self.tabs.addTab(self.tab_controls, "Controls")
+        self.tabs.addTab(self.tab_waterfall, "Waterfall")
         self.tabs.addTab(self.tab_plot, "Plot View")
 
         ctl = QVBoxLayout(self.tab_controls)
@@ -2165,6 +2254,8 @@ class MainWindow(QMainWindow):
         ctl.addWidget(self.lbl_fft_info)
         ctl.addWidget(self.lbl_stats)
         ctl.addStretch(1)
+
+        self._build_waterfall_tab_ui()
 
         ptab = QVBoxLayout(self.tab_plot)
 
@@ -2275,6 +2366,24 @@ class MainWindow(QMainWindow):
         self.btn_select_all.setEnabled(ready)
         self.btn_clear_sel.setEnabled(ready)
         self.btn_plot.setEnabled(ready)
+
+        if hasattr(self, "btn_wf_plot"):
+            wf_ready = (
+                bool(getattr(self, "wf_acc_path", None)) and
+                bool(getattr(self, "wf_rpm_path", None)) and
+                self.cmb_wf_acc_group.count() > 0 and
+                self.cmb_wf_rpm_group.count() > 0 and
+                self.cmb_wf_acc_channel.count() > 0 and
+                self.cmb_wf_rpm_channel.count() > 0 and
+                not busy
+            )
+            self.btn_wf_plot.setEnabled(wf_ready)
+            self.btn_wf_acc_open.setEnabled(not busy)
+            self.btn_wf_rpm_open.setEnabled(not busy)
+            self.cmb_wf_acc_group.setEnabled(self.cmb_wf_acc_group.count() > 0 and not busy)
+            self.cmb_wf_rpm_group.setEnabled(self.cmb_wf_rpm_group.count() > 0 and not busy)
+            self.cmb_wf_acc_channel.setEnabled(self.cmb_wf_acc_channel.count() > 0 and not busy)
+            self.cmb_wf_rpm_channel.setEnabled(self.cmb_wf_rpm_channel.count() > 0 and not busy)
 
     def _plot_color_cfg(self):
         return {
@@ -2835,6 +2944,8 @@ class MainWindow(QMainWindow):
             self.lbl_stats.setText(st.get("stats_text", ""))
             self.lbl_overview_empty.setVisible(True)
 
+            if hasattr(self, "lbl_wf_status"):
+                self.lbl_wf_status.setText(st.get("stats_text", ""))
             if self._pending_waterfall_open_3d:
                 self._pending_waterfall_open_3d = False
                 detail.canvas.open_3d_window()
@@ -2864,6 +2975,8 @@ class MainWindow(QMainWindow):
 
     def _on_plot_worker_error(self, msg: str):
         self.lbl_stats.setText("")
+        if hasattr(self, "lbl_wf_status"):
+            self.lbl_wf_status.setText("")
         self._err(f"Plot error:\n{msg}")
 
     def _start_plot_worker(self, cfg: dict):
@@ -3057,12 +3170,379 @@ class MainWindow(QMainWindow):
 
         QMessageBox.information(self, "Export", f"Plot exported successfully:\n{path}")
 
+    def _build_waterfall_tab_ui(self):
+        self.btn_wf_acc_open = QPushButton("Open Acc file (.xlsx / .tdms / .csv)")
+        self.lbl_wf_acc_file = QLabel("Acceleration source: -")
+        self.lbl_wf_acc_file.setWordWrap(True)
+        self.cmb_wf_acc_group = QComboBox()
+        self.cmb_wf_acc_channel = QComboBox()
+
+        self.btn_wf_rpm_open = QPushButton("Open RPM file (.xlsx / .tdms / .csv)")
+        self.lbl_wf_rpm_file = QLabel("RPM source: -")
+        self.lbl_wf_rpm_file.setWordWrap(True)
+        self.cmb_wf_rpm_group = QComboBox()
+        self.cmb_wf_rpm_channel = QComboBox()
+
+        self.wf_fs_spin = QDoubleSpinBox()
+        self.wf_fs_spin.setRange(0.1, 1_000_000.0)
+        self.wf_fs_spin.setDecimals(2)
+        self.wf_fs_spin.setValue(10000.0)
+
+        self.chk_wf_skip_first = QCheckBox("Skip first sample (y[1:])")
+        self.chk_wf_crop = QCheckBox("Enable time window (crop)")
+        self.wf_t0_spin = QDoubleSpinBox()
+        self.wf_t0_spin.setRange(0.0, 1_000_000_000.0)
+        self.wf_t0_spin.setDecimals(3)
+        self.wf_t0_spin.setValue(10.0)
+        self.wf_t0_spin.setEnabled(False)
+        self.wf_t1_spin = QDoubleSpinBox()
+        self.wf_t1_spin.setRange(0.0, 1_000_000_000.0)
+        self.wf_t1_spin.setDecimals(3)
+        self.wf_t1_spin.setValue(30.0)
+        self.wf_t1_spin.setEnabled(False)
+
+        self.wf_nfft = QComboBox()
+        self.wf_nfft.addItems([str(x) for x in [256, 512, 1024, 2048, 4096, 8192, 16384, 32768]])
+        self.wf_nfft.setCurrentText("8192")
+
+        self.wf_ovl_spin = QDoubleSpinBox()
+        self.wf_ovl_spin.setRange(0.0, 95.0)
+        self.wf_ovl_spin.setDecimals(1)
+        self.wf_ovl_spin.setSingleStep(5.0)
+        self.wf_ovl_spin.setValue(67.0)
+
+        self.wf_out = QComboBox()
+        self.wf_out.addItems(["Amplitude", "Power"])
+        self.wf_scale = QComboBox()
+        self.wf_scale.addItems(["Linear", "dB"])
+        self.wf_amp_conv = QComboBox()
+        self.wf_amp_conv.addItems(["Peak", "RMS", "Peak-to-Peak"])
+        self.wf_amp_conv.setCurrentText("RMS")
+
+        self.chk_wf_filter = QCheckBox("Enable Waterfall Butterworth filter (zero-phase)")
+        self.chk_wf_filter.setChecked(False)
+        if not _HAVE_SCIPY:
+            self.chk_wf_filter.setEnabled(False)
+            self.chk_wf_filter.setToolTip("SciPy not found. Install: pip install scipy")
+
+        self.cmb_wf_filter_type = QComboBox()
+        self.cmb_wf_filter_type.addItems(["Low-pass", "High-pass", "Band-pass", "Band-reject"])
+        self.cmb_wf_filter_type.setEnabled(False)
+
+        self.cmb_wf_filter_order = QComboBox()
+        self.cmb_wf_filter_order.addItems([str(i) for i in range(1, 9)])
+        self.cmb_wf_filter_order.setCurrentText("4")
+        self.cmb_wf_filter_order.setEnabled(False)
+
+        self.wf_cut1_spin = QDoubleSpinBox()
+        self.wf_cut1_spin.setRange(0.0, 1_000_000.0)
+        self.wf_cut1_spin.setDecimals(3)
+        self.wf_cut1_spin.setValue(100.0)
+        self.wf_cut1_spin.setEnabled(False)
+        self.lbl_wf_cut2 = QLabel("Cutoff 2 (Hz):")
+        self.wf_cut2_spin = QDoubleSpinBox()
+        self.wf_cut2_spin.setRange(0.0, 1_000_000.0)
+        self.wf_cut2_spin.setDecimals(3)
+        self.wf_cut2_spin.setValue(300.0)
+        self.wf_cut2_spin.setEnabled(False)
+        self.lbl_wf_cut2.setVisible(False)
+        self.wf_cut2_spin.setVisible(False)
+
+        self.cmb_wf_filter_target = QComboBox()
+        self.cmb_wf_filter_target.addItems(["None", "Acceleration", "RPM", "Both"])
+        self.chk_wf_open_3d = QCheckBox("Open 3D waterfall in separate window after plotting")
+        self.chk_wf_open_3d.setChecked(False)
+        self.lbl_wf_info = QLabel("Use this tab when acceleration and RPM come from the same or different TDMS/Excel/CSV files. The two signals are trimmed to the common sample count; one common fs is assumed.")
+        self.lbl_wf_info.setStyleSheet("color: #666;")
+        self.lbl_wf_info.setWordWrap(True)
+        self.lbl_wf_status = QLabel("")
+        self.lbl_wf_status.setStyleSheet("color: #444;")
+        self.lbl_wf_status.setWordWrap(True)
+        self.btn_wf_plot = QPushButton("Plot Waterfall")
+        self.btn_wf_plot.setEnabled(False)
+
+        lay = QVBoxLayout(self.tab_waterfall)
+        lay.addWidget(self.lbl_wf_info)
+        lay.addSpacing(6)
+
+        lay.addWidget(self.btn_wf_acc_open)
+        lay.addWidget(self.lbl_wf_acc_file)
+        row_acc = QHBoxLayout()
+        row_acc.addWidget(QLabel("Acc sheet/group:"))
+        row_acc.addWidget(self.cmb_wf_acc_group, 1)
+        row_acc.addSpacing(10)
+        row_acc.addWidget(QLabel("Acc channel:"))
+        row_acc.addWidget(self.cmb_wf_acc_channel, 1)
+        lay.addLayout(row_acc)
+
+        lay.addSpacing(8)
+        lay.addWidget(self.btn_wf_rpm_open)
+        lay.addWidget(self.lbl_wf_rpm_file)
+        row_rpm = QHBoxLayout()
+        row_rpm.addWidget(QLabel("RPM sheet/group:"))
+        row_rpm.addWidget(self.cmb_wf_rpm_group, 1)
+        row_rpm.addSpacing(10)
+        row_rpm.addWidget(QLabel("RPM channel:"))
+        row_rpm.addWidget(self.cmb_wf_rpm_channel, 1)
+        lay.addLayout(row_rpm)
+
+        lay.addSpacing(10)
+        row_wf_1 = QHBoxLayout()
+        row_wf_1.addWidget(QLabel("fs (Hz):"))
+        row_wf_1.addWidget(self.wf_fs_spin)
+        row_wf_1.addSpacing(14)
+        row_wf_1.addWidget(self.chk_wf_skip_first)
+        row_wf_1.addStretch(1)
+        lay.addLayout(row_wf_1)
+
+        row_wf_2 = QHBoxLayout()
+        row_wf_2.addWidget(self.chk_wf_crop)
+        row_wf_2.addWidget(QLabel("Start (s):"))
+        row_wf_2.addWidget(self.wf_t0_spin)
+        row_wf_2.addWidget(QLabel("End (s):"))
+        row_wf_2.addWidget(self.wf_t1_spin)
+        row_wf_2.addStretch(1)
+        lay.addLayout(row_wf_2)
+
+        row_wf_3 = QHBoxLayout()
+        row_wf_3.addWidget(QLabel("Buffer Size (NFFT):"))
+        row_wf_3.addWidget(self.wf_nfft)
+        row_wf_3.addWidget(QLabel("Overlap (%):"))
+        row_wf_3.addWidget(self.wf_ovl_spin)
+        row_wf_3.addWidget(QLabel("Output:"))
+        row_wf_3.addWidget(self.wf_out)
+        row_wf_3.addWidget(QLabel("Scale:"))
+        row_wf_3.addWidget(self.wf_scale)
+        row_wf_3.addWidget(QLabel("Amplitude convention:"))
+        row_wf_3.addWidget(self.wf_amp_conv)
+        row_wf_3.addStretch(1)
+        lay.addLayout(row_wf_3)
+
+        row_wf_4 = QHBoxLayout()
+        row_wf_4.addWidget(self.chk_wf_filter)
+        row_wf_4.addSpacing(12)
+        row_wf_4.addWidget(QLabel("Type:"))
+        row_wf_4.addWidget(self.cmb_wf_filter_type)
+        row_wf_4.addSpacing(8)
+        row_wf_4.addWidget(QLabel("Order:"))
+        row_wf_4.addWidget(self.cmb_wf_filter_order)
+        row_wf_4.addSpacing(8)
+        row_wf_4.addWidget(QLabel("Cutoff 1 (Hz):"))
+        row_wf_4.addWidget(self.wf_cut1_spin)
+        row_wf_4.addWidget(self.lbl_wf_cut2)
+        row_wf_4.addWidget(self.wf_cut2_spin)
+        row_wf_4.addStretch(1)
+        lay.addLayout(row_wf_4)
+
+        row_wf_5 = QHBoxLayout()
+        row_wf_5.addWidget(QLabel("Apply filter to:"))
+        row_wf_5.addWidget(self.cmb_wf_filter_target)
+        row_wf_5.addSpacing(12)
+        row_wf_5.addWidget(self.chk_wf_open_3d)
+        row_wf_5.addStretch(1)
+        row_wf_5.addWidget(self.btn_wf_plot)
+        lay.addLayout(row_wf_5)
+
+        lay.addWidget(self.lbl_wf_status)
+        lay.addStretch(1)
+
+        self.btn_wf_acc_open.clicked.connect(lambda: self._open_waterfall_source("acc"))
+        self.btn_wf_rpm_open.clicked.connect(lambda: self._open_waterfall_source("rpm"))
+        self.cmb_wf_acc_group.currentIndexChanged.connect(lambda *_: self._reload_waterfall_channels("acc"))
+        self.cmb_wf_rpm_group.currentIndexChanged.connect(lambda *_: self._reload_waterfall_channels("rpm"))
+        self.chk_wf_crop.stateChanged.connect(self._on_wf_crop_toggle)
+        self.chk_wf_filter.stateChanged.connect(self._sync_wf_filter_enabled_state)
+        self.cmb_wf_filter_type.currentIndexChanged.connect(self._on_wf_filter_type_change)
+        self.btn_wf_plot.clicked.connect(self.plot_waterfall)
+
+    def _on_wf_crop_toggle(self, _state):
+        enabled = self.chk_wf_crop.isChecked()
+        self.wf_t0_spin.setEnabled(enabled)
+        self.wf_t1_spin.setEnabled(enabled)
+
+    def _on_wf_filter_type_change(self, *_):
+        is_band = self.cmb_wf_filter_type.currentText().startswith("Band-")
+        self.lbl_wf_cut2.setVisible(is_band)
+        self.wf_cut2_spin.setVisible(is_band)
+        self._sync_wf_filter_enabled_state()
+
+    def _sync_wf_filter_enabled_state(self, *_):
+        enabled = self.chk_wf_filter.isChecked() and _HAVE_SCIPY
+        self.cmb_wf_filter_type.setEnabled(enabled)
+        self.cmb_wf_filter_order.setEnabled(enabled)
+        self.wf_cut1_spin.setEnabled(enabled)
+        self.wf_cut2_spin.setEnabled(enabled and self.cmb_wf_filter_type.currentText().startswith("Band-"))
+
+    def _open_waterfall_source(self, which: str):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open waterfall source file",
+            "",
+            "Data Files (*.xlsx *.xls *.tdms *.csv);;Excel Files (*.xlsx *.xls);;TDMS Files (*.tdms);;CSV Files (*.csv)"
+        )
+        if not path:
+            return
+
+        try:
+            file_type = detect_file_type(path)
+            containers = read_source_container_names(path, file_type)
+        except Exception as e:
+            self._err(f"Failed to open waterfall source:\n{e}")
+            return
+
+        if which == "acc":
+            self.wf_acc_path = path
+            self.wf_acc_type = file_type
+            self.wf_acc_containers = containers
+            self.lbl_wf_acc_file.setText(f"Acceleration source: {path}")
+            combo = self.cmb_wf_acc_group
+        else:
+            self.wf_rpm_path = path
+            self.wf_rpm_type = file_type
+            self.wf_rpm_containers = containers
+            self.lbl_wf_rpm_file.setText(f"RPM source: {path}")
+            combo = self.cmb_wf_rpm_group
+
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItems(containers)
+        combo.setCurrentIndex(0)
+        combo.blockSignals(False)
+        self._reload_waterfall_channels(which)
+        self._refresh_enabled_state()
+
+    def _reload_waterfall_channels(self, which: str):
+        if which == "acc":
+            path = self.wf_acc_path
+            file_type = self.wf_acc_type
+            container = self.cmb_wf_acc_group.currentText().strip()
+            combo = self.cmb_wf_acc_channel
+            guess_fn = self._guess_acc_from_names
+        else:
+            path = self.wf_rpm_path
+            file_type = self.wf_rpm_type
+            container = self.cmb_wf_rpm_group.currentText().strip()
+            combo = self.cmb_wf_rpm_channel
+            guess_fn = self._guess_rpm_from_names
+
+        combo.blockSignals(True)
+        combo.clear()
+        combo.blockSignals(False)
+
+        if not path or not file_type or not container:
+            self._refresh_enabled_state()
+            return
+
+        try:
+            names = read_source_signal_names(path, file_type, container)
+        except Exception as e:
+            self._err(f"Failed to load waterfall channels:\n{e}")
+            self._refresh_enabled_state()
+            return
+
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItems(names)
+        guess = guess_fn(names)
+        if guess in names:
+            combo.setCurrentText(guess)
+        combo.blockSignals(False)
+        self._refresh_enabled_state()
+
+    def _guess_rpm_from_names(self, names):
+        keys = ["rpm", "tach", "speed", "rev", "rot"]
+        for nm in names:
+            lo = str(nm).lower()
+            if any(k in lo for k in keys):
+                return nm
+        return names[0] if names else ""
+
+    def _guess_acc_from_names(self, names):
+        keys = ["acc", "vib", "g", "z", "x", "y"]
+        for nm in names:
+            lo = str(nm).lower()
+            if any(k in lo for k in keys) and ("rpm" not in lo) and ("tach" not in lo):
+                return nm
+        return names[min(1, len(names) - 1)] if names else ""
+
+    def plot_waterfall(self):
+        if not self.wf_acc_path or not self.wf_rpm_path:
+            self._err("Please select both acceleration and RPM source files in the Waterfall tab.")
+            return
+
+        acc_group = self.cmb_wf_acc_group.currentText().strip()
+        rpm_group = self.cmb_wf_rpm_group.currentText().strip()
+        acc_name = self.cmb_wf_acc_channel.currentText().strip()
+        rpm_name = self.cmb_wf_rpm_channel.currentText().strip()
+
+        if not acc_group or not rpm_group or not acc_name or not rpm_name:
+            self._err("Please select both source containers and channels for the waterfall plot.")
+            return
+        if acc_name == rpm_name and self.wf_acc_path == self.wf_rpm_path and acc_group == rpm_group:
+            self._err("RPM and acceleration channels must be different when they come from the same source container.")
+            return
+
+        fs = float(self.wf_fs_spin.value())
+        crop = self.chk_wf_crop.isChecked()
+        t0 = float(self.wf_t0_spin.value())
+        t1 = float(self.wf_t1_spin.value())
+        if crop and t1 <= t0:
+            self._err("End time must be greater than start time.")
+            return
+
+        self._pending_waterfall_open_3d = self.chk_wf_open_3d.isChecked()
+        self.lbl_wf_status.setText("Preparing waterfall in background...")
+
+        cfg = {
+            "file_path": self.wf_acc_path,
+            "file_type": self.wf_acc_type,
+            "group_or_sheet": acc_group,
+            "names": [acc_name],
+            "fs": fs,
+            "crop": crop,
+            "t0": t0,
+            "t1": t1,
+            "skip_first": self.chk_wf_skip_first.isChecked(),
+            "mode": "Waterfall (RPM + Acceleration)",
+            "signal_kind": "acc",
+            "signal_name": "Acceleration",
+            "use_filtered": False,
+            "filter_enabled": self.chk_wf_filter.isChecked(),
+            "filter_type": self.cmb_wf_filter_type.currentText(),
+            "filter_order": int(self.cmb_wf_filter_order.currentText()),
+            "cut1": float(self.wf_cut1_spin.value()),
+            "cut2": float(self.wf_cut2_spin.value()),
+            "nfft": int(self.wf_nfft.currentText()),
+            "overlap_pct": float(self.wf_ovl_spin.value()),
+            "out_type": self.wf_out.currentText(),
+            "scale": self.wf_scale.currentText(),
+            "method": "Averaged Spectrum",
+            "amp_conv": self.wf_amp_conv.currentText(),
+            "waterfall_filter_target": self.cmb_wf_filter_target.currentText(),
+            "waterfall_acc_name": acc_name,
+            "waterfall_rpm_name": rpm_name,
+            "waterfall_acc_source": {
+                "file_path": self.wf_acc_path,
+                "file_type": self.wf_acc_type,
+                "group_or_sheet": acc_group,
+                "name": acc_name,
+            },
+            "waterfall_rpm_source": {
+                "file_path": self.wf_rpm_path,
+                "file_type": self.wf_rpm_type,
+                "group_or_sheet": rpm_group,
+                "name": rpm_name,
+            },
+        }
+
+        self._start_plot_worker(cfg)
+
     def open_file(self):
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Open data file",
             "",
-            "Data Files (*.xlsx *.xls *.tdms);;Excel Files (*.xlsx *.xls);;TDMS Files (*.tdms)"
+            "Data Files (*.xlsx *.xls *.tdms *.csv);;Excel Files (*.xlsx *.xls);;TDMS Files (*.tdms);;CSV Files (*.csv)"
         )
         if not path:
             return

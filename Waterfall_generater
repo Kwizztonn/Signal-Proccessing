@@ -5,7 +5,7 @@ Gereksinim:
     pip install npTDMS numpy
 
 Çalıştır:
-    python generate_waterfall_tdms.py
+    python generate_waterfall_updated.py
 
 Çıktı:
     waterfall_example.tdms
@@ -14,17 +14,19 @@ Gereksinim:
 ------------------------------------------------------------
 Yapı:
   Grup: "Waterfall"
-    Kanal: "RPM"          → anlık devir (1/dk)
-    Kanal: "Accel_X"      → X ekseni ivme (g)
-    Kanal: "Accel_Y"      → Y ekseni ivme (g)
-    Kanal: "Accel_Z"      → Z ekseni ivme (g)
+    Kanal: "Time"       → zaman ekseni (s)
+    Kanal: "RPM"        → anlık devir (1/dk)
+    Kanal: "Tach_1P"    → 1 pulse/rev takometre darbesi
+    Kanal: "Accel_X"    → X ekseni ivme (g)
+    Kanal: "Accel_Y"    → Y ekseni ivme (g)
+    Kanal: "Accel_Z"    → Z ekseni ivme (g)
 
   Senaryo: 500 RPM → 5000 RPM run-up (hız artışı), 60 s
   fs = 10000 Hz  →  600 000 sample/kanal
 
   Fizik modeli:
     - 1X (temel frekans) baskın bileşen
-    - 2X, 3X harmonikler
+    - 2X, 3X, 4X harmonikler
     - Rezonans 1800 RPM civarında (30 Hz)
     - Rezonans 3600 RPM civarında (60 Hz)
     - Gürültü zemini
@@ -41,58 +43,59 @@ except ImportError:
     )
 
 # ── Parametreler ──────────────────────────────────────────
-FS          = 10_000      # Hz
-DURATION    = 60.0        # saniye
-RPM_START   = 500.0
-RPM_END     = 5_000.0
-GROUP       = "Waterfall"
-OUTPUT      = "waterfall_example.tdms"
+FS = 10_000        # Hz
+DURATION = 60.0    # saniye
+RPM_START = 500.0
+RPM_END = 5_000.0
+GROUP = "Waterfall"
+OUTPUT = "waterfall_example.tdms"
+TACH_PPR = 1       # pulse per revolution
+TACH_WIDTH_SAMPLES = 3
 
 # Rezonans frekansları ve Q faktörleri
-RESONANCES  = [
-    {"freq_hz": 30.0,  "amplitude": 2.5, "q": 15},   # 1800 RPM
-    {"freq_hz": 60.0,  "amplitude": 1.8, "q": 20},   # 3600 RPM
-    {"freq_hz": 95.0,  "amplitude": 0.9, "q": 12},   # 5700 RPM (yaklaşık)
+RESONANCES = [
+    {"freq_hz": 30.0, "amplitude": 2.5, "q": 15},   # 1800 RPM
+    {"freq_hz": 60.0, "amplitude": 1.8, "q": 20},   # 3600 RPM
+    {"freq_hz": 95.0, "amplitude": 0.9, "q": 12},   # 5700 RPM (yaklaşık)
 ]
 
 # Harmonik amplitüdler (1X, 2X, 3X, 4X)
-HARMONICS   = [1.0, 0.35, 0.15, 0.07]
+HARMONICS = [1.0, 0.35, 0.15, 0.07]
 NOISE_LEVEL = 0.04  # g RMS gürültü
 
 # ── Zaman ekseni ──────────────────────────────────────────
-N   = int(FS * DURATION)
-t   = np.linspace(0.0, DURATION, N, endpoint=False)
+N = int(FS * DURATION)
+dt = 1.0 / FS
+t = np.arange(N, dtype=np.float64) * dt
 
 # ── RPM sweep (doğrusal artış) ────────────────────────────
-rpm = np.linspace(RPM_START, RPM_END, N)
-freq_1x = rpm / 60.0          # Hz cinsinden 1X frekansı
+rpm = np.linspace(RPM_START, RPM_END, N, dtype=np.float64)
+freq_1x = rpm / 60.0  # Hz cinsinden 1X frekansı
 
 # ── Anlık faz (faz = integral(2π·f·dt)) ──────────────────
-dt = 1.0 / FS
 phase_1x = 2.0 * np.pi * np.cumsum(freq_1x) * dt
 
 
 def resonance_gain(freq_array, f0, q):
     """Basit 1-DOF rezonans büyütme faktörü."""
     r = freq_array / f0
-    denom = np.sqrt((1.0 - r**2)**2 + (r / q)**2)
+    denom = np.sqrt((1.0 - r**2) ** 2 + (r / q) ** 2)
     denom = np.maximum(denom, 1e-6)
     return 1.0 / denom
 
 
 def build_acceleration(phase_offset=0.0, noise_seed=0):
     rng = np.random.default_rng(noise_seed)
-
     sig = np.zeros(N, dtype=np.float64)
 
     # Harmonikler
     for h_idx, amp in enumerate(HARMONICS, start=1):
         phase = h_idx * phase_1x + phase_offset
-        base  = amp * np.sin(phase)
+        base = amp * np.sin(phase)
 
         # Her harmonik için rezonans büyütmesi uygula
         h_freq = h_idx * freq_1x
-        gain   = np.ones(N, dtype=np.float64)
+        gain = np.ones(N, dtype=np.float64)
         for res in RESONANCES:
             gain += resonance_gain(h_freq, res["freq_hz"], res["q"]) * (res["amplitude"] - 1.0)
 
@@ -103,36 +106,70 @@ def build_acceleration(phase_offset=0.0, noise_seed=0):
     return sig.astype(np.float32)
 
 
+def build_tach_1p_from_phase(phase, width_samples=1):
+    """1 pulse/rev tach kanalı üretir.
+
+    phase: toplam rotor fazı [rad]
+    width_samples: darbenin genişliği (sample)
+    """
+    rev_index = np.floor(phase / (2.0 * np.pi)).astype(np.int64)
+    cross = np.diff(rev_index, prepend=rev_index[0]) > 0
+
+    tach = np.zeros_like(phase, dtype=np.float32)
+    edge_idx = np.flatnonzero(cross)
+
+    width_samples = max(1, int(width_samples))
+    for idx in edge_idx:
+        stop = min(idx + width_samples, tach.size)
+        tach[idx:stop] = 1.0
+
+    return tach
+
+
+COMMON_PROPS = {
+    "wf_start_offset": 0.0,
+    "wf_increment": dt,
+    "wf_samples": N,
+    "sampling_frequency_hz": float(FS),
+}
+
 # ── Sinyaller ─────────────────────────────────────────────
 print("Sinyaller üretiliyor...")
-accel_x = build_acceleration(phase_offset=0.0,          noise_seed=1)
-accel_y = build_acceleration(phase_offset=np.pi / 3,    noise_seed=2)
-accel_z = build_acceleration(phase_offset=np.pi * 0.9,  noise_seed=3) * 0.4  # Z daha sakin
+accel_x = build_acceleration(phase_offset=0.0, noise_seed=1)
+accel_y = build_acceleration(phase_offset=np.pi / 3, noise_seed=2)
+accel_z = build_acceleration(phase_offset=np.pi * 0.9, noise_seed=3) * 0.4  # Z daha sakin
 
-rpm_ch  = rpm.astype(np.float32)
+time_ch = t.astype(np.float64)
+rpm_ch = rpm.astype(np.float32)
+tach_1p = build_tach_1p_from_phase(phase_1x, width_samples=TACH_WIDTH_SAMPLES)
 
 # ── TDMS yazma ────────────────────────────────────────────
 print(f"TDMS yazılıyor: {OUTPUT}")
 
-rpm_ch_obj    = ChannelObject(GROUP, "RPM",     rpm_ch)
-accel_x_obj   = ChannelObject(GROUP, "Accel_X", accel_x)
-accel_y_obj   = ChannelObject(GROUP, "Accel_Y", accel_y)
-accel_z_obj   = ChannelObject(GROUP, "Accel_Z", accel_z)
+channels = [
+    ChannelObject(GROUP, "Time", time_ch, properties={**COMMON_PROPS, "unit_string": "s"}),
+    ChannelObject(GROUP, "RPM", rpm_ch, properties={**COMMON_PROPS, "unit_string": "rpm"}),
+    ChannelObject(GROUP, "Tach_1P", tach_1p, properties={**COMMON_PROPS, "unit_string": "pulse", "pulse_per_revolution": int(TACH_PPR)}),
+    ChannelObject(GROUP, "Accel_X", accel_x, properties={**COMMON_PROPS, "unit_string": "g"}),
+    ChannelObject(GROUP, "Accel_Y", accel_y, properties={**COMMON_PROPS, "unit_string": "g"}),
+    ChannelObject(GROUP, "Accel_Z", accel_z, properties={**COMMON_PROPS, "unit_string": "g"}),
+]
 
 with TdmsWriter(OUTPUT) as writer:
-    writer.write_segment([rpm_ch_obj, accel_x_obj, accel_y_obj, accel_z_obj])
+    writer.write_segment(channels)
 
-print(f"\n✓ Tamamlandı!")
+print("\n✓ Tamamlandı!")
 print(f"  Dosya   : {OUTPUT}")
 print(f"  Grup    : {GROUP}")
-print(f"  Kanallar: RPM, Accel_X, Accel_Y, Accel_Z")
+print("  Kanallar: Time, RPM, Tach_1P, Accel_X, Accel_Y, Accel_Z")
 print(f"  fs      : {FS} Hz")
 print(f"  Süre    : {DURATION} s")
 print(f"  Örnek   : {N:,} / kanal")
 print(f"  RPM     : {RPM_START:.0f} → {RPM_END:.0f}")
-print(f"\n  Plotter'da:")
-print(f"    - Grup: Waterfall")
-print(f"    - Kanal: Accel_X (veya Y/Z)")
-print(f"    - Plot Mode: Fourier Transform (Acceleration)")
-print(f"    - Fourier Method: STFT (Spectrogram)")
+print(f"  Tach    : 1 pulse/rev, darbe genişliği = {TACH_WIDTH_SAMPLES} sample")
+print("\n  Plotter'da:")
+print(f"    - Grup: {GROUP}")
+print("    - Time kanalı: Time")
+print("    - Speed kanalı: RPM veya Tach_1P")
+print("    - Acceleration kanalı: Accel_X / Accel_Y / Accel_Z")
 print(f"    - fs: {FS} Hz")

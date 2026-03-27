@@ -3,16 +3,17 @@ import sys
 import numpy as np
 import pandas as pd
 
-from PyQt5.QtCore import Qt, QObject, QThread, pyqtSignal, pyqtSlot, QRectF
+from PyQt5.QtCore import Qt, QObject, QThread, QTimer, pyqtSignal, pyqtSlot, QRectF
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QComboBox, QDoubleSpinBox,
     QCheckBox, QMessageBox, QListWidget, QListWidgetItem,
     QAbstractItemView, QTabWidget, QSpinBox, QSizePolicy, QProgressBar,
     QScrollArea, QGridLayout, QFrame, QToolButton, QLineEdit,
-    QDialog, QDialogButtonBox, QFormLayout,
+    QDialog, QDialogButtonBox, QFormLayout, QColorDialog,
+    QTableWidget, QTableWidgetItem, QHeaderView,
 )
-
+from PyQt5.QtGui import QPixmap, QPainter, QColor, QIcon
 # --- PyQtGraph: interactive / fast plotting ---
 try:
     import pyqtgraph as pg
@@ -30,6 +31,7 @@ except Exception:
 
 # --- Matplotlib: export/report only ---
 import matplotlib
+import matplotlib.colors as mcolors
 matplotlib.use("Agg")
 matplotlib.rcParams["path.simplify"] = True
 matplotlib.rcParams["path.simplify_threshold"] = 1.0
@@ -62,6 +64,302 @@ G0 = 9.80665           # m/s^2 per g
 VEL_SCALE = 1000.0     # m/s -> mm/s
 VEL_UNIT = "mm/s"
 
+
+def get_amp_conv_factor_label(amp_conv: str, signal_kind: str):
+    sk = str(signal_kind).strip().lower()
+    unit = VEL_UNIT if sk == "vel" else "g"
+    sel = str(amp_conv).strip().lower()
+
+    if sel == "peak":
+        return 1.0, f"{unit} (peak)"
+    if sel == "rms":
+        return 1.0 / np.sqrt(2.0), f"{unit} RMS"
+    if sel in ("peak-to-peak", "peak to peak", "p-p", "pk-pk", "peak_to_peak"):
+        return 2.0, f"{unit} p-p"
+
+    return 1.0, f"{unit} (peak)"
+
+
+def build_spectrum_ylabel(output_type: str, scale: str, unit_lbl: str) -> str:
+    out = str(output_type).strip() or "Amplitude"
+    scl = str(scale).strip().lower()
+    if scl == "db":
+        return f"{out} ({unit_lbl}) [dB]"
+    return f"{out} ({unit_lbl})"
+
+
+def compute_avg_spectrum_from_signal(
+    y: np.ndarray,
+    fs: float,
+    nfft: int,
+    overlap_pct: float,
+    output_type: str,
+    scale: str,
+    amp_conv: str,
+    signal_kind: str,
+):
+    y = np.nan_to_num(np.asarray(y, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    fs = float(fs)
+    nfft = max(2, int(nfft))
+
+    if y.size == 0 or not np.isfinite(fs) or fs <= 0.0:
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+
+    ovl = np.clip(float(overlap_pct) / 100.0, 0.0, 0.95)
+    hop = max(1, int(round(nfft * (1.0 - ovl))))
+
+    w = np.hanning(nfft).astype(np.float64)
+    w_sum = float(np.sum(w))
+    if w_sum <= 0.0:
+        w_sum = float(nfft)
+
+    if y.size < nfft:
+        n_frames = 1
+    else:
+        n_frames = max(1, 1 + (y.size - nfft) // hop)
+
+    freqs = np.fft.rfftfreq(nfft, d=1.0 / fs)
+    spec_acc = np.zeros(freqs.size, dtype=np.float64)
+    conv, _ = get_amp_conv_factor_label(amp_conv, signal_kind)
+    out_type = str(output_type).strip()
+
+    for i in range(n_frames):
+        start = i * hop
+        frame = np.zeros(nfft, dtype=np.float64)
+        take = max(0, min(nfft, y.size - start))
+        if take > 0:
+            frame[:take] = y[start:start + take]
+
+        X = np.fft.rfft(frame * w, n=nfft)
+        mag = np.abs(X)
+        A_peak = (2.0 * mag) / w_sum
+        A_peak[0] *= 0.5
+        if (nfft % 2 == 0) and (A_peak.size > 1):
+            A_peak[-1] *= 0.5
+
+        A = A_peak * conv
+        P = A if out_type == "Amplitude" else (A * A)
+        spec_acc += P
+
+    spec = spec_acc / max(n_frames, 1)
+
+    if str(scale).strip().lower() == "db":
+        eps = 1e-20
+        spec = 20.0 * np.log10(spec + eps) if out_type == "Amplitude" else 10.0 * np.log10(spec + eps)
+
+    return freqs, spec
+
+def resolve_color_limits(S: np.ndarray, scale: str, color_cfg: dict):
+    S = np.asarray(S, dtype=np.float64)
+    finite = S[np.isfinite(S)]
+
+    auto_vmin = float(np.min(finite)) if finite.size else 0.0
+    auto_vmax = float(np.max(finite)) if finite.size else 1.0
+
+    if auto_vmax <= auto_vmin:
+        auto_vmax = auto_vmin + 1e-12
+
+    manual = bool(color_cfg.get("manual_clim", False))
+    dyn_range_db = max(1e-9, float(color_cfg.get("dyn_range_db", 80.0)))
+    is_db = str(scale).strip().lower() == "db"
+
+    if manual:
+        vmin = float(color_cfg.get("vmin", auto_vmin))
+        vmax = float(color_cfg.get("vmax", auto_vmax))
+    elif is_db:
+        vmax = auto_vmax
+        vmin = vmax - dyn_range_db
+    else:
+        vmin = auto_vmin
+        vmax = auto_vmax
+
+    if not np.isfinite(vmin):
+        vmin = auto_vmin
+    if not np.isfinite(vmax):
+        vmax = auto_vmax
+
+    if vmax <= vmin:
+        vmax = vmin + 1e-12
+
+    return vmin, vmax, auto_vmin, auto_vmax
+
+
+def get_pg_colormap(name: str, reverse: bool = False):
+    desired = f"{name}_r" if reverse else name
+    if not _HAVE_PG:
+        return None
+    try:
+        return pg.colormap.get(desired, source="matplotlib")
+    except Exception:
+        try:
+            return pg.colormap.get(desired)
+        except Exception:
+            fallback = "viridis_r" if reverse else "viridis"
+            try:
+                return pg.colormap.get(fallback, source="matplotlib")
+            except Exception:
+                return pg.colormap.get("viridis")
+
+
+def qcolor_to_hex(color) -> str:
+    qc = QColor(color)
+    if not qc.isValid():
+        qc = QColor("#ffffff")
+    return qc.name().upper()
+
+
+def default_custom_color_bands():
+    return [
+        {"min": 0.0, "max": 200.0, "color": "#0000FF"},
+        {"min": 200.0, "max": 500.0, "color": "#00FF00"},
+        {"min": 500.0, "max": 800.0, "color": "#FFFF00"},
+        {"min": 800.0, "max": 1000.0, "color": "#FF0000"},
+    ]
+
+
+def normalize_custom_bands(bands):
+    if not bands:
+        return []
+
+    out = []
+    for i, band in enumerate(bands):
+        try:
+            lo = float(band.get("min"))
+            hi = float(band.get("max"))
+        except Exception:
+            raise ValueError(f"Band {i + 1}: invalid numeric limits.")
+
+        if not np.isfinite(lo) or not np.isfinite(hi):
+            raise ValueError(f"Band {i + 1}: limits must be finite.")
+        if hi <= lo:
+            raise ValueError(f"Band {i + 1}: max must be greater than min.")
+
+        color_hex = qcolor_to_hex(band.get("color", "#FFFFFF"))
+        out.append({"min": lo, "max": hi, "color": color_hex})
+
+    out.sort(key=lambda b: (b["min"], b["max"]))
+    for i in range(1, len(out)):
+        prev = out[i - 1]
+        cur = out[i]
+        if cur["min"] < prev["max"] - 1e-12:
+            raise ValueError("Custom color bands must not overlap.")
+
+    return out
+
+
+def build_segmented_pg_colormap(bands):
+    bands = normalize_custom_bands(bands)
+    if not bands:
+        return get_pg_colormap("viridis", reverse=False)
+
+    low = float(bands[0]["min"])
+    high = float(bands[-1]["max"])
+    span = max(high - low, 1e-12)
+
+    pos = []
+    colors = []
+    for band in bands:
+        color = QColor(band["color"])
+        rgba = (color.red(), color.green(), color.blue(), 255)
+        p0 = float(np.clip((band["min"] - low) / span, 0.0, 1.0))
+        p1 = float(np.clip((band["max"] - low) / span, 0.0, 1.0))
+        pos.extend([p0, p1])
+        colors.extend([rgba, rgba])
+
+    if len(pos) < 2 or abs(pos[-1] - pos[0]) < 1e-12:
+        pos = [0.0, 1.0]
+        color = QColor(bands[0]["color"])
+        rgba = (color.red(), color.green(), color.blue(), 255)
+        colors = [rgba, rgba]
+
+    return pg.ColorMap(np.asarray(pos, dtype=np.float64), colors)
+
+
+def resolve_image_style(S: np.ndarray, scale: str, color_cfg: dict):
+    color_mode = str(color_cfg.get("color_mode", "Continuous")).strip()
+    reverse = bool(color_cfg.get("reverse", False))
+
+    if color_mode == "Custom Bands":
+        bands = normalize_custom_bands(color_cfg.get("custom_bands", []))
+        if bands:
+            vmin = float(bands[0]["min"])
+            vmax = float(bands[-1]["max"])
+            if vmax <= vmin:
+                vmax = vmin + 1e-12
+            return {
+                "mode": "bands",
+                "bands": bands,
+                "vmin": vmin,
+                "vmax": vmax,
+                "cm": build_segmented_pg_colormap(bands),
+                "interactive": False,
+            }
+
+    vmin, vmax, auto_vmin, auto_vmax = resolve_color_limits(S, scale, color_cfg)
+    return {
+        "mode": "continuous",
+        "bands": [],
+        "vmin": vmin,
+        "vmax": vmax,
+        "auto_vmin": auto_vmin,
+        "auto_vmax": auto_vmax,
+        "cm": get_pg_colormap(color_cfg.get("cmap", "viridis"), reverse=reverse),
+        "interactive": bool(color_cfg.get("manual_clim", False)),
+    }
+
+
+def resolve_mpl_image_style(S: np.ndarray, scale: str, color_cfg: dict):
+    color_mode = str(color_cfg.get("color_mode", "Continuous")).strip()
+    reverse = bool(color_cfg.get("reverse", False))
+
+    if color_mode == "Custom Bands":
+        bands = normalize_custom_bands(color_cfg.get("custom_bands", []))
+        if bands:
+            colors = [band["color"] for band in bands]
+            boundaries = [bands[0]["min"]] + [band["max"] for band in bands]
+            cmap = mcolors.ListedColormap(colors)
+            norm = mcolors.BoundaryNorm(boundaries, cmap.N, clip=True)
+            return {
+                "mode": "bands",
+                "bands": bands,
+                "boundaries": boundaries,
+                "cmap": cmap,
+                "norm": norm,
+            }
+
+    vmin, vmax, auto_vmin, auto_vmax = resolve_color_limits(S, scale, color_cfg)
+    cmap_name = color_cfg.get("cmap", "viridis")
+    cmap = matplotlib.colormaps.get_cmap(f"{cmap_name}_r" if reverse else cmap_name)
+    return {
+        "mode": "continuous",
+        "vmin": vmin,
+        "vmax": vmax,
+        "auto_vmin": auto_vmin,
+        "auto_vmax": auto_vmax,
+        "cmap": cmap,
+        "norm": None,
+    }
+
+
+def make_colormap_preview_icon(name: str, width: int = 72, height: int = 14):
+    pix = QPixmap(width, height)
+    pix.fill(Qt.transparent)
+    painter = QPainter(pix)
+    try:
+        cmap = matplotlib.colormaps.get_cmap(name)
+    except Exception:
+        cmap = matplotlib.colormaps.get_cmap("viridis")
+
+    for x in range(width):
+        frac = x / max(width - 1, 1)
+        rgba = cmap(frac)
+        painter.setPen(QColor(int(rgba[0] * 255), int(rgba[1] * 255), int(rgba[2] * 255)))
+        painter.drawLine(x, 0, x, height)
+
+    painter.setPen(QColor(80, 80, 80))
+    painter.drawRect(0, 0, width - 1, height - 1)
+    painter.end()
+    return QIcon(pix)
 
 def _read_csv_df(path: str, nrows=None):
     kwargs = {"sep": None, "engine": "python"}
@@ -177,6 +475,8 @@ def read_signal_from_source(path: str, file_type: str, container_name: str, sign
 
 class InteractivePlotWidget(QWidget):
     clicked = pyqtSignal()
+    color_levels_changed = pyqtSignal(float, float)
+    color_levels_change_finished = pyqtSignal(float, float)
 
     def __init__(self, mini=False):
         super().__init__()
@@ -190,6 +490,9 @@ class InteractivePlotWidget(QWidget):
         self._mouse_proxy = None
         self._home_range = None
         self._rect_zoom_active = False
+        self._image_item = None
+        self._color_bar = None
+        self._suspend_colorbar_sync = False
 
         self.enable_click_annotations = not self.mini
         self._click_annotations = []
@@ -209,9 +512,16 @@ class InteractivePlotWidget(QWidget):
         self.plot_state = None
         self.plot_key = None
         self._home_range = None
+        self._image_item = None
+        self._color_bar = None
         self.hover_label.setVisible(False)
 
         if self._plot_widget is not None:
+            try:
+                if self._plot_item is not None:
+                    self._plot_item.clear()
+            except Exception:
+                pass
             self.root.removeWidget(self._plot_widget)
             self._plot_widget.deleteLater()
             self._plot_widget = None
@@ -247,6 +557,18 @@ class InteractivePlotWidget(QWidget):
         if self._view_box is not None:
             self._view_box.setMouseMode(pg.ViewBox.RectMode if active else pg.ViewBox.PanMode)
 
+    def get_view_box(self):
+        return self._view_box
+
+    def get_view_range(self):
+        if self._view_box is None:
+            return None
+        try:
+            xr, yr = self._view_box.viewRange()
+            return (float(xr[0]), float(xr[1])), (float(yr[0]), float(yr[1]))
+        except Exception:
+            return None
+
     def _cursor_top_y(self):
         span = max(self.rpm_max - self.rpm_min, 1e-12)
         return self.rpm_max - 0.035 * span
@@ -254,6 +576,24 @@ class InteractivePlotWidget(QWidget):
     def _cursor_label_x(self, x_value: float) -> float:
         span = max(self.freq_max - self.freq_min, 1e-12)
         return float(np.clip(x_value, self.freq_min + 0.02 * span, self.freq_max - 0.02 * span))
+
+    def _on_upper_colorbar_levels_changed(self, *_):
+        if self._suspend_colorbar_sync or self._upper_color_bar is None:
+            return
+        try:
+            lo, hi = self._upper_color_bar.levels()
+            self.color_levels_changed.emit(float(lo), float(hi))
+        except Exception:
+            pass
+
+    def _on_upper_colorbar_levels_change_finished(self, *_):
+        if self._suspend_colorbar_sync or self._upper_color_bar is None:
+            return
+        try:
+            lo, hi = self._upper_color_bar.levels()
+            self.color_levels_change_finished.emit(float(lo), float(hi))
+        except Exception:
+            pass
 
     def _on_mouse_clicked(self, event):
         if self._plot_widget is None or self._view_box is None:
@@ -509,18 +849,25 @@ class InteractivePlotWidget(QWidget):
 
     @staticmethod
     def _pg_colormap(name: str, reverse: bool = False):
-        desired = f"{name}_r" if reverse else name
+        return get_pg_colormap(name, reverse=reverse)
+
+    def _on_colorbar_levels_changed(self, *_):
+        if self._suspend_colorbar_sync or self._color_bar is None:
+            return
         try:
-            return pg.colormap.get(desired, source="matplotlib")
+            lo, hi = self._color_bar.levels()
+            self.color_levels_changed.emit(float(lo), float(hi))
         except Exception:
-            try:
-                return pg.colormap.get(desired)
-            except Exception:
-                fallback = "viridis_r" if reverse else "viridis"
-                try:
-                    return pg.colormap.get(fallback, source="matplotlib")
-                except Exception:
-                    return pg.colormap.get("viridis")
+            pass
+
+    def _on_colorbar_levels_change_finished(self, *_):
+        if self._suspend_colorbar_sync or self._color_bar is None:
+            return
+        try:
+            lo, hi = self._color_bar.levels()
+            self.color_levels_change_finished.emit(float(lo), float(hi))
+        except Exception:
+            pass
 
     def set_state(self, state: dict, color_cfg=None, preserve_view=False, preserve_annotations=False):
         old_range = None
@@ -578,9 +925,6 @@ class InteractivePlotWidget(QWidget):
                 pen=self._safe_pen(),
                 antialias=False,
                 connect="finite",
-                autoDownsample=True,
-                clipToView=True,
-                downsampleMethod="peak",
             )
             try:
                 item.setSkipFiniteCheck(True)
@@ -630,36 +974,39 @@ class InteractivePlotWidget(QWidget):
         y0 = float(freqs[0] - 0.5 * dy)
         y1 = float(freqs[-1] + 0.5 * dy)
 
-        finite = S[np.isfinite(S)]
-        auto_vmin = float(np.min(finite)) if finite.size else 0.0
-        auto_vmax = float(np.max(finite)) if finite.size else 1.0
-        if auto_vmin == auto_vmax:
-            auto_vmax = auto_vmin + 1e-12
-
-        manual = bool(color_cfg.get("manual_clim", False))
-        vmin = float(color_cfg.get("vmin", auto_vmin)) if manual else auto_vmin
-        vmax = float(color_cfg.get("vmax", auto_vmax)) if manual else auto_vmax
-        if vmax <= vmin:
-            vmax = vmin + 1e-12
-
-        cmap_name = color_cfg.get("cmap", "viridis")
-        reverse = bool(color_cfg.get("reverse", False))
+        style = resolve_image_style(S, state.get("scale", "Linear"), color_cfg)
 
         image_item = pg.ImageItem(axisOrder="row-major")
         image_item.setImage(S, autoLevels=False)
         image_item.setRect(QRectF(x0, y0, x1 - x0, y1 - y0))
-        image_item.setLevels((vmin, vmax))
-        image_item.setColorMap(self._pg_colormap(cmap_name, reverse=reverse))
+        image_item.setLevels((style["vmin"], style["vmax"]))
+        image_item.setColorMap(style["cm"])
         self._plot_item.addItem(image_item)
 
         cbar = pg.ColorBarItem(
-            values=(vmin, vmax),
-            colorMap=self._pg_colormap(cmap_name, reverse=reverse),
+            values=(style["vmin"], style["vmax"]),
+            colorMap=style["cm"],
             label=state.get("colorbar_label", ""),
-            interactive=False,
+            interactive=bool(style.get("interactive", False)),
             width=12 if self.mini else 18,
         )
+
+        self._suspend_colorbar_sync = True
         cbar.setImageItem(image_item, insert_in=self._plot_item)
+        self._suspend_colorbar_sync = False
+
+        self._image_item = image_item
+        self._color_bar = cbar
+
+        if bool(style.get("interactive", False)):
+            try:
+                cbar.sigLevelsChanged.connect(self._on_colorbar_levels_changed)
+            except Exception:
+                pass
+            try:
+                cbar.sigLevelsChangeFinished.connect(self._on_colorbar_levels_change_finished)
+            except Exception:
+                pass
 
         self._set_home_range(x0, x1, y0, y1, padding=0.0)
 
@@ -709,6 +1056,121 @@ class WaterfallSetupDialog(QDialog):
             "filter_target": self.cmb_filter_target.currentText().strip(),
             "open_3d": self.chk_open_3d.isChecked(),
         }
+
+
+class BandEditorDialog(QDialog):
+    def __init__(self, bands=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Custom Color Bands")
+        self.resize(560, 360)
+
+        self.table = QTableWidget(0, 3, self)
+        self.table.setHorizontalHeaderLabels(["Min", "Max", "Color"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.table.cellDoubleClicked.connect(self._on_cell_double_clicked)
+
+        self.btn_add = QPushButton("Add Band")
+        self.btn_remove = QPushButton("Remove Selected")
+        self.btn_pick = QPushButton("Pick Color")
+        self.btn_reset = QPushButton("Reset Defaults")
+
+        row_btn = QHBoxLayout()
+        row_btn.addWidget(self.btn_add)
+        row_btn.addWidget(self.btn_remove)
+        row_btn.addWidget(self.btn_pick)
+        row_btn.addWidget(self.btn_reset)
+        row_btn.addStretch(1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("Define numeric intervals and colors. Double-click a color cell to change it."))
+        lay.addWidget(self.table, 1)
+        lay.addLayout(row_btn)
+        lay.addWidget(buttons)
+
+        self.btn_add.clicked.connect(lambda: self._add_row())
+        self.btn_remove.clicked.connect(self._remove_selected)
+        self.btn_pick.clicked.connect(self._pick_selected_color)
+        self.btn_reset.clicked.connect(self._reset_defaults)
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+
+        initial = bands if bands else default_custom_color_bands()
+        for band in initial:
+            self._add_row(band)
+
+    def _set_color_item(self, row: int, color_text: str):
+        color_text = qcolor_to_hex(color_text)
+        item = self.table.item(row, 2)
+        if item is None:
+            item = QTableWidgetItem()
+            self.table.setItem(row, 2, item)
+        item.setText(color_text)
+        item.setBackground(QColor(color_text))
+        item.setForeground(QColor("#000000") if QColor(color_text).lightness() > 128 else QColor("#FFFFFF"))
+
+    def _add_row(self, band=None):
+        band = band or {"min": 0.0, "max": 1.0, "color": "#FFFFFF"}
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self.table.setItem(row, 0, QTableWidgetItem(str(band.get("min", 0.0))))
+        self.table.setItem(row, 1, QTableWidgetItem(str(band.get("max", 1.0))))
+        self._set_color_item(row, band.get("color", "#FFFFFF"))
+
+    def _remove_selected(self):
+        rows = sorted({idx.row() for idx in self.table.selectedIndexes()}, reverse=True)
+        for row in rows:
+            self.table.removeRow(row)
+
+    def _pick_color_for_row(self, row: int):
+        if row < 0 or row >= self.table.rowCount():
+            return
+        current = self.table.item(row, 2)
+        start = QColor(current.text()) if current is not None else QColor("#FFFFFF")
+        color = QColorDialog.getColor(start, self, "Select band color")
+        if color.isValid():
+            self._set_color_item(row, color.name())
+
+    def _pick_selected_color(self):
+        row = self.table.currentRow()
+        if row >= 0:
+            self._pick_color_for_row(row)
+
+    def _reset_defaults(self):
+        self.table.setRowCount(0)
+        for band in default_custom_color_bands():
+            self._add_row(band)
+
+    def _on_cell_double_clicked(self, row: int, column: int):
+        if column == 2:
+            self._pick_color_for_row(row)
+
+    def bands(self):
+        out = []
+        for row in range(self.table.rowCount()):
+            min_item = self.table.item(row, 0)
+            max_item = self.table.item(row, 1)
+            color_item = self.table.item(row, 2)
+            out.append({
+                "min": float(min_item.text()) if min_item is not None else 0.0,
+                "max": float(max_item.text()) if max_item is not None else 1.0,
+                "color": color_item.text() if color_item is not None else "#FFFFFF",
+            })
+        return normalize_custom_bands(out)
+
+    def _accept(self):
+        try:
+            self.bands()
+        except Exception as e:
+            QMessageBox.warning(self, "Custom Bands", str(e))
+            return
+        self.accept()
 
 
 class Waterfall3DWindow(QDialog):
@@ -863,6 +1325,8 @@ class WaterfallOrderCursor(QObject):
 
 class WaterfallPlotWidget(QWidget):
     clicked = pyqtSignal()
+    color_levels_changed = pyqtSignal(float, float)
+    color_levels_change_finished = pyqtSignal(float, float)
 
     def __init__(self, mini=False, parent=None):
         super().__init__(parent)
@@ -874,6 +1338,9 @@ class WaterfallPlotWidget(QWidget):
         self._home_lower = None
         self._legend = None
         self._cursors = []
+        self._upper_image_item = None
+        self._upper_color_bar = None
+        self._suspend_colorbar_sync = False
         self._cursor_colors = [
             (220, 60, 60),
             (70, 180, 90),
@@ -971,6 +1438,30 @@ class WaterfallPlotWidget(QWidget):
             self.btn_open_3d.hide()
             self.lbl_order_info.hide()
             self.lower.hide()
+
+    def _clear_upper_colorbar(self):
+        cbar = self._upper_color_bar
+        self._upper_color_bar = None
+        if cbar is None:
+            return
+        try:
+            cbar.setImageItem(None)
+        except Exception:
+            pass
+        try:
+            self.upper_item.layout.removeItem(cbar)
+        except Exception:
+            pass
+        try:
+            scene = cbar.scene()
+            if scene is not None:
+                scene.removeItem(cbar)
+        except Exception:
+            pass
+        try:
+            cbar.deleteLater()
+        except Exception:
+            pass
 
     def _freq_at_top(self, order_value: float) -> float:
         return float(order_value) * self.rpm_max / 60.0
@@ -1617,8 +2108,10 @@ class WaterfallPlotWidget(QWidget):
         self.lower_hover_label.setVisible(False)
         self.clear_click_annotations()
 
+        self._clear_upper_colorbar()
         self.upper_item.clear()
         self.lower_item.clear()
+        self._upper_image_item = None
         self.clear_cursors()
 
         if self.freqs.size == 0 or self.rpms.size == 0 or self.S.size == 0:
@@ -1638,37 +2131,37 @@ class WaterfallPlotWidget(QWidget):
         y0 = float(self.rpms[0] - 0.5 * dy)
         y1 = float(self.rpms[-1] + 0.5 * dy)
 
-        finite = self.S[np.isfinite(self.S)]
-        auto_vmin = float(np.min(finite)) if finite.size else 0.0
-        auto_vmax = float(np.max(finite)) if finite.size else 1.0
-        if auto_vmax <= auto_vmin:
-            auto_vmax = auto_vmin + 1e-12
-
-        manual = bool(color_cfg.get("manual_clim", False))
-        vmin = float(color_cfg.get("vmin", auto_vmin)) if manual else auto_vmin
-        vmax = float(color_cfg.get("vmax", auto_vmax)) if manual else auto_vmax
-        if vmax <= vmin:
-            vmax = vmin + 1e-12
-
-        cmap_name = color_cfg.get("cmap", "viridis")
-        reverse = bool(color_cfg.get("reverse", False))
-        cm = InteractivePlotWidget._pg_colormap(cmap_name, reverse=reverse)
+        style = resolve_image_style(self.S, state.get("scale", "Linear"), color_cfg)
 
         img = pg.ImageItem(axisOrder="row-major")
         img.setImage(self.S, autoLevels=False)
         img.setRect(QRectF(x0, y0, x1 - x0, y1 - y0))
-        img.setLevels((vmin, vmax))
-        img.setColorMap(cm)
+        img.setLevels((style["vmin"], style["vmax"]))
+        img.setColorMap(style["cm"])
         self.upper_item.addItem(img)
 
         cbar = pg.ColorBarItem(
-            values=(vmin, vmax),
-            colorMap=cm,
+            values=(style["vmin"], style["vmax"]),
+            colorMap=style["cm"],
             label=state.get("colorbar_label", "Amplitude"),
-            interactive=False,
+            interactive=bool(style.get("interactive", False)),
             width=18,
         )
+        self._suspend_colorbar_sync = True
         cbar.setImageItem(img, insert_in=self.upper_item)
+        self._suspend_colorbar_sync = False
+        self._upper_image_item = img
+        self._upper_color_bar = cbar
+
+        if bool(style.get("interactive", False)):
+            try:
+                cbar.sigLevelsChanged.connect(self._on_upper_colorbar_levels_changed)
+            except Exception:
+                pass
+            try:
+                cbar.sigLevelsChangeFinished.connect(self._on_upper_colorbar_levels_change_finished)
+            except Exception:
+                pass
 
         self.upper_item.setLabel("bottom", state.get("xlabel", "Frequency (Hz)"))
         self.upper_item.setLabel("left", state.get("ylabel", "RPM"))
@@ -1709,6 +2202,215 @@ class WaterfallPlotWidget(QWidget):
 
         self._update_upper_annotation_buttons()
         self._update_lower_annotation_buttons()
+
+
+class TimeDomainZoomFFTWidget(QWidget):
+    clicked = pyqtSignal()
+    color_levels_changed = pyqtSignal(float, float)
+    color_levels_change_finished = pyqtSignal(float, float)
+
+    def __init__(self, mini=False, parent=None):
+        super().__init__(parent)
+        self.mini = bool(mini)
+        self.plot_state = None
+        self.plot_key = None
+
+        self.upper = InteractivePlotWidget(mini=mini)
+        self.upper.clicked.connect(self.clicked.emit)
+
+        self.lbl_zoom_fft = QLabel("Visible time window FFT: -")
+        self.lbl_zoom_fft.setStyleSheet("color: #444;")
+        self.lbl_zoom_fft.setWordWrap(True)
+
+        self.lower = InteractivePlotWidget(mini=mini)
+        self.lower.clicked.connect(self.clicked.emit)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self.upper, 3)
+        lay.addWidget(self.lbl_zoom_fft)
+        lay.addWidget(self.lower, 2)
+
+        self._range_timer = QTimer(self)
+        self._range_timer.setSingleShot(True)
+        self._range_timer.setInterval(120)
+        self._range_timer.timeout.connect(self._update_zoom_fft_from_view)
+
+        self._connected_upper_vb = None
+        self._time_signal = np.array([], dtype=np.float64)
+        self._time_axis = np.array([], dtype=np.float64)
+        self._fft_cfg = {}
+        self._lower_export_data = None
+
+    def _connect_upper_viewbox(self):
+        vb = self.upper.get_view_box()
+        if vb is self._connected_upper_vb:
+            return
+
+        if self._connected_upper_vb is not None:
+            try:
+                self._connected_upper_vb.sigRangeChanged.disconnect(self._on_upper_range_changed)
+            except Exception:
+                pass
+
+        self._connected_upper_vb = vb
+        if vb is not None:
+            try:
+                vb.sigRangeChanged.connect(self._on_upper_range_changed)
+            except Exception:
+                pass
+
+    def _on_upper_range_changed(self, *_):
+        self._range_timer.start()
+
+    def set_rect_zoom_active(self, active: bool):
+        self.upper.set_rect_zoom_active(active)
+        self.lower.set_rect_zoom_active(active)
+
+    def zoom_axes(self, factor: float):
+        self.upper.zoom_axes(factor)
+        self.lower.zoom_axes(factor)
+
+    def reset_view(self):
+        self.upper.reset_view()
+        self.lower.reset_view()
+        self._update_zoom_fft_from_view()
+
+    def clear_click_annotations(self):
+        self.upper.clear_click_annotations()
+        self.lower.clear_click_annotations()
+
+    def get_export_annotations(self):
+        return self.upper.get_export_annotations()
+
+    def get_export_lower_annotations(self):
+        return self.lower.get_export_annotations()
+
+    def get_zoom_fft_export_data(self):
+        return dict(self._lower_export_data) if isinstance(self._lower_export_data, dict) else None
+
+    def set_state(self, state: dict, color_cfg=None, preserve_view=False, preserve_annotations=False):
+        self.plot_state = state
+        self.plot_key = state["key"]
+        self._time_signal = np.asarray(state.get("time_signal", state["series"][0]["y"]), dtype=np.float64)
+        self._time_axis = np.asarray(state.get("time_axis", state["series"][0]["x"]), dtype=np.float64)
+        self._fft_cfg = dict(state.get("fft_zoom_cfg", {}))
+
+        self.upper.set_state(
+            state,
+            color_cfg=color_cfg,
+            preserve_view=preserve_view,
+            preserve_annotations=preserve_annotations,
+        )
+        self._connect_upper_viewbox()
+        self._update_zoom_fft_from_view()
+
+    def _selected_time_window(self):
+        if self._time_axis.size == 0 or self._time_signal.size == 0:
+            return None
+
+        xr = self.upper.get_view_range()
+        if xr is None:
+            x0 = float(self._time_axis[0])
+            x1 = float(self._time_axis[-1])
+        else:
+            x0, x1 = xr[0]
+
+        if x1 < x0:
+            x0, x1 = x1, x0
+
+        lo = float(self._time_axis[0])
+        hi = float(self._time_axis[-1])
+        x0 = float(np.clip(x0, lo, hi))
+        x1 = float(np.clip(x1, lo, hi))
+
+        if x1 <= x0:
+            x0 = lo
+            x1 = hi
+
+        i0 = int(np.searchsorted(self._time_axis, x0, side="left"))
+        i1 = int(np.searchsorted(self._time_axis, x1, side="right"))
+        i0 = max(0, min(i0, self._time_signal.size - 1))
+        i1 = max(i0 + 1, min(i1, self._time_signal.size))
+
+        return x0, x1, i0, i1
+
+    def _update_zoom_fft_from_view(self):
+        self._lower_export_data = None
+
+        if self._time_signal.size == 0 or self._time_axis.size == 0:
+            self.lbl_zoom_fft.setText("Visible time window FFT: -")
+            self.lower.clear_plot()
+            return
+
+        win = self._selected_time_window()
+        if win is None:
+            self.lbl_zoom_fft.setText("Visible time window FFT: -")
+            self.lower.clear_plot()
+            return
+
+        x0, x1, i0, i1 = win
+        y_sel = np.asarray(self._time_signal[i0:i1], dtype=np.float64)
+        if y_sel.size < 2:
+            self.lbl_zoom_fft.setText("Visible time window FFT: selected region is too short.")
+            self.lower.clear_plot()
+            return
+
+        fs = float(self.plot_state.get("fs", 1.0))
+        nfft = int(self._fft_cfg.get("nfft", 1024))
+        overlap_pct = float(self._fft_cfg.get("overlap_pct", 67.0))
+        out_type = str(self._fft_cfg.get("out_type", "Amplitude"))
+        scale = str(self._fft_cfg.get("scale", "Linear"))
+        amp_conv = str(self._fft_cfg.get("amp_conv", "RMS"))
+        signal_kind = str(self._fft_cfg.get("signal_kind", "acc"))
+        _, unit_lbl = get_amp_conv_factor_label(amp_conv, signal_kind)
+        ylabel = build_spectrum_ylabel(out_type, scale, unit_lbl)
+
+        freqs, spec = compute_avg_spectrum_from_signal(
+            y=y_sel,
+            fs=fs,
+            nfft=nfft,
+            overlap_pct=overlap_pct,
+            output_type=out_type,
+            scale=scale,
+            amp_conv=amp_conv,
+            signal_kind=signal_kind,
+        )
+
+        if freqs.size == 0 or spec.size == 0:
+            self.lbl_zoom_fft.setText("Visible time window FFT: selected region is empty.")
+            self.lower.clear_plot()
+            return
+
+        dt = max(0.0, float(x1 - x0))
+        title = (
+            f"Visible time window FFT | t=[{x0:.6g}, {x1:.6g}] s | Δt={dt:.6g} s | "
+            f"samples={y_sel.size} | NFFT={nfft} | Overlap={overlap_pct:.1f}%"
+        )
+        self.lbl_zoom_fft.setText(title)
+
+        lower_state = {
+            "key": f"{self.plot_key}|visible_fft",
+            "kind": "avg",
+            "name": f"{self.plot_state.get('name', 'signal')} | Visible FFT",
+            "short_title": "Visible time window FFT",
+            "title": title,
+            "xlabel": "Frequency (Hz)",
+            "ylabel": ylabel,
+            "grid": True,
+            "series": [{"x": freqs, "y": spec, "label": "Visible time window FFT"}],
+            "stats_text": "",
+        }
+        self.lower.set_state(lower_state, preserve_view=False, preserve_annotations=False)
+
+        self._lower_export_data = {
+            "freqs": np.asarray(freqs, dtype=np.float64),
+            "spec": np.asarray(spec, dtype=np.float64),
+            "xlabel": "Frequency (Hz)",
+            "ylabel": ylabel,
+            "title": title,
+            "window": (float(x0), float(x1)),
+        }
 
 
 class PlotMiniWidget(QFrame):
@@ -1772,8 +2474,12 @@ class DetailPlotWidget(QWidget):
         self.title.setWordWrap(True)
         self.title.setStyleSheet("font-weight: bold;")
 
-        self.canvas = InteractivePlotWidget(mini=False)
-        self.canvas.setMinimumHeight(620)
+        if state.get("kind") == "time":
+            self.canvas = TimeDomainZoomFFTWidget(mini=False)
+            self.canvas.setMinimumHeight(680)
+        else:
+            self.canvas = InteractivePlotWidget(mini=False)
+            self.canvas.setMinimumHeight(480)
 
         lay = QVBoxLayout(self)
         lay.addWidget(self.title)
@@ -1798,7 +2504,7 @@ class WaterfallDetailWidget(QWidget):
         self.title.setStyleSheet("font-weight: bold;")
 
         self.canvas = WaterfallPlotWidget(mini=False)
-        self.canvas.setMinimumHeight(780)
+        self.canvas.setMinimumHeight(620)
         self.canvas.clicked.connect(self._emit_active)
 
         lay = QVBoxLayout(self)
@@ -1884,14 +2590,7 @@ class PlotWorker(QObject):
 
     def _amp_conv_factor_label(self, signal_kind=None):
         sk = signal_kind or self.cfg["signal_kind"]
-        unit = self._signal_unit_short(sk)
-        sel = self.cfg["amp_conv"]
-
-        if sel == "Peak":
-            return 1.0, f"{unit} (peak)"
-        if sel == "RMS":
-            return 1.0 / np.sqrt(2.0), f"{unit} RMS"
-        return 2.0, f"{unit} p-p"
+        return get_amp_conv_factor_label(self.cfg["amp_conv"], sk)
 
     def _make_time_axis(self, n: int, fs: float, start_offset_s: float = 0.0):
         return start_offset_s + (np.arange(n, dtype=np.float64) / fs)
@@ -2087,45 +2786,16 @@ class PlotWorker(QObject):
 
     def _compute_avg_spectrum(self, y: np.ndarray, fs: float, nfft: int, overlap_pct: float,
                               output_type: str, scale: str, signal_kind: str):
-        ovl = np.clip(overlap_pct / 100.0, 0.0, 0.95)
-        hop = max(1, int(round(nfft * (1.0 - ovl))))
-
-        w = np.hanning(nfft).astype(np.float64)
-        w_sum = np.sum(w)
-
-        if y.size < nfft:
-            frame = np.zeros(nfft, dtype=np.float64)
-            frame[:y.size] = y
-            frames = [frame]
-        else:
-            frames = [y[start:start + nfft] for start in range(0, y.size - nfft + 1, hop)]
-            if not frames:
-                frame = np.zeros(nfft, dtype=np.float64)
-                frame[:min(y.size, nfft)] = y[:min(y.size, nfft)]
-                frames = [frame]
-
-        conv, _ = self._amp_conv_factor_label(signal_kind)
-        acc = None
-
-        for frame in frames:
-            X = np.fft.rfft(frame * w, n=nfft)
-            mag = np.abs(X)
-            A_peak = (2.0 * mag) / w_sum
-            A_peak[0] *= 0.5
-            if (nfft % 2 == 0) and (A_peak.size > 1):
-                A_peak[-1] *= 0.5
-            A = A_peak * conv
-            S = A if output_type == "Amplitude" else (A * A)
-            acc = S if acc is None else (acc + S)
-
-        spec = acc / float(len(frames))
-        freqs = np.fft.rfftfreq(nfft, d=1.0 / fs)
-
-        if scale == "dB":
-            eps = 1e-20
-            spec = (20.0 * np.log10(spec + eps)) if output_type == "Amplitude" else (10.0 * np.log10(spec + eps))
-
-        return freqs, spec
+        return compute_avg_spectrum_from_signal(
+            y=y,
+            fs=fs,
+            nfft=nfft,
+            overlap_pct=overlap_pct,
+            output_type=output_type,
+            scale=scale,
+            amp_conv=self.cfg["amp_conv"],
+            signal_kind=signal_kind,
+        )
 
     def _compute_stft(self, y: np.ndarray, fs: float, nfft: int, overlap_pct: float,
                       output_type: str, scale: str, signal_kind: str):
@@ -2333,11 +3003,7 @@ class PlotWorker(QObject):
 
         _, unit_lbl = self._amp_conv_factor_label("acc")
 
-        colorbar_label = (
-            f"Amplitude (dB re 1 {unit_lbl})" if scale == "dB" else f"Amplitude ({unit_lbl})"
-        ) if out_type == "Amplitude" else (
-            f"Power (dB re 1 ({unit_lbl})²)" if scale == "dB" else f"Power ({unit_lbl}²)"
-        )
+        colorbar_label = build_spectrum_ylabel(out_type, scale, unit_lbl)
 
         same_source = (
             acc_file_base == rpm_file_base and
@@ -2374,6 +3040,8 @@ class PlotWorker(QObject):
             "freqs": freqs,
             "rpms": rpms,
             "S": S_map,
+            "scale": scale,
+            "out_type": out_type,
             "colorbar_label": colorbar_label,
             "stats_text": (
                 f"Waterfall built from Acc={acc_name} ({acc_file_base}/{acc_group}, fs={fs_acc:g} Hz) and "
@@ -2500,6 +3168,17 @@ class PlotWorker(QObject):
                     "ylabel": self._signal_ylabel(signal_kind),
                     "grid": True,
                     "series": [{"x": t, "y": y, "label": nm}],
+                    "time_signal": y.copy(),
+                    "time_axis": t.copy(),
+                    "fs": fs,
+                    "fft_zoom_cfg": {
+                        "nfft": int(self.cfg["nfft"]),
+                        "overlap_pct": float(self.cfg["overlap_pct"]),
+                        "out_type": self.cfg["out_type"],
+                        "scale": self.cfg["scale"],
+                        "amp_conv": self.cfg["amp_conv"],
+                        "signal_kind": signal_kind,
+                    },
                     "stats_text": self._time_stats_text(nm, y, signal_kind),
                 })
                 continue
@@ -2514,11 +3193,7 @@ class PlotWorker(QObject):
             if method == "Averaged Spectrum":
                 freqs, spec = self._compute_avg_spectrum(y, fs, nfft, overlap_pct, out_type, scale, signal_kind)
 
-                ylabel = (
-                    f"Amplitude (dB re 1 {unit_lbl})" if scale == "dB" else f"Amplitude ({unit_lbl})"
-                ) if out_type == "Amplitude" else (
-                    f"Power (dB re 1 ({unit_lbl})²)" if scale == "dB" else f"Power ({unit_lbl}²)"
-                )
+                ylabel = build_spectrum_ylabel(out_type, scale, unit_lbl)
 
                 states.append({
                     "key": key,
@@ -2538,11 +3213,7 @@ class PlotWorker(QObject):
             if crop:
                 times = times + t0
 
-            colorbar_label = (
-                f"Amplitude (dB re 1 {unit_lbl})" if scale == "dB" else f"Amplitude ({unit_lbl})"
-            ) if out_type == "Amplitude" else (
-                f"Power (dB re 1 ({unit_lbl})²)" if scale == "dB" else f"Power ({unit_lbl}²)"
-            )
+            colorbar_label = build_spectrum_ylabel(out_type, scale, unit_lbl)
 
             states.append({
                 "key": key,
@@ -2598,6 +3269,7 @@ class MainWindow(QMainWindow):
         self._active_canvas = None
         self._active_plot_key = None
         self._pending_waterfall_open_3d = False
+        self.custom_color_bands = default_custom_color_bands()
 
         self.btn_open = QPushButton("Open File (.xlsx / .tdms / .csv)")
         self.lbl_file = QLabel("Selected file: -")
@@ -2744,19 +3416,26 @@ class MainWindow(QMainWindow):
         self.cmb_spec_render.setCurrentText("ImageItem")
 
         self.cmb_spec_cmap = QComboBox()
-        self.cmb_spec_cmap.addItems([
+        for cmap_name in [
             "viridis", "plasma", "inferno", "magma", "cividis",
             "turbo", "jet", "hot", "cool", "coolwarm",
             "nipy_spectral", "gist_rainbow"
-        ])
+        ]:
+            self.cmb_spec_cmap.addItem(make_colormap_preview_icon(cmap_name), cmap_name)
         self.cmb_spec_cmap.setCurrentText("viridis")
 
         self.chk_spec_cmap_reverse = QCheckBox("Reverse colors")
 
+        self.lbl_dyn_range = QLabel("Dynamic Range (dB):")
         self.spec_levels_spin = QSpinBox()
         self.spec_levels_spin.setRange(4, 512)
         self.spec_levels_spin.setValue(80)
+        self.spec_levels_spin.setToolTip("For dB plots in continuous mode: vmin = vmax - dynamic range")
         self.spec_levels_spin.setEnabled(False)
+
+        self.cmb_color_mode = QComboBox()
+        self.cmb_color_mode.addItems(["Continuous", "Custom Bands"])
+        self.btn_edit_bands = QPushButton("Edit Bands...")
 
         self.chk_manual_clim = QCheckBox("Manual color range (vmin/vmax)")
 
@@ -2917,24 +3596,31 @@ class MainWindow(QMainWindow):
         row_axis.addWidget(self.edit_ylabel, 1)
         ptab.addLayout(row_axis)
 
-        row_spec = QHBoxLayout()
-        row_spec.addWidget(QLabel("Spectrogram render:"))
-        row_spec.addWidget(self.cmb_spec_render)
-        row_spec.addSpacing(8)
-        row_spec.addWidget(QLabel("Colormap:"))
-        row_spec.addWidget(self.cmb_spec_cmap)
-        row_spec.addWidget(self.chk_spec_cmap_reverse)
-        row_spec.addSpacing(8)
-        row_spec.addWidget(QLabel("Levels:"))
-        row_spec.addWidget(self.spec_levels_spin)
-        row_spec.addSpacing(8)
-        row_spec.addWidget(self.chk_manual_clim)
-        row_spec.addWidget(QLabel("vmin:"))
-        row_spec.addWidget(self.spec_vmin_spin)
-        row_spec.addWidget(QLabel("vmax:"))
-        row_spec.addWidget(self.spec_vmax_spin)
-        row_spec.addStretch(1)
-        ptab.addLayout(row_spec)
+        row_spec_top = QHBoxLayout()
+        row_spec_top.addWidget(QLabel("Spectrogram render:"))
+        row_spec_top.addWidget(self.cmb_spec_render)
+        row_spec_top.addSpacing(8)
+        row_spec_top.addWidget(QLabel("Colormap:"))
+        row_spec_top.addWidget(self.cmb_spec_cmap)
+        row_spec_top.addWidget(self.chk_spec_cmap_reverse)
+        row_spec_top.addSpacing(8)
+        row_spec_top.addWidget(QLabel("Color Mode:"))
+        row_spec_top.addWidget(self.cmb_color_mode)
+        row_spec_top.addWidget(self.btn_edit_bands)
+        row_spec_top.addStretch(1)
+        ptab.addLayout(row_spec_top)
+
+        row_spec_bottom = QHBoxLayout()
+        row_spec_bottom.addWidget(self.lbl_dyn_range)
+        row_spec_bottom.addWidget(self.spec_levels_spin)
+        row_spec_bottom.addSpacing(8)
+        row_spec_bottom.addWidget(self.chk_manual_clim)
+        row_spec_bottom.addWidget(QLabel("vmin:"))
+        row_spec_bottom.addWidget(self.spec_vmin_spin)
+        row_spec_bottom.addWidget(QLabel("vmax:"))
+        row_spec_bottom.addWidget(self.spec_vmax_spin)
+        row_spec_bottom.addStretch(1)
+        ptab.addLayout(row_spec_bottom)
 
         ptab.addWidget(self.plot_pages, 1)
 
@@ -2963,6 +3649,13 @@ class MainWindow(QMainWindow):
         self.btn_reset_view.clicked.connect(self._reset_active_view)
         self.btn_rect_zoom.toggled.connect(self._on_rect_zoom_toggled)
         self.chk_manual_clim.stateChanged.connect(self._on_manual_clim_toggle)
+        self.cmb_spec_cmap.currentIndexChanged.connect(self._on_color_controls_changed)
+        self.chk_spec_cmap_reverse.stateChanged.connect(self._on_color_controls_changed)
+        self.spec_levels_spin.valueChanged.connect(self._on_color_controls_changed)
+        self.spec_vmin_spin.valueChanged.connect(self._on_color_controls_changed)
+        self.spec_vmax_spin.valueChanged.connect(self._on_color_controls_changed)
+        self.cmb_color_mode.currentIndexChanged.connect(self._on_color_mode_changed)
+        self.btn_edit_bands.clicked.connect(self._edit_custom_bands)
         self.btn_apply_plot_view.clicked.connect(self._apply_plot_view)
         self.btn_export_plot.clicked.connect(self._export_current_plot)
 
@@ -3031,7 +3724,81 @@ class MainWindow(QMainWindow):
             "manual_clim": self.chk_manual_clim.isChecked(),
             "vmin": float(self.spec_vmin_spin.value()),
             "vmax": float(self.spec_vmax_spin.value()),
+            "dyn_range_db": float(self.spec_levels_spin.value()),
+            "color_mode": self.cmb_color_mode.currentText().strip(),
+            "custom_bands": [dict(b) for b in self.custom_color_bands],
         }
+
+    def _connect_canvas_color_signals(self, canvas):
+        if canvas is None:
+            return
+        try:
+            canvas.color_levels_changed.connect(self._on_canvas_color_levels_changed)
+        except Exception:
+            pass
+        try:
+            canvas.color_levels_change_finished.connect(self._on_canvas_color_levels_change_finished)
+        except Exception:
+            pass
+
+    def _has_active_color_plot(self):
+        state = self._plot_states.get(self._active_plot_key) if self._active_plot_key else None
+        return bool(state and state.get("kind") in ("stft", "waterfall"))
+
+    def _on_canvas_color_levels_changed(self, vmin: float, vmax: float):
+        if self._active_canvas is None or not self._has_active_color_plot():
+            return
+        self.chk_manual_clim.blockSignals(True)
+        self.chk_manual_clim.setChecked(True)
+        self.chk_manual_clim.blockSignals(False)
+        self.spec_vmin_spin.blockSignals(True)
+        self.spec_vmax_spin.blockSignals(True)
+        self.spec_vmin_spin.setValue(float(vmin))
+        self.spec_vmax_spin.setValue(float(vmax))
+        self.spec_vmin_spin.blockSignals(False)
+        self.spec_vmax_spin.blockSignals(False)
+        self._sync_spectrogram_controls()
+
+    def _on_canvas_color_levels_change_finished(self, vmin: float, vmax: float):
+        self._on_canvas_color_levels_changed(vmin, vmax)
+        if self._active_plot_key in self._plot_states:
+            self._refresh_plot_views_for_key(
+                self._active_plot_key,
+                preserve_active_limits=True,
+                preserve_active_annotations=True,
+            )
+
+    def _on_color_controls_changed(self, *_):
+        if self._active_plot_key not in self._plot_states:
+            return
+        state = self._plot_states[self._active_plot_key]
+        if state.get("kind") not in ("stft", "waterfall"):
+            return
+        self._sync_spectrogram_controls()
+        self._refresh_plot_views_for_key(
+            self._active_plot_key,
+            preserve_active_limits=True,
+            preserve_active_annotations=True,
+        )
+
+    def _on_color_mode_changed(self, *_):
+        if self.cmb_color_mode.currentText() == "Custom Bands":
+            self.chk_manual_clim.blockSignals(True)
+            self.chk_manual_clim.setChecked(False)
+            self.chk_manual_clim.blockSignals(False)
+        self._sync_spectrogram_controls()
+        self._on_color_controls_changed()
+
+    def _edit_custom_bands(self):
+        dlg = BandEditorDialog(self.custom_color_bands, self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        try:
+            self.custom_color_bands = dlg.bands()
+        except Exception as e:
+            self._err(str(e))
+            return
+        self._on_color_controls_changed()
 
     def _load_axis_editors_from_state(self, state=None):
         st = state or (self._plot_states.get(self._active_plot_key) if self._active_plot_key else None)
@@ -3383,14 +4150,20 @@ class MainWindow(QMainWindow):
     def _sync_spectrogram_controls(self):
         state = self._plot_states.get(self._active_plot_key) if self._active_plot_key else None
         is_color_plot = bool(state and state.get("kind") in ("stft", "waterfall"))
+        is_db = bool(is_color_plot and str(state.get("scale", "")).strip().lower() == "db")
+        custom_mode = self.cmb_color_mode.currentText().strip() == "Custom Bands"
+        manual = self.chk_manual_clim.isChecked() and not custom_mode
 
         self.cmb_spec_render.setEnabled(is_color_plot)
-        self.cmb_spec_cmap.setEnabled(is_color_plot)
-        self.chk_spec_cmap_reverse.setEnabled(is_color_plot)
-        self.spec_levels_spin.setEnabled(False)
-        self.chk_manual_clim.setEnabled(is_color_plot)
-        self.spec_vmin_spin.setEnabled(is_color_plot and self.chk_manual_clim.isChecked())
-        self.spec_vmax_spin.setEnabled(is_color_plot and self.chk_manual_clim.isChecked())
+        self.cmb_spec_cmap.setEnabled(is_color_plot and not custom_mode)
+        self.chk_spec_cmap_reverse.setEnabled(is_color_plot and not custom_mode)
+        self.cmb_color_mode.setEnabled(is_color_plot)
+        self.btn_edit_bands.setEnabled(is_color_plot and custom_mode)
+        self.lbl_dyn_range.setEnabled(is_color_plot and is_db and (not manual) and (not custom_mode))
+        self.spec_levels_spin.setEnabled(is_color_plot and is_db and (not manual) and (not custom_mode))
+        self.chk_manual_clim.setEnabled(is_color_plot and not custom_mode)
+        self.spec_vmin_spin.setEnabled(is_color_plot and manual)
+        self.spec_vmax_spin.setEnabled(is_color_plot and manual)
         self.btn_apply_plot_view.setEnabled(state is not None)
         self.btn_export_plot.setEnabled(state is not None)
 
@@ -3400,17 +4173,18 @@ class MainWindow(QMainWindow):
 
     def _on_manual_clim_toggle(self, *_):
         self._sync_spectrogram_controls()
+        self._on_color_controls_changed()
 
     def _on_mode_change(self):
-        is_fourier = self._is_fourier_mode() or self._is_waterfall_mode()
+        has_fft_settings = self._is_fourier_mode() or self._is_waterfall_mode() or self.cmb_mode.currentText().startswith("Time Domain")
 
         self.cmb_fourier_method.setEnabled(not self._is_waterfall_mode() and self._is_fourier_mode())
-        self.cmb_nfft.setEnabled(is_fourier)
-        self.ovl_spin.setEnabled(is_fourier)
-        self.cmb_out.setEnabled(is_fourier)
-        self.cmb_scale.setEnabled(is_fourier)
-        self.cmb_amp_conv.setEnabled(is_fourier)
-        self.lbl_fft_info.setEnabled(is_fourier)
+        self.cmb_nfft.setEnabled(has_fft_settings)
+        self.ovl_spin.setEnabled(has_fft_settings)
+        self.cmb_out.setEnabled(has_fft_settings)
+        self.cmb_scale.setEnabled(has_fft_settings)
+        self.cmb_amp_conv.setEnabled(has_fft_settings)
+        self.lbl_fft_info.setEnabled(has_fft_settings)
 
         self._sync_data_source_items()
         self._sync_filter_enabled_state()
@@ -3440,8 +4214,9 @@ class MainWindow(QMainWindow):
                 else f"Data source: {self.cmb_data_source.currentText()}"
             )
 
+            zoom_note = "   |   Visible time window -> Averaged Spectrum" if self.cmb_mode.currentText().startswith("Time Domain") else ""
             self.lbl_fft_info.setText(
-                f"Signal: {self._signal_name()}   |   {base_info}   |   Δf: {df:.6g} Hz   |   Window: {win_t:.6g} s   |   Hop: {hop} samples ({hop_t:.6g} s)   |   Amplitude convention: {unit_lbl}"
+                f"Signal: {self._signal_name()}   |   {base_info}   |   Δf: {df:.6g} Hz   |   Window: {win_t:.6g} s   |   Hop: {hop} samples ({hop_t:.6g} s)   |   Amplitude convention: {unit_lbl}{zoom_note}"
             )
         except Exception:
             self.lbl_fft_info.setText("Frequency resolution: -")
@@ -3555,6 +4330,7 @@ class MainWindow(QMainWindow):
         detail = DetailPlotWidget(state)
         detail.activated.connect(self._set_active_canvas)
 
+        self._connect_canvas_color_signals(detail.canvas)
         self._draw_state_on_canvas(detail.canvas, state, preserve_limits=False)
 
         self._detail_widgets[key] = detail
@@ -3571,6 +4347,7 @@ class MainWindow(QMainWindow):
             st = states[0]
             detail = WaterfallDetailWidget(st)
             detail.activated.connect(self._set_active_canvas)
+            self._connect_canvas_color_signals(detail.canvas)
             self._draw_state_on_canvas(detail.canvas, st, preserve_limits=False)
 
             self._detail_widgets[st["key"]] = detail
@@ -3598,6 +4375,7 @@ class MainWindow(QMainWindow):
             w.request_close.connect(self._close_plot_by_key)
             w.activated.connect(self._set_active_canvas)
 
+            self._connect_canvas_color_signals(w.canvas)
             self._draw_state_on_canvas(w.canvas, st, preserve_limits=False)
             if st.get("stats_text"):
                 all_stats.append(st["stats_text"])
@@ -3728,15 +4506,18 @@ class MainWindow(QMainWindow):
                 S = np.asarray(state["S"])
                 color_cfg = self._plot_color_cfg()
 
-                finite = S[np.isfinite(S)]
-                auto_vmin = float(np.min(finite)) if finite.size else 0.0
-                auto_vmax = float(np.max(finite)) if finite.size else 1.0
-                vmin = float(color_cfg["vmin"]) if color_cfg["manual_clim"] else auto_vmin
-                vmax = float(color_cfg["vmax"]) if color_cfg["manual_clim"] else auto_vmax
-                cmap = f"{color_cfg['cmap']}_r" if color_cfg["reverse"] else color_cfg["cmap"]
+                style = resolve_mpl_image_style(S, state.get("scale", "Linear"), color_cfg)
 
-                mesh = ax0.pcolormesh(freqs, rpms, S, shading="auto", cmap=cmap, vmin=vmin, vmax=vmax)
+                if style["mode"] == "bands":
+                    mesh = ax0.pcolormesh(freqs, rpms, S, shading="auto", cmap=style["cmap"], norm=style["norm"])
+                else:
+                    mesh = ax0.pcolormesh(
+                        freqs, rpms, S, shading="auto",
+                        cmap=style["cmap"], vmin=style["vmin"], vmax=style["vmax"]
+                    )
                 cbar = fig.colorbar(mesh, ax=ax0)
+                if style["mode"] == "bands":
+                    cbar.set_ticks(style["boundaries"])
                 cbar.set_label(state.get("colorbar_label", ""))
                 ax0.set_xlabel(xlabel)
                 ax0.set_ylabel(ylabel)
@@ -3828,35 +4609,98 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "Export", f"Plot exported successfully:\n{path}")
                 return
 
-            fig = Figure(figsize=(12, 6), dpi=150, constrained_layout=True)
-            ax = fig.add_subplot(111)
+            zoom_fft_data = None
+            if state["kind"] == "time" and self._active_canvas is not None and hasattr(self._active_canvas, "get_zoom_fft_export_data"):
+                try:
+                    zoom_fft_data = self._active_canvas.get_zoom_fft_export_data()
+                except Exception:
+                    zoom_fft_data = None
 
-            if state["kind"] in ("time", "avg"):
+            if state["kind"] == "time" and zoom_fft_data:
+                fig = Figure(figsize=(12, 9), dpi=150, constrained_layout=True)
+                gs = fig.add_gridspec(2, 1, height_ratios=[3.0, 1.7])
+                ax = fig.add_subplot(gs[0, 0])
+                ax_fft = fig.add_subplot(gs[1, 0])
+
                 for series in state["series"]:
                     ax.plot(np.asarray(series["x"]), np.asarray(series["y"]), linewidth=0.9, label=series["label"])
                 ax.set_xlabel(xlabel)
                 ax.set_ylabel(ylabel)
                 ax.grid(True)
                 ax.margins(x=0)
+
+                if zoom_fft_data.get("window") is not None:
+                    x0, x1 = zoom_fft_data["window"]
+                    ax.axvspan(x0, x1, alpha=0.12)
+
+                fft_x = np.asarray(zoom_fft_data.get("freqs", []), dtype=np.float64)
+                fft_y = np.asarray(zoom_fft_data.get("spec", []), dtype=np.float64)
+                ax_fft.plot(fft_x, fft_y, linewidth=1.0)
+                ax_fft.set_xlabel(zoom_fft_data.get("xlabel", "Frequency (Hz)"))
+                ax_fft.set_ylabel(zoom_fft_data.get("ylabel", "Amplitude"))
+                ax_fft.set_title(zoom_fft_data.get("title", "Visible time window FFT"))
+                ax_fft.grid(True)
+                ax_fft.margins(x=0)
+
+                for i, ann in enumerate(lower_annotations):
+                    try:
+                        if "x" in ann and "y" in ann:
+                            dx, dy = _mpl_offset_points(i)
+                            ax_fft.plot(
+                                ann["x"], ann["y"],
+                                linestyle="None",
+                                marker="o",
+                                markersize=5,
+                                markerfacecolor="white",
+                                markeredgecolor="red",
+                                markeredgewidth=0.8,
+                                zorder=6,
+                            )
+                            ax_fft.annotate(
+                                ann.get("text", ""),
+                                xy=(ann["x"], ann["y"]),
+                                xytext=(dx, dy),
+                                textcoords="offset points",
+                                fontsize=8,
+                                bbox=dict(facecolor="white", edgecolor="#666", alpha=0.9, boxstyle="round,pad=0.2"),
+                                zorder=7,
+                            )
+                    except Exception:
+                        pass
             else:
-                times = np.asarray(state["times"])
-                freqs = np.asarray(state["freqs"])
-                S = np.asarray(state["S"])
-                color_cfg = self._plot_color_cfg()
+                fig = Figure(figsize=(12, 6), dpi=150, constrained_layout=True)
+                ax = fig.add_subplot(111)
+                ax_fft = None
 
-                finite = S[np.isfinite(S)]
-                auto_vmin = float(np.min(finite)) if finite.size else 0.0
-                auto_vmax = float(np.max(finite)) if finite.size else 1.0
-                vmin = float(color_cfg["vmin"]) if color_cfg["manual_clim"] else auto_vmin
-                vmax = float(color_cfg["vmax"]) if color_cfg["manual_clim"] else auto_vmax
-                cmap = f"{color_cfg['cmap']}_r" if color_cfg["reverse"] else color_cfg['cmap']
+                if state["kind"] in ("time", "avg"):
+                    for series in state["series"]:
+                        ax.plot(np.asarray(series["x"]), np.asarray(series["y"]), linewidth=0.9, label=series["label"])
+                    ax.set_xlabel(xlabel)
+                    ax.set_ylabel(ylabel)
+                    ax.grid(True)
+                    ax.margins(x=0)
+                else:
+                    times = np.asarray(state["times"])
+                    freqs = np.asarray(state["freqs"])
+                    S = np.asarray(state["S"])
+                    color_cfg = self._plot_color_cfg()
 
-                mesh = ax.pcolormesh(times, freqs, S, shading="auto", cmap=cmap, vmin=vmin, vmax=vmax)
-                cbar = fig.colorbar(mesh, ax=ax)
-                cbar.set_label(state.get("colorbar_label", ""))
-                ax.set_xlabel(xlabel)
-                ax.set_ylabel(ylabel)
-                ax.grid(False)
+                    style = resolve_mpl_image_style(S, state.get("scale", "Linear"), color_cfg)
+
+                    if style["mode"] == "bands":
+                        mesh = ax.pcolormesh(times, freqs, S, shading="auto", cmap=style["cmap"], norm=style["norm"])
+                    else:
+                        mesh = ax.pcolormesh(
+                            times, freqs, S, shading="auto",
+                            cmap=style["cmap"], vmin=style["vmin"], vmax=style["vmax"]
+                        )
+                    cbar = fig.colorbar(mesh, ax=ax)
+                    if style["mode"] == "bands":
+                        cbar.set_ticks(style["boundaries"])
+                    cbar.set_label(state.get("colorbar_label", ""))
+                    ax.set_xlabel(xlabel)
+                    ax.set_ylabel(ylabel)
+                    ax.grid(False)
 
             for i, ann in enumerate(annotations):
                 try:
@@ -4416,7 +5260,8 @@ def main():
         sys.exit(1)
 
     w = MainWindow()
-    w.showMaximized()
+    w.resize(1600, 900)
+    w.show()
     sys.exit(app.exec_())
 
 

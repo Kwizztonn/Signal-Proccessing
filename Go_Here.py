@@ -97,6 +97,62 @@ def build_spectrum_ylabel(output_type: str, scale: str, unit_lbl: str) -> str:
     return f"{out} ({unit_lbl})"
 
 
+
+
+def compute_one_sided_amp_spectrum_from_segment(
+    segment: np.ndarray,
+    fs: float,
+    nfft: int,
+    amp_conv: str,
+    signal_kind: str,
+    output_type: str,
+):
+    """
+    One valid segment -> one-sided amplitude/power spectrum.
+
+    Critical rule:
+    window length = actual segment length
+    FFT length    = nfft
+
+    Therefore, short signals are windowed first and zero-padded only inside
+    np.fft.rfft(..., n=nfft). This prevents amplitude loss for y.size < nfft.
+    """
+    segment = np.nan_to_num(np.asarray(segment, dtype=np.float64),
+                            nan=0.0, posinf=0.0, neginf=0.0)
+    fs = float(fs)
+    nfft = max(2, int(nfft))
+
+    freqs = np.fft.rfftfreq(nfft, d=1.0 / fs)
+
+    if segment.size == 0 or not np.isfinite(fs) or fs <= 0.0:
+        return freqs, np.zeros(freqs.size, dtype=np.float64)
+
+    nseg = int(segment.size)
+
+    if nseg <= 1:
+        w = np.ones(nseg, dtype=np.float64)
+    else:
+        w = np.hanning(nseg).astype(np.float64)
+
+    w_sum = float(np.sum(w))
+    if not np.isfinite(w_sum) or w_sum <= 0.0:
+        w_sum = float(nseg)
+
+    X = np.fft.rfft(segment * w, n=nfft)
+    mag = np.abs(X)
+
+    A_peak = (2.0 * mag) / w_sum
+    A_peak[0] *= 0.5
+    if (nfft % 2 == 0) and (A_peak.size > 1):
+        A_peak[-1] *= 0.5
+
+    conv, _ = get_amp_conv_factor_label(amp_conv, signal_kind)
+    A = A_peak * conv
+
+    out_type = str(output_type).strip()
+    spec = A if out_type == "Amplitude" else (A * A)
+    return freqs, spec
+
 def compute_avg_spectrum_from_signal(
     y: np.ndarray,
     fs: float,
@@ -107,6 +163,12 @@ def compute_avg_spectrum_from_signal(
     amp_conv: str,
     signal_kind: str,
 ):
+    """
+    nCode-like averaged FFT:
+    - nperseg/window length = min(nfft, signal length)
+    - FFT length remains nfft
+    - window first, then zero-pad through rfft(..., n=nfft)
+    """
     y = np.nan_to_num(np.asarray(y, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
     fs = float(fs)
     nfft = max(2, int(nfft))
@@ -114,47 +176,54 @@ def compute_avg_spectrum_from_signal(
     if y.size == 0 or not np.isfinite(fs) or fs <= 0.0:
         return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
 
+    nperseg = min(nfft, int(y.size))
+    if nperseg <= 0:
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+
     ovl = np.clip(float(overlap_pct) / 100.0, 0.0, 0.95)
-    hop = max(1, int(round(nfft * (1.0 - ovl))))
+    hop = max(1, int(round(nperseg * (1.0 - ovl))))
 
-    w = np.hanning(nfft).astype(np.float64)
-    w_sum = float(np.sum(w))
-    if w_sum <= 0.0:
-        w_sum = float(nfft)
-
-    if y.size < nfft:
+    if y.size <= nperseg:
         n_frames = 1
     else:
-        n_frames = max(1, 1 + (y.size - nfft) // hop)
+        n_frames = max(1, 1 + (y.size - nperseg) // hop)
 
     freqs = np.fft.rfftfreq(nfft, d=1.0 / fs)
     spec_acc = np.zeros(freqs.size, dtype=np.float64)
-    conv, _ = get_amp_conv_factor_label(amp_conv, signal_kind)
-    out_type = str(output_type).strip()
+    valid_frames = 0
 
     for i in range(n_frames):
         start = i * hop
-        frame = np.zeros(nfft, dtype=np.float64)
-        take = max(0, min(nfft, y.size - start))
-        if take > 0:
-            frame[:take] = y[start:start + take]
+        stop = start + nperseg
 
-        X = np.fft.rfft(frame * w, n=nfft)
-        mag = np.abs(X)
-        A_peak = (2.0 * mag) / w_sum
-        A_peak[0] *= 0.5
-        if (nfft % 2 == 0) and (A_peak.size > 1):
-            A_peak[-1] *= 0.5
+        if stop > y.size:
+            break
 
-        A = A_peak * conv
-        P = A if out_type == "Amplitude" else (A * A)
-        spec_acc += P
+        segment = y[start:stop]
 
-    spec = spec_acc / max(n_frames, 1)
+        _, spec_i = compute_one_sided_amp_spectrum_from_segment(
+            segment=segment,
+            fs=fs,
+            nfft=nfft,
+            amp_conv=amp_conv,
+            signal_kind=signal_kind,
+            output_type=output_type,
+        )
+
+        spec_acc += spec_i
+        valid_frames += 1
+
+    if valid_frames <= 0:
+        return freqs, np.zeros(freqs.size, dtype=np.float64)
+
+    spec = spec_acc / float(valid_frames)
 
     if str(scale).strip().lower() == "db":
         eps = 1e-20
-        spec = 20.0 * np.log10(spec + eps) if out_type == "Amplitude" else 10.0 * np.log10(spec + eps)
+        if str(output_type).strip() == "Amplitude":
+            spec = 20.0 * np.log10(spec + eps)
+        else:
+            spec = 10.0 * np.log10(spec + eps)
 
     return freqs, spec
 
@@ -1931,7 +2000,10 @@ class WaterfallPlotWidget(QWidget):
 
         self._visible_reinterp_timer = QTimer(self)
         self._visible_reinterp_timer.setSingleShot(True)
-        self._visible_reinterp_timer.setInterval(90)
+        # Rebuild the visible waterfall shortly after a zoom/pan.
+        # A short delay keeps dragging responsive but avoids leaving the zoomed
+        # image in a magnified low-resolution state for too long.
+        self._visible_reinterp_timer.setInterval(35)
         self._visible_reinterp_timer.timeout.connect(self._rebuild_visible_waterfall)
 
         topbar = QHBoxLayout()
@@ -2072,6 +2144,13 @@ class WaterfallPlotWidget(QWidget):
         y1 = float(rpms[-1] + 0.5 * dy)
 
         self._upper_image_item.setImage(S, autoLevels=False)
+        # The waterfall is already resampled to the current viewport resolution
+        # in _render_waterfall_view_from_frames(). Extra GPU interpolation here
+        # makes rectangle-zoomed ridges look soft/blurred.
+        try:
+            self._upper_image_item.setOpts(interpolate=False)
+        except Exception:
+            pass
         self._upper_image_item.setRect(QRectF(x0, y0, x1 - x0, y1 - y0))
 
         self._display_S = np.asarray(S, dtype=np.float64)
@@ -2111,10 +2190,12 @@ class WaterfallPlotWidget(QWidget):
         full_r_lo = float(rpms_u[0])
         full_r_hi = float(rpms_u[-1])
 
-        view_f_lo = float(np.clip(min(view_f_lo, view_f_hi), full_f_lo, full_f_hi))
-        view_f_hi = float(np.clip(max(view_f_lo, view_f_hi), full_f_lo, full_f_hi))
-        view_r_lo = float(np.clip(min(view_r_lo, view_r_hi), full_r_lo, full_r_hi))
-        view_r_hi = float(np.clip(max(view_r_lo, view_r_hi), full_r_lo, full_r_hi))
+        vf0, vf1 = sorted((float(view_f_lo), float(view_f_hi)))
+        vr0, vr1 = sorted((float(view_r_lo), float(view_r_hi)))
+        view_f_lo = float(np.clip(vf0, full_f_lo, full_f_hi))
+        view_f_hi = float(np.clip(vf1, full_f_lo, full_f_hi))
+        view_r_lo = float(np.clip(vr0, full_r_lo, full_r_hi))
+        view_r_hi = float(np.clip(vr1, full_r_lo, full_r_hi))
 
         if view_f_hi <= view_f_lo or view_r_hi <= view_r_lo:
             return self.freqs_full_display, self.rpms_full_display, self.S_full_display
@@ -3044,6 +3125,7 @@ class WaterfallPlotWidget(QWidget):
         self.clear_cursors()
 
         if self.freqs.size == 0 or self.rpms.size == 0 or self.S.size == 0:
+            self._suspend_viewport_reinterp = False
             return
 
         if self.freqs.size > 1:
@@ -3064,8 +3146,11 @@ class WaterfallPlotWidget(QWidget):
 
         img = pg.ImageItem(axisOrder="row-major")
         img.setImage(self.S, autoLevels=False)
+        # For waterfall, disable ImageItem-level interpolation. The code below
+        # rebuilds/resamples the visible viewport itself after zooming, so
+        # enabling ImageItem interpolation causes an additional smoothing pass.
         try:
-            img.setOpts(interpolate=True)
+            img.setOpts(interpolate=False)
         except Exception:
             pass
         img.setRect(QRectF(x0, y0, x1 - x0, y1 - y0))
@@ -3139,6 +3224,15 @@ class WaterfallPlotWidget(QWidget):
 
         self._update_upper_annotation_buttons()
         self._update_lower_annotation_buttons()
+
+        # IMPORTANT: set_state intentionally suspends viewport rebuilding while
+        # the plot is being constructed and the initial ranges are assigned.
+        # It must be re-enabled here; otherwise rectangle zoom only magnifies
+        # the full-range ImageItem and the waterfall appears blurred.
+        self._suspend_viewport_reinterp = False
+        self._last_viewport_signature = None
+        if not self.mini:
+            self._visible_reinterp_timer.start()
 
 
 class TimeDomainZoomFFTWidget(QWidget):
@@ -3736,46 +3830,74 @@ class PlotWorker(QObject):
 
     def _compute_stft(self, y: np.ndarray, fs: float, nfft: int, overlap_pct: float,
                       output_type: str, scale: str, signal_kind: str):
-        ovl = np.clip(overlap_pct / 100.0, 0.0, 0.95)
-        hop = max(1, int(round(nfft * (1.0 - ovl))))
+        """
+        STFT/spectrogram using corrected nCode-like windowing:
+        window length = actual segment length, FFT length = nfft.
+        """
+        y = np.nan_to_num(np.asarray(y, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+        fs = float(fs)
+        nfft = max(2, int(nfft))
 
-        w = np.hanning(nfft).astype(np.float64)
-        w_sum = np.sum(w)
+        if y.size == 0 or not np.isfinite(fs) or fs <= 0.0:
+            return (
+                np.array([], dtype=np.float64),
+                np.array([], dtype=np.float64),
+                np.empty((0, 0), dtype=np.float64),
+            )
 
-        n_frames = 1 if y.size < nfft else max(1, 1 + (y.size - nfft) // hop)
+        nperseg = min(nfft, int(y.size))
+        ovl = np.clip(float(overlap_pct) / 100.0, 0.0, 0.95)
+        hop = max(1, int(round(nperseg * (1.0 - ovl))))
+
+        if y.size <= nperseg:
+            n_frames = 1
+        else:
+            n_frames = max(1, 1 + (y.size - nperseg) // hop)
+
         freqs = np.fft.rfftfreq(nfft, d=1.0 / fs)
         S = np.zeros((freqs.size, n_frames), dtype=np.float64)
         times = np.zeros((n_frames,), dtype=np.float64)
 
-        conv, _ = self._amp_conv_factor_label(signal_kind)
+        valid_frames = 0
 
         for i in range(n_frames):
             start = i * hop
-            times[i] = start / fs
+            stop = start + nperseg
 
-            if start + nfft <= y.size:
-                frame = y[start:start + nfft]
-            else:
-                frame = np.zeros(nfft, dtype=np.float64)
-                take = max(0, y.size - start)
-                if take > 0:
-                    frame[:take] = y[start:start + take]
+            if stop > y.size:
+                break
 
-            X = np.fft.rfft(frame * w, n=nfft)
-            mag = np.abs(X)
-            A_peak = (2.0 * mag) / w_sum
-            A_peak[0] *= 0.5
-            if (nfft % 2 == 0) and (A_peak.size > 1):
-                A_peak[-1] *= 0.5
-            A = A_peak * conv
-            P = A if output_type == "Amplitude" else (A * A)
-            S[:, i] = P
+            segment = y[start:stop]
+            times[valid_frames] = start / fs
 
-        if scale == "dB":
+            _, spec_i = compute_one_sided_amp_spectrum_from_segment(
+                segment=segment,
+                fs=fs,
+                nfft=nfft,
+                amp_conv=self.cfg["amp_conv"],
+                signal_kind=signal_kind,
+                output_type=output_type,
+            )
+
+            S[:, valid_frames] = spec_i
+            valid_frames += 1
+
+        if valid_frames <= 0:
+            return freqs, np.array([], dtype=np.float64), np.empty((freqs.size, 0), dtype=np.float64)
+
+        S = S[:, :valid_frames]
+        times = times[:valid_frames]
+
+        if str(scale).strip().lower() == "db":
             eps = 1e-20
-            S = (20.0 * np.log10(S + eps)) if output_type == "Amplitude" else (10.0 * np.log10(S + eps))
+            if output_type == "Amplitude":
+                S = 20.0 * np.log10(S + eps)
+            else:
+                S = 10.0 * np.log10(S + eps)
 
         return freqs, times, S
+
+
 
 
 
@@ -3883,52 +4005,65 @@ class PlotWorker(QObject):
                                output_type: str, scale: str,
                                num_spectra: int = 100, num_buffers: int = 1,
                                rpm_label_method: str = "Window-weighted (Hanning)"):
-        ovl = np.clip(overlap_pct / 100.0, 0.0, 0.95)
-        hop = max(1, int(round(nfft * (1.0 - ovl))))
+        """
+        Waterfall FFT map using corrected nCode-like windowing:
+        window length = min(nfft, available common signal length),
+        FFT length = nfft.
+        """
+        acc = np.nan_to_num(np.asarray(acc, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+        rpm = np.nan_to_num(np.asarray(rpm, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+        fs = float(fs)
+        nfft = max(2, int(nfft))
 
-        w = np.hanning(nfft).astype(np.float64)
-        w_sum = float(np.sum(w))
-        if w_sum <= 0.0:
-            w_sum = float(nfft)
+        n_common = min(int(acc.size), int(rpm.size))
+        if n_common <= 0 or not np.isfinite(fs) or fs <= 0.0:
+            raise RuntimeError("Acceleration or RPM signal is empty.")
 
-        if acc.size < nfft:
+        acc = acc[:n_common]
+        rpm = rpm[:n_common]
+
+        ovl = np.clip(float(overlap_pct) / 100.0, 0.0, 0.95)
+        nperseg = min(nfft, n_common)
+        hop = max(1, int(round(nperseg * (1.0 - ovl))))
+
+        if n_common <= nperseg:
             n_frames = 1
         else:
-            n_frames = max(1, 1 + (acc.size - nfft) // hop)
+            n_frames = max(1, 1 + (n_common - nperseg) // hop)
 
         freqs = np.fft.rfftfreq(nfft, d=1.0 / fs)
-        conv, _ = self._amp_conv_factor_label("acc")
 
         spectra_list = []
         frame_rpm_list = []
 
         for i in range(n_frames):
             start = i * hop
+            stop = start + nperseg
 
-            if start + nfft <= acc.size:
-                a = acc[start:start + nfft]
-                r = rpm[start:start + nfft]
+            if stop > n_common:
+                break
+
+            a = acc[start:stop]
+            r = rpm[start:stop]
+
+            if nperseg <= 1:
+                w_local = np.ones(nperseg, dtype=np.float64)
             else:
-                a = np.zeros(nfft, dtype=np.float64)
-                r = np.zeros(nfft, dtype=np.float64)
-                take = max(0, acc.size - start)
-                if take > 0:
-                    a[:take] = acc[start:start + take]
-                    r[:take] = rpm[start:start + take]
+                w_local = np.hanning(nperseg).astype(np.float64)
 
-            rpm_value = self._compute_frame_rpm_label(r, w, rpm_label_method)
+            rpm_value = self._compute_frame_rpm_label(r, w_local, rpm_label_method)
             if not np.isfinite(rpm_value):
                 continue
 
-            X = np.fft.rfft(a * w, n=nfft)
-            mag = np.abs(X)
-            A_peak = (2.0 * mag) / w_sum
-            A_peak[0] *= 0.5
-            if (nfft % 2 == 0) and (A_peak.size > 1):
-                A_peak[-1] *= 0.5
+            _, P = compute_one_sided_amp_spectrum_from_segment(
+                segment=a,
+                fs=fs,
+                nfft=nfft,
+                amp_conv=self.cfg["amp_conv"],
+                signal_kind="acc",
+                output_type=output_type,
+            )
 
-            A = A_peak * conv
-            P = A if output_type == "Amplitude" else (A * A)
             spectra_list.append(P)
             frame_rpm_list.append(rpm_value)
 
@@ -3941,6 +4076,7 @@ class PlotWorker(QObject):
         m = np.isfinite(frame_rpms)
         spectra = spectra[m]
         frame_rpms = frame_rpms[m]
+
         if frame_rpms.size < 2:
             raise RuntimeError("Not enough valid RPM frames for waterfall plotting.")
 

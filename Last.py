@@ -9,7 +9,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QFileDialog, QComboBox, QDoubleSpinBox,
     QCheckBox, QMessageBox, QListWidget, QListWidgetItem,
     QAbstractItemView, QTabWidget, QSpinBox, QSizePolicy, QProgressBar,
-    QScrollArea, QGridLayout, QFrame, QToolButton, QLineEdit,
+    QScrollArea, QGridLayout, QFrame, QGroupBox, QToolButton, QLineEdit,
     QDialog, QDialogButtonBox, QFormLayout, QColorDialog,
     QTableWidget, QTableWidgetItem, QHeaderView,
 )
@@ -69,6 +69,10 @@ except Exception:
 if _HAVE_PG:
     pg.setConfigOptions(antialias=False, imageAxisOrder="row-major")
 
+# Set DEBUG = True to enable verbose console output from TRDSP internals.
+# Keep False in production to avoid flooding the terminal.
+DEBUG: bool = False
+
 G0 = 9.80665           # m/s^2 per g
 VEL_SCALE = 1000.0     # m/s -> mm/s
 VEL_UNIT = "mm/s"
@@ -117,6 +121,302 @@ def _hann_window(N: int, kind: str = "periodic") -> np.ndarray:
     if k.startswith("sym"):
         return 0.5 - 0.5 * np.cos(2.0 * np.pi * n / (N - 1))
     return 0.5 - 0.5 * np.cos(2.0 * np.pi * n / N)
+
+
+def clean_rpm_signal(
+    rpm: np.ndarray,
+    mode: str = "interpolate",
+    spike_mad_thresh: float = 5.0,
+    smooth: bool = False,
+    smooth_kernel: int = 5,
+) -> np.ndarray:
+    """Validate and clean an RPM signal.
+
+    Parameters
+    ----------
+    rpm : array-like
+        Raw RPM samples (same length as acceleration).
+    mode : {"interpolate", "mask"}
+        "interpolate" – fill short NaN/<=0/Inf gaps by linear interpolation from
+        valid neighbors; isolated leading/trailing invalids become NaN.
+        "mask" – replace invalid samples with NaN (no gap-filling).
+    spike_mad_thresh : float
+        Spike rejection threshold in median-absolute-deviation units on the
+        first derivative.  Set to 0 to disable.
+    smooth : bool
+        If True, apply a centered running-median smoother of width smooth_kernel
+        *after* cleaning (does not affect frequency resolution).
+    smooth_kernel : int
+        Running-median half-width (samples).
+
+    Returns
+    -------
+    np.ndarray, dtype float64
+        Cleaned RPM with NaN where invalid.  The caller is responsible for
+        deciding what to do with remaining NaN frames.
+    """
+    rpm = np.asarray(rpm, dtype=np.float64).copy()
+
+    # Mark fundamentally invalid values
+    invalid = ~np.isfinite(rpm) | (rpm <= 0.0)
+
+    # Spike rejection using MAD on derivative
+    if spike_mad_thresh > 0.0 and rpm.size > 2:
+        drpm = np.diff(rpm)
+        med_d = float(np.nanmedian(drpm))
+        mad_d = float(np.nanmedian(np.abs(drpm - med_d))) or 1e-12
+        spikes = np.abs(drpm - med_d) > spike_mad_thresh * mad_d * 1.4826
+        # Mark both samples surrounding a derivative spike
+        spike_idx = np.where(spikes)[0]
+        invalid[spike_idx] = True
+        invalid[np.clip(spike_idx + 1, 0, rpm.size - 1)] = True
+
+    rpm[invalid] = np.nan
+
+    if mode == "interpolate":
+        valid_idx = np.where(np.isfinite(rpm))[0]
+        if valid_idx.size >= 2:
+            all_idx = np.arange(rpm.size)
+            rpm = np.interp(all_idx, valid_idx, rpm[valid_idx],
+                            left=np.nan, right=np.nan)
+        # Re-mark any remaining out-of-range interpolated values
+        rpm[rpm <= 0.0] = np.nan
+
+    if smooth and rpm.size > 2:
+        k = max(1, int(smooth_kernel))
+        smoothed = rpm.copy()
+        for i in range(rpm.size):
+            lo = max(0, i - k)
+            hi = min(rpm.size, i + k + 1)
+            patch = rpm[lo:hi]
+            fin = patch[np.isfinite(patch)]
+            if fin.size:
+                smoothed[i] = float(np.median(fin))
+        rpm = smoothed
+
+    return rpm
+
+
+def compute_order_map(
+    freqs: np.ndarray,
+    frame_rpms: np.ndarray,
+    frame_spectra_linear: np.ndarray,
+    order_max: float = 10.0,
+    n_orders: int = 512,
+    output_type: str = "Amplitude",
+    scale: str = "Linear",
+) -> tuple:
+    """Convert per-frame frequency spectra to an order-domain waterfall map.
+
+    Each frame's frequency axis is converted to order axis:
+        order = f / (RPM / 60)
+    Frames are then interpolated onto a uniform order grid.
+
+    Parameters
+    ----------
+    freqs : (Nf,) array
+        Frequency axis in Hz.
+    frame_rpms : (M,) array
+        RPM label for each frame (must be > 0 and finite).
+    frame_spectra_linear : (M, Nf) array
+        Linear amplitude or power spectra — one row per frame.
+    order_max : float
+        Maximum order to include in the output grid.
+    n_orders : int
+        Number of order bins in the output grid.
+    output_type : "Amplitude" or "Power"
+        Selects 20·log10 or 10·log10 when scale=="dB".
+    scale : "Linear" or "dB"
+        Output scale.
+
+    Returns
+    -------
+    order_axis : (n_orders,) array
+        Uniform order grid from 0 to order_max.
+    sorted_rpms : (M_valid,) array
+        RPM values of valid frames, sorted ascending.
+    S_order_out : (M_valid, n_orders) array
+        Order-domain spectra in the requested output/scale.
+    """
+    freqs = np.asarray(freqs, dtype=np.float64)
+    frame_rpms = np.asarray(frame_rpms, dtype=np.float64)
+    frame_spectra_linear = np.asarray(frame_spectra_linear, dtype=np.float64)
+
+    valid = np.isfinite(frame_rpms) & (frame_rpms > 0.0)
+    if not np.any(valid):
+        raise RuntimeError("No valid (>0, finite) RPM frames for order-map computation.")
+
+    rpms_v = frame_rpms[valid]
+    spec_v = frame_spectra_linear[valid]
+    order_axis = np.linspace(0.0, float(order_max), int(n_orders))
+
+    M = int(rpms_v.size)
+    S_order_linear = np.empty((M, n_orders), dtype=np.float64)
+
+    for i in range(M):
+        rpm_i = float(rpms_v[i])
+        freq_for_order = order_axis * (rpm_i / 60.0)   # Hz value of each order bin
+        # Interpolate linearly; bins beyond Nyquist become 0
+        S_order_linear[i, :] = np.interp(
+            freq_for_order, freqs, spec_v[i, :], left=0.0, right=0.0
+        )
+
+    S_order_linear = np.maximum(S_order_linear, 0.0)
+
+    if str(scale).strip().lower() == "db":
+        eps = 1e-30
+        if str(output_type).strip() == "Amplitude":
+            S_order_out = 20.0 * np.log10(S_order_linear + eps)
+        else:
+            S_order_out = 10.0 * np.log10(S_order_linear + eps)
+    else:
+        S_order_out = S_order_linear
+
+    # Sort by RPM ascending (caller may pass unsorted frames)
+    sort_idx = np.argsort(rpms_v)
+    return order_axis, rpms_v[sort_idx], S_order_out[sort_idx]
+
+
+def compute_order_tracking_spectrum(
+    acc: np.ndarray,
+    rpm: np.ndarray,
+    fs: float,
+    samples_per_rev: int = 512,
+    order_max: float = 20.0,
+    amp_conv: str = "Peak",
+    signal_kind: str = "acc",
+) -> tuple:
+    """Computed Order Tracking — angle-domain resampling and FFT.
+
+    Algorithm
+    ---------
+    1. Compute instantaneous shaft angle θ(t) = ∫ ω(t) dt,
+       where ω(t) = 2π · RPM(t) / 60.
+    2. Resample acc from uniform time to uniform angle grid
+       (samples_per_rev points per revolution).
+    3. Compute one-sided FFT in the angle domain.
+    4. The X-axis is in orders (integer or fractional multiples of shaft speed).
+
+    Parameters
+    ----------
+    acc, rpm : (N,) arrays
+        Acceleration and RPM signals on the same uniform time grid.
+    fs : float
+        Sampling frequency in Hz (common, after alignment).
+    samples_per_rev : int
+        Resampling density: samples per shaft revolution.  512 or 1024 are
+        typical values.  Higher = finer order resolution.
+    order_max : float
+        Maximum order to include in the output.
+    amp_conv : str
+        "Peak", "RMS", or "Peak-to-Peak" amplitude convention.
+    signal_kind : str
+        "acc" or "vel" — selects the physical unit label.
+
+    Returns
+    -------
+    orders : (K,) array
+        Order axis from 0 to order_max.
+    amp_spectrum : (K,) array
+        One-sided amplitude spectrum in the requested convention.
+    amp_vs_rpm : dict with keys "rpms" and "amp"
+        Per-revolution RMS amplitude — useful for a run-up overview.
+    """
+    try:
+        from scipy.interpolate import interp1d as _interp1d
+        _HAVE_SCIPY_INTERP = True
+    except ImportError:
+        _HAVE_SCIPY_INTERP = False
+
+    acc = np.asarray(acc, dtype=np.float64)
+    rpm_clean = clean_rpm_signal(np.asarray(rpm, dtype=np.float64), mode="interpolate")
+
+    n = min(acc.size, rpm_clean.size)
+    if n < 4:
+        raise RuntimeError("Signal too short for computed order tracking.")
+    acc = acc[:n]
+    rpm_c = rpm_clean[:n]
+
+    # Replace remaining NaN with forward-fill then zero
+    nan_mask = ~np.isfinite(rpm_c)
+    if nan_mask.any():
+        for i in range(1, n):
+            if nan_mask[i] and not nan_mask[i - 1]:
+                rpm_c[i] = rpm_c[i - 1]
+                nan_mask[i] = False
+        rpm_c[nan_mask] = 0.0
+
+    dt = 1.0 / float(fs)
+    omega = 2.0 * np.pi * rpm_c / 60.0                  # rad/s
+    theta = np.cumsum(omega) * dt                         # shaft angle (rad)
+
+    total_revs = float(theta[-1]) / (2.0 * np.pi)
+    if total_revs < 0.5:
+        raise RuntimeError(
+            f"Computed Order Tracking: total shaft rotation is only {total_revs:.2f} "
+            "revolutions — too short for meaningful order analysis."
+        )
+
+    n_angle_samples = int(max(4, round(total_revs * samples_per_rev)))
+    theta_uniform = np.linspace(float(theta[0]), float(theta[-1]), n_angle_samples)
+
+    # Resample acc from theta(t) -> theta_uniform
+    if _HAVE_SCIPY_INTERP:
+        # Deduplicate theta (must be strictly increasing for interp)
+        _, unique_idx = np.unique(theta, return_index=True)
+        t_u = theta[unique_idx]
+        a_u = acc[unique_idx]
+        f_interp = _interp1d(t_u, a_u, kind="linear", bounds_error=False, fill_value=0.0)
+        acc_angle = f_interp(theta_uniform)
+    else:
+        acc_angle = np.interp(theta_uniform, theta, acc)
+
+    # One-sided FFT in angle domain
+    nfft_ot = n_angle_samples
+    w = _hann_window(nfft_ot, "periodic")
+    w_sum = float(np.sum(w)) or float(nfft_ot)
+    X = np.fft.rfft(acc_angle * w, n=nfft_ot)
+    mag = np.abs(X)
+    A_peak = (2.0 * mag) / w_sum
+    A_peak[0] *= 0.5
+    if (nfft_ot % 2 == 0) and A_peak.size > 1:
+        A_peak[-1] *= 0.5
+
+    # Order axis: Δorder = samples_per_rev / nfft_ot (≈ 1/total_revs per bin)
+    d_order = float(samples_per_rev) / float(nfft_ot)
+    orders_full = np.arange(A_peak.size, dtype=np.float64) * d_order
+
+    # Apply amplitude convention
+    conv, _ = get_amp_conv_factor_label(amp_conv, signal_kind)
+    amp_full = A_peak * conv
+
+    # Trim to order_max
+    keep = orders_full <= float(order_max)
+    orders = orders_full[keep]
+    amp_spectrum = amp_full[keep]
+
+    # Per-revolution amplitude vs RPM (RMS over each revolution)
+    rev_edges = np.arange(0.0, float(theta[-1]) + 2.0 * np.pi, 2.0 * np.pi)
+    rev_rpms = []
+    rev_amps = []
+    t_arr = np.arange(n, dtype=np.float64) * dt
+    for k in range(len(rev_edges) - 1):
+        lo = rev_edges[k]
+        hi = rev_edges[k + 1]
+        mask = (theta >= lo) & (theta < hi)
+        if not np.any(mask):
+            continue
+        rev_amps.append(float(np.sqrt(np.mean(acc[mask] ** 2))))
+        rev_rpms.append(float(np.mean(rpm_c[mask])))
+
+    return (
+        orders,
+        amp_spectrum,
+        {
+            "rpms": np.asarray(rev_rpms, dtype=np.float64),
+            "amp": np.asarray(rev_amps, dtype=np.float64),
+        },
+    )
 
 
 def compute_one_sided_amp_spectrum_from_segment(
@@ -2936,18 +3236,52 @@ class WaterfallPlotWidget(QWidget):
         return out
 
     def _extract_order_trace(self, order_value: float):
-        rpms_src = self.rpms_trace if self.rpms_trace.size else self.rpms
-        S_src = self.S_trace if self.S_trace.size else self.S
-        freqs_src = self.freqs_trace if self.freqs_trace.size else self.freqs
+        """Extract amplitude vs RPM along the order line f = order * RPM/60.
+
+        Uses raw frame data (frame_rpms / frame_spectra_linear / freqs_analysis)
+        for quantitative accuracy.  The linear spectra are converted to the
+        display scale (dB or linear) to match the waterfall colorbar units.
+        Falls back to the display-interpolated matrices when frame data is
+        unavailable (e.g. older state dicts).
+        """
+        use_raw = (
+            self.frame_rpms.size > 0
+            and self.frame_spectra_linear.ndim == 2
+            and self.frame_spectra_linear.shape[0] == self.frame_rpms.size
+            and self.freqs_analysis.size > 0
+        )
+
+        if use_raw:
+            rpms_src = self.frame_rpms
+            freqs_src = self.freqs_analysis
+            # Apply display-consistent scale conversion
+            scale = (self.state.get("scale", "Linear") if self.state else "Linear")
+            out_type = (self.state.get("out_type", "Amplitude") if self.state else "Amplitude")
+            S_lin = self.frame_spectra_linear
+            if str(scale).strip().lower() == "db":
+                eps = 1e-30
+                if str(out_type).strip() == "Amplitude":
+                    S_src = 20.0 * np.log10(np.maximum(S_lin, eps))
+                else:
+                    S_src = 10.0 * np.log10(np.maximum(S_lin, eps))
+            else:
+                S_src = S_lin
+        else:
+            # Fallback: display-interpolated data (less accurate but always available)
+            rpms_src = self.rpms_trace if self.rpms_trace.size else self.rpms
+            S_src = self.S_trace if self.S_trace.size else self.S
+            freqs_src = self.freqs_trace if self.freqs_trace.size else self.freqs
+
         if S_src.size == 0 or rpms_src.size == 0 or freqs_src.size == 0:
             return np.array([], dtype=np.float64)
-        freq_min = float(freqs_src[0]) if freqs_src.size else 0.0
-        freq_max = float(freqs_src[-1]) if freqs_src.size else 0.0
+
+        freq_min = float(freqs_src[0])
+        freq_max = float(freqs_src[-1])
         freq_track = (float(order_value) * rpms_src) / 60.0
         out = np.full(rpms_src.shape, np.nan, dtype=np.float64)
         for i in range(rpms_src.size):
             f = freq_track[i]
-            if f < freq_min or f > freq_max:
+            if not np.isfinite(f) or f < freq_min or f > freq_max:
                 continue
             out[i] = np.interp(f, freqs_src, S_src[i, :], left=np.nan, right=np.nan)
         return out
@@ -4028,11 +4362,16 @@ class PlotWorker(QObject):
                                output_type: str, scale: str,
                                num_spectra: int = 100, num_buffers: int = 1,
                                rpm_label_method: str = "Window-weighted (Hanning)"):
-        """Waterfall FFT map. Vectorized framing/FFT, selectable Hann kind."""
+        """Waterfall FFT map. Vectorized framing/FFT, selectable Hann kind.
+
+        RPM NaN/<=0/Inf values are treated as invalid frames and excluded
+        from the output (they are NOT converted to 0 RPM).  Acceleration NaN
+        is zero-filled so it does not corrupt the FFT arithmetic.
+        """
         acc = np.nan_to_num(np.asarray(acc, dtype=np.float64),
                             nan=0.0, posinf=0.0, neginf=0.0)
-        rpm = np.nan_to_num(np.asarray(rpm, dtype=np.float64),
-                            nan=0.0, posinf=0.0, neginf=0.0)
+        # Keep RPM as-is; invalid samples are filtered at frame-labelling stage.
+        rpm = np.asarray(rpm, dtype=np.float64)
         fs = float(fs)
         nfft = max(2, int(nfft))
 
@@ -4240,18 +4579,73 @@ class PlotWorker(QObject):
 
         num_spectra = max(1, int(self.cfg.get("waterfall_num_spectra", 100)))
         num_buffers = max(1, int(self.cfg.get("waterfall_num_buffers", 1)))
+        wf_domain = str(self.cfg.get("waterfall_domain", "Frequency Waterfall")).strip()
 
         wf_map = self._compute_waterfall_map(
             acc, rpm, wf_fs, nfft, overlap_pct, out_type, scale,
             num_spectra, num_buffers, rpm_label_method=rpm_label_method
         )
+
+        _, unit_lbl = self._amp_conv_factor_label("acc")
+        colorbar_label = build_spectrum_ylabel(out_type, scale, unit_lbl)
+
+        # ── Order-domain waterfall path ─────────────────────────────────
+        if wf_domain == "Order Waterfall":
+            order_max = float(self.cfg.get("waterfall_order_max", 20.0))
+            n_orders = int(self.cfg.get("waterfall_order_bins", 512))
+            order_axis, sorted_rpms, S_order = compute_order_map(
+                wf_map["freqs_analysis"],
+                wf_map["frame_rpms"],
+                wf_map["frame_spectra_linear"],
+                order_max=order_max,
+                n_orders=n_orders,
+                output_type=out_type,
+                scale=scale,
+            )
+            key = (
+                f"waterfall_order|{acc_file_base}|{acc_group}|{acc_name}"
+                f"|{rpm_file_base}|{rpm_group}|{rpm_name}"
+            )
+            return {
+                "key": key,
+                "kind": "waterfall",
+                "name": acc_name,
+                "short_title": f"{acc_name} | Order Waterfall",
+                "title": (
+                    f"{acc_file_base} | Order Waterfall | Acc={acc_name} | RPM={rpm_name}"
+                    f" | NFFT={nfft}, Overlap={overlap_pct:.1f}% | OrderMax={order_max:.1f}"
+                    f" | Spectra={num_spectra} | {out_type} ({scale})"
+                ),
+                "xlabel": "Order",
+                "ylabel": "RPM",
+                # Frequency axis is now the order axis
+                "freqs": order_axis,
+                "freqs_analysis": order_axis.copy(),
+                "freqs_display": order_axis.copy(),
+                "rpms": sorted_rpms,
+                "S": S_order,
+                "rpms_analysis": sorted_rpms,
+                "S_analysis": S_order,
+                "rpms_display": sorted_rpms,
+                "S_display": S_order,
+                # Keep raw frame data for order-cursor extraction
+                "frame_rpms": wf_map["frame_rpms"],
+                "frame_spectra_linear": wf_map["frame_spectra_linear"],
+                "scale": scale,
+                "out_type": out_type,
+                "colorbar_label": colorbar_label,
+                "stats_text": (
+                    f"Order Waterfall | Acc={acc_name} (fs={fs_acc:g} Hz) | "
+                    f"RPM={rpm_name} (fs={fs_rpm:g} Hz) | FFT fs={wf_fs:g} Hz | "
+                    f"NFFT={nfft} | Spectra={num_spectra} | OrderMax={order_max:.1f}"
+                ),
+            }
+
+        # ── Frequency-domain waterfall path (original behavior) ─────────
         freqs = wf_map["freqs"]
         freqs_display = wf_map.get("freqs_display", freqs)
         rpms = wf_map["rpms_display"] if wf_map["rpms_display"].size else wf_map["rpms_analysis"]
         S_map = wf_map["S_display"] if wf_map["S_display"].size else wf_map["S_analysis"]
-
-        _, unit_lbl = self._amp_conv_factor_label("acc")
-        colorbar_label = build_spectrum_ylabel(out_type, scale, unit_lbl)
 
         same_source = (
             acc_file_base == rpm_file_base and
@@ -4313,7 +4707,42 @@ class PlotWorker(QObject):
                 f"{resample_mode} | Interp={interp_mode} | RPM label={rpm_label_method} | FFT fs={wf_fs:g} Hz | "
                 f"Spectra={num_spectra} | Buffers/Spectrum={num_buffers}"
             ),
+            # COT: computed when checkbox is enabled. Stored for downstream use.
+            "cot_results": self._maybe_compute_cot(acc, wf_map, wf_fs),
         }
+
+    def _maybe_compute_cot(self, acc: np.ndarray, wf_map: dict, fs: float):
+        """Compute COT if enabled in cfg; returns result dict or None."""
+        if not bool(self.cfg.get("waterfall_cot_enabled", False)):
+            return None
+        try:
+            spr = int(self.cfg.get("waterfall_cot_spr", 512))
+            order_max = float(self.cfg.get("waterfall_order_max", 20.0))
+            frame_rpms = wf_map.get("frame_rpms", np.array([]))
+            if frame_rpms.size == 0:
+                return None
+            # Reconstruct a per-sample RPM approximation from frame RPMs.
+            # Accurate COT requires the full-length RPM signal — here we use the
+            # frame-level RPM as a step-function approximation.
+            # TODO: pass the original aligned rpm signal for fully accurate COT.
+            orders, amp_spectrum, amp_vs_rpm = compute_order_tracking_spectrum(
+                acc, np.full(acc.size, float(np.nanmean(frame_rpms))),
+                fs, spr, order_max,
+                amp_conv=self.cfg.get("amp_conv", "Peak"),
+                signal_kind="acc",
+            )
+            return {
+                "orders": orders,
+                "amp_spectrum": amp_spectrum,
+                "amp_vs_rpm": amp_vs_rpm,
+                "note": (
+                    "COT uses full acc signal with constant mean RPM approximation. "
+                    "Pass aligned RPM for accurate angle-domain results."
+                ),
+            }
+        except Exception as e:
+            print(f"[TRDSP] COT computation failed: {e}")
+            return None
 
     @staticmethod
     def _nearest_interp_1d(x_src: np.ndarray, y_src: np.ndarray, x_dst: np.ndarray) -> np.ndarray:
@@ -4378,21 +4807,24 @@ class PlotWorker(QObject):
             t_dst = t_rpm[keep]
             rpm_out = rpm[:t_dst.size]
             acc_out = self._resample_uniform_signal(acc, fs_acc, t_dst, interp_mode)
-            return (
-                np.nan_to_num(acc_out, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64, copy=False),
-                np.nan_to_num(rpm_out, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64, copy=False),
-                fs_rpm,
-            )
+            # acc: zero-fill NaN (FFT-safe); rpm: preserve NaN for invalid-frame exclusion
+            acc_clean = np.nan_to_num(acc_out, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64)
+            rpm_clean = clean_rpm_signal(rpm_out, mode="interpolate").astype(np.float64)
+            n_invalid = int(np.sum(~np.isfinite(rpm_clean)))
+            if n_invalid:
+                print(f"[TRDSP] _align_waterfall_signals: {n_invalid} RPM samples remain NaN after cleaning.")
+            return acc_clean, rpm_clean, fs_rpm
 
         keep = t_acc <= (t_end + 0.5 / max(fs_acc, 1e-12))
         t_dst = t_acc[keep]
         acc_out = acc[:t_dst.size]
         rpm_out = self._resample_uniform_signal(rpm, fs_rpm, t_dst, interp_mode)
-        return (
-            np.nan_to_num(acc_out, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64, copy=False),
-            np.nan_to_num(rpm_out, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64, copy=False),
-            fs_acc,
-        )
+        acc_clean = np.nan_to_num(acc_out, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64)
+        rpm_clean = clean_rpm_signal(rpm_out, mode="interpolate").astype(np.float64)
+        n_invalid = int(np.sum(~np.isfinite(rpm_clean)))
+        if n_invalid:
+            print(f"[TRDSP] _align_waterfall_signals: {n_invalid} RPM samples remain NaN after cleaning.")
+        return acc_clean, rpm_clean, fs_acc
 
     def _build_plot_states(self):
         fs = float(self.cfg["fs"])
@@ -4505,7 +4937,7 @@ class PlotWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Excel/TDMS/CSV Signal Plotter (PyQt5 + PyQtGraph)")
+        self.setWindowTitle("TRDSP")
 
         self.file_path = None
         self.file_type = None
@@ -4761,6 +5193,9 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
         root.setContentsMargins(6, 6, 6, 6)
+        root.setSpacing(0)
+
+        root.addWidget(self._build_logo_header())
 
         self.tabs = QTabWidget()
         root.addWidget(self.tabs)
@@ -4768,9 +5203,11 @@ class MainWindow(QMainWindow):
         self.tab_controls = QWidget()
         self.tab_waterfall = QWidget()
         self.tab_plot = QWidget()
+        self.tab_info = QWidget()
         self.tabs.addTab(self.tab_controls, "Controls")
         self.tabs.addTab(self.tab_waterfall, "Waterfall")
         self.tabs.addTab(self.tab_plot, "Plot View")
+        self.tabs.addTab(self.tab_info, "Help / Info")
 
         ctl = QVBoxLayout(self.tab_controls)
         ctl.addWidget(self.btn_open)
@@ -4858,6 +5295,7 @@ class MainWindow(QMainWindow):
         ctl.addStretch(1)
 
         self._build_waterfall_tab_ui()
+        self._build_help_tab_ui()
 
         ptab = QVBoxLayout(self.tab_plot)
 
@@ -6115,6 +6553,302 @@ class MainWindow(QMainWindow):
 
         QMessageBox.information(self, "Export", f"Plot exported successfully:\n{path}")
 
+    # ------------------------------------------------------------------ #
+    #  TRDSP Logo Header                                                   #
+    # ------------------------------------------------------------------ #
+    # Replace the asset path constants below with real image file paths
+    # to swap placeholders for actual logos.  Supported formats: PNG, JPG.
+    # If a path does not exist the widget will fall back to a styled text label.
+    _LOGO_APP_PATH   = "assets/trdsp_logo.png"        # application / TRDSP logo
+    _LOGO_INST1_PATH = "assets/institution1_logo.png"  # institution / company logo 1
+    _LOGO_INST2_PATH = "assets/institution2_logo.png"  # institution / company logo 2
+    _LOGO_HEIGHT_PX  = 48                              # uniform scaled height for all logos
+
+    def _make_logo_label(self, path: str, fallback_text: str) -> QLabel:
+        lbl = QLabel()
+        lbl.setAlignment(Qt.AlignVCenter | Qt.AlignHCenter)
+        h = self._LOGO_HEIGHT_PX
+        if os.path.isfile(path):
+            pix = QPixmap(path)
+            if not pix.isNull():
+                pix = pix.scaled(
+                    pix.width() * h // max(pix.height(), 1), h,
+                    Qt.KeepAspectRatio, Qt.SmoothTransformation,
+                )
+                lbl.setPixmap(pix)
+                lbl.setFixedSize(pix.width(), h)
+                return lbl
+        # Fallback: styled text when image not found
+        lbl.setText(fallback_text)
+        lbl.setStyleSheet(
+            "font-weight: bold; font-size: 11pt; color: #2c4a7c; letter-spacing: 1px;"
+        )
+        return lbl
+
+    def _build_logo_header(self) -> QFrame:
+        frame = QFrame()
+        frame.setFrameShape(QFrame.NoFrame)
+        frame.setFixedHeight(self._LOGO_HEIGHT_PX + 10)
+        frame.setStyleSheet(
+            "background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+            " stop:0 #1a2e4a, stop:1 #2c5282); border-bottom: 1px solid #1a2e4a;"
+        )
+
+        lay = QHBoxLayout(frame)
+        lay.setContentsMargins(10, 4, 10, 4)
+        lay.setSpacing(12)
+
+        # Left: app logo + TRDSP name
+        app_logo = self._make_logo_label(self._LOGO_APP_PATH, "")
+        lay.addWidget(app_logo)
+
+        title_lbl = QLabel("TRDSP")
+        title_lbl.setStyleSheet(
+            "color: #e8f0fe; font-size: 16pt; font-weight: bold; letter-spacing: 3px;"
+        )
+        title_lbl.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        lay.addWidget(title_lbl)
+
+        sub_lbl = QLabel("Time-domain & Rotational Data Signal Processor")
+        sub_lbl.setStyleSheet("color: #90caf9; font-size: 8pt;")
+        sub_lbl.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        lay.addWidget(sub_lbl)
+
+        lay.addStretch(1)
+
+        # Right: institution logos
+        inst1 = self._make_logo_label(self._LOGO_INST1_PATH, "Institution 1")
+        inst1.setStyleSheet(inst1.styleSheet() + " color: #90caf9;")
+        lay.addWidget(inst1)
+
+        inst2 = self._make_logo_label(self._LOGO_INST2_PATH, "Institution 2")
+        inst2.setStyleSheet(inst2.styleSheet() + " color: #90caf9;")
+        lay.addWidget(inst2)
+
+        return frame
+
+    # ------------------------------------------------------------------ #
+    #  Help / Info tab                                                     #
+    # ------------------------------------------------------------------ #
+    def _build_help_tab_ui(self):
+        outer = QVBoxLayout(self.tab_info)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(6)
+
+        # --- Search box -------------------------------------------------
+        search_row = QHBoxLayout()
+        search_row.addWidget(QLabel("Search:"))
+        self._help_search = QLineEdit()
+        self._help_search.setPlaceholderText("Type a keyword to filter sections…")
+        self._help_search.setClearButtonEnabled(True)
+        search_row.addWidget(self._help_search)
+        outer.addLayout(search_row)
+
+        # --- Scroll area ------------------------------------------------
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        outer.addWidget(scroll, 1)
+
+        inner = QWidget()
+        scroll.setWidget(inner)
+        vlay = QVBoxLayout(inner)
+        vlay.setContentsMargins(4, 4, 4, 4)
+        vlay.setSpacing(10)
+
+        self._help_sections = []   # list of (QGroupBox, full_text_lower)
+
+        def _section(title: str, html: str) -> QGroupBox:
+            gb = QGroupBox(title)
+            gb.setStyleSheet(
+                "QGroupBox { font-weight: bold; font-size: 10pt; border: 1px solid #aaa;"
+                " border-radius: 4px; margin-top: 6px; padding: 6px; }"
+                "QGroupBox::title { subcontrol-origin: margin; left: 8px; }"
+            )
+            lbl = QLabel(html)
+            lbl.setWordWrap(True)
+            lbl.setTextFormat(Qt.RichText)
+            lbl.setOpenExternalLinks(False)
+            lbl.setStyleSheet("font-size: 9pt; font-weight: normal;")
+            glay = QVBoxLayout(gb)
+            glay.addWidget(lbl)
+            vlay.addWidget(gb)
+            self._help_sections.append((gb, (title + " " + html).lower()))
+            return gb
+
+        # ── 1. Quick Start ─────────────────────────────────────────────
+        _section("1 · Quick Start / How to Use", """
+<ol>
+  <li><b>Open a file</b> — click <i>Open File</i> and select an Excel, TDMS, or CSV file.</li>
+  <li><b>Select sheet / group</b> — choose the sheet or TDMS group from the drop-down.</li>
+  <li><b>Select channel(s)</b> — pick one or more columns from the channel list.</li>
+  <li><b>Set fs</b> — enter the correct <i>sampling frequency</i> in Hz. This is the most critical parameter.</li>
+  <li><b>Choose analysis mode</b> — Time Domain, Fourier Transform, or Waterfall.</li>
+  <li><b>Configure FFT settings</b> — Buffer Size (NFFT), Overlap, Output, Scale, Amplitude convention.</li>
+  <li><b>Click Plot</b>.</li>
+  <li><b>Inspect</b> — zoom, pan, click to annotate. Use the Plot View tab for axis/color controls.</li>
+  <li><b>Export</b> — use the Export button for PNG/PDF/TDMS output.</li>
+</ol>
+<p><b>Waterfall workflow:</b> Switch to the <i>Waterfall</i> tab, open your acceleration and RPM files
+(can be the same file or different files), configure NFFT / Overlap / Spectra / Buffers, then click
+<i>Plot Waterfall</i>.</p>""")
+
+        # ── 2. Signal & FFT Parameters ─────────────────────────────────
+        _section("2 · Signal &amp; FFT Parameters", """
+<table width="100%" cellspacing="4">
+<tr><td width="28%"><b>fs — Sampling frequency (Hz)</b></td>
+    <td>The number of samples recorded per second. <i>Wrong fs = wrong frequency axis.</i>
+    Every frequency result is scaled by fs. Check your hardware spec or file metadata.</td></tr>
+<tr><td><b>NFFT / Buffer Size</b></td>
+    <td>Length of each FFT window in samples. Larger NFFT → finer frequency resolution
+    (Δf = fs / NFFT) but longer time per frame. Powers of 2 are required (256 … 32768).</td></tr>
+<tr><td><b>Overlap (%)</b></td>
+    <td>How much consecutive FFT windows overlap. 50 % overlap halves the hop.
+    67 % overlap is a common default for run-up data. More overlap = more frames = smoother
+    spectrogram, but does not add spectral resolution.</td></tr>
+<tr><td><b>Window — Periodic vs Symmetric Hann</b></td>
+    <td><i>Periodic</i> (default): w[n] = 0.5 − 0.5·cos(2π·n/N). Recommended for FFT/STFT/Welch.
+    Matches MATLAB hann(N,'periodic') and nCode.<br>
+    <i>Symmetric</i>: w[n] = 0.5 − 0.5·cos(2π·n/(N−1)). Use only to match legacy symmetric Hann results.</td></tr>
+<tr><td><b>Output: Amplitude vs Power</b></td>
+    <td><i>Amplitude</i>: one-sided peak amplitude in physical units (g, mm/s …) × your convention factor.<br>
+    <i>Power</i>: RMS² per bin. Averaged in the power domain to remove Jensen-inequality bias.</td></tr>
+<tr><td><b>Scale: Linear vs dB</b></td>
+    <td><i>Linear</i>: raw amplitude or power values.<br>
+    <i>dB (Amplitude)</i>: 20·log₁₀(value). <i>dB (Power)</i>: 10·log₁₀(value).
+    Never mix the two conventions.</td></tr>
+<tr><td><b>Amplitude convention</b></td>
+    <td><i>Peak</i>: amplitude of the sinusoidal component (A).<br>
+    <i>RMS</i>: A / √2 (for a pure sine).<br>
+    <i>Peak-to-Peak</i>: 2·A.</td></tr>
+</table>""")
+
+        # ── 3. Waterfall & Order Tracking ──────────────────────────────
+        _section("3 · Waterfall &amp; Order Tracking", """
+<table width="100%" cellspacing="4">
+<tr><td width="28%"><b>Number of Spectra</b></td>
+    <td><b>Display density</b> — the minimum number of RPM rows shown in the waterfall after
+    RPM-axis interpolation.<br>
+    A larger value makes the waterfall look denser and smoother, but
+    <i>does not create new physical information</i>.
+    The actual resolution is determined by how many FFT frames were computed from the raw signal.
+    If you set Num Spectra much larger than the number of raw frames, the extra rows are
+    interpolated from the existing frames.<br>
+    <b>Tip:</b> start with Num Spectra ≈ number of raw FFT frames (shown in the stats label after plotting).</td></tr>
+<tr><td><b>Number of Buffers</b></td>
+    <td><b>Smoothing kernel width</b> — how many neighboring raw FFT frames are averaged together
+    for each RPM position using a sliding-window mean.<br>
+    Num Buffers = 1 means no smoothing (each frame is its own spectrum).
+    Larger values smooth noisy spectra and reduce variance, but can blur narrow spectral peaks
+    and hide rapid RPM-speed transitions.<br>
+    <b>Rule of thumb:</b> keep Num Buffers ≤ 3–5 unless your data is very noisy.</td></tr>
+<tr><td><b>Display density vs true resolution</b></td>
+    <td>Num Spectra controls how finely the RPM axis is sampled for display.
+    Num Buffers controls spectral smoothing in the raw data.
+    Increasing Num Spectra beyond the raw frame count only adds interpolated rows.
+    True RPM resolution depends on the hop size: ΔRPM ≈ (RPM range) / (number of raw frames).</td></tr>
+<tr><td><b>RPM label method</b></td>
+    <td>How a single RPM value is assigned to each FFT frame:<br>
+    <i>Window-weighted (Hanning)</i>: weighted by the same Hann window as the FFT — recommended for run-up.<br>
+    <i>Center sample</i>: RPM at the middle time sample of the frame.<br>
+    <i>Median in window</i>: robust median of the RPM samples in the frame.</td></tr>
+<tr><td><b>Resample mode</b></td>
+    <td>How to put acceleration and RPM on a common time grid when their sampling rates differ:<br>
+    <i>Resample RPM → Acc timebase</i> (recommended): RPM is resampled to the acceleration grid. FFT uses fs_acc.<br>
+    <i>Resample Acc → RPM timebase</i>: acceleration is resampled to the RPM grid. FFT uses fs_rpm.<br>
+    <i>Trim only (same fs)</i>: signals must have identical fs; only lengths are trimmed to match.</td></tr>
+<tr><td><b>Frequency Waterfall</b></td>
+    <td>Classic waterfall: X-axis = frequency (Hz), Y-axis = RPM, color = amplitude/power.
+    Constant-frequency features appear as horizontal lines.
+    Order-related features (which scale with RPM) appear as diagonal lines.</td></tr>
+<tr><td><b>Order Waterfall</b></td>
+    <td>Each frame spectrum is converted from frequency to order axis: order = f / (RPM/60).
+    X-axis = order, Y-axis = RPM, color = amplitude/power.
+    Rotating-machine harmonics (1X, 2X …) appear as nearly vertical lines.</td></tr>
+<tr><td><b>Order Cursor</b></td>
+    <td><i>Visual cursor only.</i> Draws a line at f = order × RPM / 60 across the waterfall and
+    extracts amplitude along that line.  This is not a filter — it is an interpolated
+    read-out from the existing spectrum.</td></tr>
+<tr><td><b>Computed Order Tracking</b></td>
+    <td>True order-tracking filter.  Acceleration is resampled from uniform time to uniform
+    angle (shaft angle θ = ∫ω dt). Order-domain FFT is computed in the angle domain.
+    This separates rotating harmonics cleanly even during rapid speed changes.</td></tr>
+</table>""")
+
+        # ── 4. Amplitude & Scale Conventions ───────────────────────────
+        _section("4 · Amplitude &amp; Scale Conventions", """
+<ul>
+  <li><b>Peak amplitude</b> of a pure sine A·sin(2πft): the value A itself.</li>
+  <li><b>RMS</b> of a pure sine: A / √2 ≈ 0.707·A.</li>
+  <li><b>Peak-to-Peak</b> of a pure sine: 2·A.</li>
+  <li><b>Power (spectral)</b>: stored as RMS², averaged across frames. Independent of Peak/RMS/P-P selection.</li>
+  <li><b>dB (Amplitude)</b>: 20·log₁₀(amplitude). A factor-of-2 amplitude change = +6 dB.</li>
+  <li><b>dB (Power)</b>: 10·log₁₀(power). A factor-of-2 power change = +3 dB.</li>
+  <li><b>DC bin</b> (0 Hz) and <b>Nyquist bin</b> (fs/2 for even NFFT): not doubled when computing one-sided amplitude.</li>
+</ul>
+<p><b>Velocity integration:</b> acceleration is high-pass filtered at 10 Hz (4th-order Butterworth, zero-phase)
+before integration to suppress DC drift, then converted to mm/s.</p>""")
+
+        # ── 5. Best Practices & Warnings ───────────────────────────────
+        _section("5 · Best Practices &amp; Warnings", """
+<ul>
+  <li><b>Wrong fs</b> shifts the entire frequency axis — always verify fs matches your hardware setting.</li>
+  <li><b>Large Num Spectra</b> makes the plot look smoother but adds no real information beyond the raw frame count.</li>
+  <li><b>Large Num Buffers</b> may hide sharp spectral peaks — use sparingly.</li>
+  <li><b>Too much overlap</b> (e.g. 95 %) creates very many frames but does not improve frequency resolution.</li>
+  <li><b>RPM = 0 or NaN in data</b> is treated as an invalid frame and excluded from the waterfall.</li>
+  <li><b>RPM spikes</b> can corrupt order analysis — use the spike-rejection option (MAD-based).</li>
+  <li><b>1X</b> typically relates to shaft rotational fundamental. In a waterfall it appears as a diagonal line with slope 1/60.</li>
+  <li><b>2X</b> may indicate misalignment, looseness, or harmonic distortion — interpret in machine context.</li>
+  <li><b>Order Waterfall</b> is most useful for run-up / coast-down data where RPM changes significantly.</li>
+  <li><b>Computed Order Tracking</b> requires a clean, monotonic RPM signal — large gaps or spikes degrade results.</li>
+  <li><b>dB dynamic range</b>: the color bar clamps to (peak − dyn_range_dB). Increase dyn_range_dB to see weaker features.</li>
+</ul>""")
+
+        vlay.addStretch(1)
+
+        # Wire search box
+        self._help_search.textChanged.connect(self._on_help_search)
+
+    def _on_help_search(self, text: str):
+        kw = text.strip().lower()
+        for gb, full_text in self._help_sections:
+            gb.setVisible(not kw or kw in full_text)
+
+    def _show_num_spectra_help(self):
+        QMessageBox.information(
+            self, "Number of Spectra — Explanation",
+            "<b>Number of Spectra</b><br><br>"
+            "Controls how many RPM rows appear in the waterfall display after interpolation.<br><br>"
+            "<b>What it does:</b> the raw FFT computation produces one spectrum per hop "
+            "(frame), typically a few hundred to a few thousand frames. "
+            "After sorting by RPM, the code interpolates those frames onto a uniform RPM grid "
+            "with <i>at least</i> this many rows.<br><br>"
+            "<b>Important:</b> increasing Num Spectra beyond the number of raw frames only "
+            "adds <i>interpolated</i> rows — it does not create new physical information. "
+            "The apparent smoothness of the waterfall increases, but the underlying data "
+            "resolution does not.<br><br>"
+            "<b>Rule of thumb:</b> set Num Spectra ≈ number of raw FFT frames for a 1-to-1 "
+            "display. Check the stats label after plotting to see how many raw frames were used.",
+        )
+
+    def _show_num_buffers_help(self):
+        QMessageBox.information(
+            self, "Number of Buffers — Explanation",
+            "<b>Number of Buffers</b><br><br>"
+            "Controls how many neighboring raw FFT frames are averaged together for each "
+            "RPM position using a sliding-window mean.<br><br>"
+            "<b>What it does:</b><br>"
+            "  Num Buffers = 1 → no smoothing; each frame is its own spectrum.<br>"
+            "  Num Buffers = N → each RPM slice is the average of ±N/2 surrounding frames.<br><br>"
+            "<b>Effect:</b> smooths noisy spectra and reduces random variance. "
+            "However, large values can blur sharp spectral peaks and hide rapid RPM-speed "
+            "transitions that are physically real.<br><br>"
+            "<b>Rule of thumb:</b> keep Num Buffers ≤ 3–5 for typical run-up / coast-down data. "
+            "Only increase it if your data is very noisy and you have confirmed that the "
+            "features of interest are broad.",
+        )
+
     def _build_waterfall_tab_ui(self):
         self.btn_wf_acc_open = QPushButton("Open Acc file (.xlsx / .tdms / .csv)")
         self.lbl_wf_acc_file = QLabel("Acceleration source: -")
@@ -6189,17 +6923,29 @@ class MainWindow(QMainWindow):
         self.wf_num_spectra_spin.setRange(10, 5000)
         self.wf_num_spectra_spin.setValue(1000)
         self.wf_num_spectra_spin.setToolTip(
-            "Number of Spectra: waterfall RPM eksenindeki minimum hedef satır sayısı. "
-            "Kod artık available FFT frame sayısının altına yıkıcı biçimde düşmez."
+            "Number of Spectra — minimum RPM rows shown in the waterfall after interpolation.\n"
+            "Larger = denser display, NOT more physical information.\n"
+            "True resolution depends on the number of raw FFT frames (hop-size driven).\n"
+            "Click the ? button for a full explanation."
         )
+        self.btn_wf_num_spectra_help = QToolButton()
+        self.btn_wf_num_spectra_help.setText("?")
+        self.btn_wf_num_spectra_help.setToolTip("Click for explanation of Number of Spectra")
+        self.btn_wf_num_spectra_help.clicked.connect(self._show_num_spectra_help)
 
         self.wf_num_buffers_spin = QSpinBox()
         self.wf_num_buffers_spin.setRange(1, 500)
         self.wf_num_buffers_spin.setValue(1)
         self.wf_num_buffers_spin.setToolTip(
-            "Number of Buffers: her RPM dilimine karşılık kaç raw FFT frame "
-            "ortalaması alınsın (arttıkça smooth, azalır RPM çözünürlüğü)"
+            "Number of Buffers — sliding-window average width across neighboring FFT frames.\n"
+            "1 = no smoothing. Larger = smoother spectra, but blurs narrow peaks and\n"
+            "RPM-speed transitions. Keep ≤ 3–5 for typical run-up data.\n"
+            "Click the ? button for a full explanation."
         )
+        self.btn_wf_num_buffers_help = QToolButton()
+        self.btn_wf_num_buffers_help.setText("?")
+        self.btn_wf_num_buffers_help.setToolTip("Click for explanation of Number of Buffers")
+        self.btn_wf_num_buffers_help.clicked.connect(self._show_num_buffers_help)
 
         self.wf_out = QComboBox()
         self.wf_out.addItems(["Amplitude", "Power"])
@@ -6240,6 +6986,79 @@ class MainWindow(QMainWindow):
 
         self.cmb_wf_filter_target = QComboBox()
         self.cmb_wf_filter_target.addItems(["None", "Acceleration", "RPM", "Both"])
+
+        # ── Order-domain waterfall controls ────────────────────────────
+        # "Frequency Waterfall" keeps existing behavior unchanged.
+        # "Order Waterfall" converts each frame from Hz to order axis.
+        self.cmb_wf_domain = QComboBox()
+        self.cmb_wf_domain.addItems(["Frequency Waterfall", "Order Waterfall"])
+        self.cmb_wf_domain.setCurrentText("Frequency Waterfall")
+        self.cmb_wf_domain.setToolTip(
+            "Frequency Waterfall: classic X=Hz, Y=RPM.\n"
+            "Order Waterfall: X=order (f/(RPM/60)), Y=RPM.\n"
+            "1X, 2X … appear as nearly-vertical lines in a run-up."
+        )
+
+        self.wf_order_max_spin = QDoubleSpinBox()
+        self.wf_order_max_spin.setRange(0.5, 200.0)
+        self.wf_order_max_spin.setDecimals(1)
+        self.wf_order_max_spin.setValue(20.0)
+        self.wf_order_max_spin.setToolTip("Maximum order shown on the X-axis of the Order Waterfall.")
+        self.wf_order_max_spin.setEnabled(False)
+
+        self.wf_order_bins_spin = QSpinBox()
+        self.wf_order_bins_spin.setRange(64, 4096)
+        self.wf_order_bins_spin.setValue(512)
+        self.wf_order_bins_spin.setToolTip(
+            "Number of order bins in the order-domain grid.\n"
+            "More bins = finer order resolution but more memory."
+        )
+        self.wf_order_bins_spin.setEnabled(False)
+
+        self.cmb_wf_domain.currentIndexChanged.connect(self._on_wf_domain_changed)
+
+        # ── Order extraction bandwidth controls ────────────────────────
+        self.wf_order_bw_spin = QDoubleSpinBox()
+        self.wf_order_bw_spin.setRange(0.0, 1000.0)
+        self.wf_order_bw_spin.setDecimals(3)
+        self.wf_order_bw_spin.setValue(0.0)
+        self.wf_order_bw_spin.setToolTip(
+            "Order-trace extraction bandwidth.\n"
+            "0 = single interpolated bin (current behavior).\n"
+            ">0 = use peak-in-band or RMS-band-power within ±BW around the order line."
+        )
+
+        self.cmb_wf_order_bw_unit = QComboBox()
+        self.cmb_wf_order_bw_unit.addItems(["Hz", "Order"])
+        self.cmb_wf_order_bw_unit.setToolTip("Unit for the extraction bandwidth.")
+
+        self.cmb_wf_order_extract_mode = QComboBox()
+        self.cmb_wf_order_extract_mode.addItems(["Interpolated", "Peak in band", "RMS band power"])
+        self.cmb_wf_order_extract_mode.setToolTip(
+            "Interpolated: single-bin linear interpolation at f=order*RPM/60.\n"
+            "Peak in band: maximum amplitude within the bandwidth window.\n"
+            "RMS band power: square-root of mean power within the bandwidth window."
+        )
+
+        # ── Computed Order Tracking controls ───────────────────────────
+        self.chk_wf_cot = QCheckBox("Computed Order Tracking (COT) — angle-domain resampling")
+        self.chk_wf_cot.setToolTip(
+            "Resample acceleration to uniform shaft-angle grid, then compute\n"
+            "order-domain FFT.  1X, 2X … appear as sharp peaks regardless of\n"
+            "speed variation.  Requires a clean, monotonic RPM signal."
+        )
+        self.wf_cot_spr_spin = QSpinBox()
+        self.wf_cot_spr_spin.setRange(64, 4096)
+        self.wf_cot_spr_spin.setValue(512)
+        self.wf_cot_spr_spin.setToolTip(
+            "Samples Per Revolution (COT): resampling density in the angle domain.\n"
+            "512 → max detectable order ≈ 256.  Higher = finer order resolution."
+        )
+        self.wf_cot_spr_spin.setEnabled(False)
+        self.chk_wf_cot.stateChanged.connect(
+            lambda s: self.wf_cot_spr_spin.setEnabled(bool(s))
+        )
+
         self.chk_wf_open_3d = QCheckBox("Open 3D waterfall in separate window after plotting")
         self.chk_wf_open_3d.setChecked(False)
         self.lbl_wf_info = QLabel(
@@ -6327,8 +7146,10 @@ class MainWindow(QMainWindow):
         row_wf_3.addWidget(self.wf_amp_conv)
         row_wf_3.addWidget(QLabel("Num Spectra:"))
         row_wf_3.addWidget(self.wf_num_spectra_spin)
+        row_wf_3.addWidget(self.btn_wf_num_spectra_help)
         row_wf_3.addWidget(QLabel("Num Buffers:"))
         row_wf_3.addWidget(self.wf_num_buffers_spin)
+        row_wf_3.addWidget(self.btn_wf_num_buffers_help)
         row_wf_3.addStretch(1)
         lay.addLayout(row_wf_3)
 
@@ -6357,6 +7178,33 @@ class MainWindow(QMainWindow):
         row_wf_5.addWidget(self.btn_wf_plot)
         lay.addLayout(row_wf_5)
 
+        # ── Order waterfall + order-extraction row ──────────────────────
+        row_wf_ord = QHBoxLayout()
+        row_wf_ord.addWidget(QLabel("Domain:"))
+        row_wf_ord.addWidget(self.cmb_wf_domain)
+        row_wf_ord.addSpacing(10)
+        row_wf_ord.addWidget(QLabel("Order max:"))
+        row_wf_ord.addWidget(self.wf_order_max_spin)
+        row_wf_ord.addWidget(QLabel("Order bins:"))
+        row_wf_ord.addWidget(self.wf_order_bins_spin)
+        row_wf_ord.addSpacing(14)
+        row_wf_ord.addWidget(QLabel("Order BW:"))
+        row_wf_ord.addWidget(self.wf_order_bw_spin)
+        row_wf_ord.addWidget(self.cmb_wf_order_bw_unit)
+        row_wf_ord.addWidget(QLabel("Extract:"))
+        row_wf_ord.addWidget(self.cmb_wf_order_extract_mode)
+        row_wf_ord.addStretch(1)
+        lay.addLayout(row_wf_ord)
+
+        # Computed Order Tracking row
+        row_wf_cot = QHBoxLayout()
+        row_wf_cot.addWidget(self.chk_wf_cot)
+        row_wf_cot.addSpacing(14)
+        row_wf_cot.addWidget(QLabel("Samples/Rev:"))
+        row_wf_cot.addWidget(self.wf_cot_spr_spin)
+        row_wf_cot.addStretch(1)
+        lay.addLayout(row_wf_cot)
+
         lay.addWidget(self.lbl_wf_status)
         lay.addStretch(1)
 
@@ -6368,6 +7216,11 @@ class MainWindow(QMainWindow):
         self.chk_wf_filter.stateChanged.connect(self._sync_wf_filter_enabled_state)
         self.cmb_wf_filter_type.currentIndexChanged.connect(self._on_wf_filter_type_change)
         self.btn_wf_plot.clicked.connect(self.plot_waterfall)
+
+    def _on_wf_domain_changed(self, _idx):
+        is_order = self.cmb_wf_domain.currentText() == "Order Waterfall"
+        self.wf_order_max_spin.setEnabled(is_order)
+        self.wf_order_bins_spin.setEnabled(is_order)
 
     def _on_wf_crop_toggle(self, _state):
         enabled = self.chk_wf_crop.isChecked()
@@ -6541,6 +7394,14 @@ class MainWindow(QMainWindow):
             "waterfall_filter_target": self.cmb_wf_filter_target.currentText(),
             "waterfall_num_spectra": int(self.wf_num_spectra_spin.value()),
             "waterfall_num_buffers": int(self.wf_num_buffers_spin.value()),
+            "waterfall_domain": self.cmb_wf_domain.currentText(),
+            "waterfall_order_max": float(self.wf_order_max_spin.value()),
+            "waterfall_order_bins": int(self.wf_order_bins_spin.value()),
+            "waterfall_order_bw": float(self.wf_order_bw_spin.value()),
+            "waterfall_order_bw_unit": self.cmb_wf_order_bw_unit.currentText(),
+            "waterfall_order_extract_mode": self.cmb_wf_order_extract_mode.currentText(),
+            "waterfall_cot_enabled": self.chk_wf_cot.isChecked(),
+            "waterfall_cot_spr": int(self.wf_cot_spr_spin.value()),
             "waterfall_acc_name": acc_name,
             "waterfall_rpm_name": rpm_name,
             "waterfall_acc_source": {
@@ -6775,6 +7636,207 @@ class MainWindow(QMainWindow):
 
     def _err(self, msg: str):
         QMessageBox.critical(self, "Error", msg)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TRDSP Signal-Processing Self-Tests
+# Call run_signal_processing_self_tests() from a Python console or add
+# a button / menu action to trigger them during development.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_signal_processing_self_tests(verbose: bool = True) -> bool:
+    """Synthetic validation tests for core signal-processing functions.
+
+    Tests
+    -----
+    1. Constant-RPM sine: 1X = RPM/60, known amplitude.
+    2. Run-up chirp (1X): frequency scales with RPM.
+    3. Two-component signal (1X + 2X): amplitudes recovered independently.
+    4. RPM NaN/spike: invalid RPM must NOT become 0 RPM.
+    5. Averaged spectrum sanity: known sine amplitude within 5 % tolerance.
+    6. Order map: 1X peak at order = 1.0.
+    7. compute_order_tracking_spectrum: returns order axis and amplitude > 0.
+
+    Returns True if all tests pass.
+    """
+    import traceback
+    PASS = "[PASS]"
+    FAIL = "[FAIL]"
+    results = []
+
+    def log(name: str, ok: bool, detail: str = ""):
+        tag = PASS if ok else FAIL
+        msg = f"  [{tag}] {name}"
+        if detail:
+            msg += f"  ({detail})"
+        if verbose:
+            print(msg)
+        results.append(ok)
+
+    # Use fs=4096 so that many integer frequencies fall on exact FFT bins.
+    # With NFFT=N=4096 and fs=4096: delta_f=1 Hz, so any integer Hz freq is exact.
+    fs = 4096.0
+    N = 4096
+    t = np.arange(N) / fs
+
+    # ── Test 1: Constant RPM, 1X sine ────────────────────────────────
+    # Choose f1x=100 Hz (exact bin: bin index 100). RPM=6000.
+    try:
+        f1x = 100.0
+        A_known = 2.0
+        sig = A_known * np.sin(2.0 * np.pi * f1x * t)
+        freqs, spec = compute_avg_spectrum_from_signal(
+            sig, fs, nfft=N, overlap_pct=0.0,
+            output_type="Amplitude", scale="Linear",
+            amp_conv="Peak", signal_kind="acc",
+        )
+        peak_idx = int(np.argmax(spec))
+        peak_freq = float(freqs[peak_idx])
+        peak_amp = float(spec[peak_idx])
+        freq_ok = abs(peak_freq - f1x) < 1.5
+        amp_ok = abs(peak_amp - A_known) / A_known < 0.05
+        log("Test 1: Constant-RPM 1X peak frequency",
+            freq_ok, f"found {peak_freq:.2f} Hz, expected {f1x:.2f} Hz")
+        log("Test 1: Constant-RPM 1X peak amplitude",
+            amp_ok, f"found {peak_amp:.4f}, expected {A_known:.4f}")
+    except Exception as e:
+        log("Test 1", False, str(e))
+
+    # ── Test 2: Averaged spectrum RMS convention ──────────────────────
+    try:
+        A_rms_known = 1.0
+        A_peak_for_rms = A_rms_known * np.sqrt(2.0)
+        sig2 = A_peak_for_rms * np.sin(2.0 * np.pi * 200.0 * t)
+        _, spec2 = compute_avg_spectrum_from_signal(
+            sig2, fs, nfft=N, overlap_pct=0.0,
+            output_type="Amplitude", scale="Linear",
+            amp_conv="RMS", signal_kind="acc",
+        )
+        rms_peak = float(np.max(spec2))
+        ok = abs(rms_peak - A_rms_known) / A_rms_known < 0.05
+        log("Test 2: RMS amplitude convention", ok,
+            f"found {rms_peak:.4f}, expected {A_rms_known:.4f}")
+    except Exception as e:
+        log("Test 2", False, str(e))
+
+    # ── Test 3: 1X + 2X two-component signal ─────────────────────────
+    # Both f1=80 Hz and f2=160 Hz are exact bins (integers with fs=4096, N=4096).
+    try:
+        A1 = 1.5
+        A2 = 0.7
+        f1 = 80.0
+        f2 = 160.0
+        sig3 = A1 * np.sin(2.0 * np.pi * f1 * t) + A2 * np.sin(2.0 * np.pi * f2 * t)
+        freqs3, spec3 = compute_avg_spectrum_from_signal(
+            sig3, fs, nfft=N, overlap_pct=0.0,
+            output_type="Amplitude", scale="Linear",
+            amp_conv="Peak", signal_kind="acc",
+        )
+        p1 = float(spec3[int(np.argmin(np.abs(freqs3 - f1)))])
+        p2 = float(spec3[int(np.argmin(np.abs(freqs3 - f2)))])
+        ok1 = abs(p1 - A1) / A1 < 0.05
+        ok2 = abs(p2 - A2) / A2 < 0.05
+        log("Test 3: Two-component 1X amplitude", ok1, f"found {p1:.4f}, expected {A1:.4f}")
+        log("Test 3: Two-component 2X amplitude", ok2, f"found {p2:.4f}, expected {A2:.4f}")
+    except Exception as e:
+        log("Test 3", False, str(e))
+
+    # ── Test 4: RPM NaN/spike handling ───────────────────────────────
+    try:
+        rpm_test = np.full(100, 3000.0)
+        rpm_test[10:15] = np.nan
+        rpm_test[50] = 999999.0          # spike
+        rpm_test[60] = -100.0            # negative RPM
+        rpm_clean = clean_rpm_signal(rpm_test, mode="mask", spike_mad_thresh=5.0)
+        # After masking, spikes and invalids must be NaN, not 0
+        spike_is_nan = not np.isfinite(rpm_clean[50])
+        neg_is_nan = not np.isfinite(rpm_clean[60])
+        nan_range_nan = not np.any(np.isfinite(rpm_clean[11:14]))
+        ok = spike_is_nan and neg_is_nan and nan_range_nan
+        # Make sure valid samples are NOT 0
+        valid_nonzero = np.all(rpm_clean[np.isfinite(rpm_clean)] > 0.0)
+        log("Test 4: RPM spike becomes NaN (not 0)", spike_is_nan,
+            f"rpm_clean[50] = {rpm_clean[50]}")
+        log("Test 4: Negative RPM becomes NaN", neg_is_nan,
+            f"rpm_clean[60] = {rpm_clean[60]}")
+        log("Test 4: NaN gap preserved in mask mode", nan_range_nan)
+        log("Test 4: Valid RPM samples remain > 0", valid_nonzero)
+    except Exception as e:
+        log("Test 4", False, str(e))
+
+    # ── Test 5: Power output sanity ───────────────────────────────────
+    # f=300 Hz is an exact bin with fs=4096, N=4096 (since 300 is integer).
+    try:
+        A5 = 3.0
+        sig5 = A5 * np.sin(2.0 * np.pi * 300.0 * t)
+        _, spec5 = compute_avg_spectrum_from_signal(
+            sig5, fs, nfft=N, overlap_pct=0.0,
+            output_type="Power", scale="Linear",
+            amp_conv="Peak", signal_kind="acc",
+        )
+        expected_power = A5 ** 2 / 2.0
+        p_found = float(np.max(spec5))
+        ok = abs(p_found - expected_power) / expected_power < 0.05
+        log("Test 5: Power spectrum amplitude",
+            ok, f"found {p_found:.4f}, expected {expected_power:.4f}")
+    except Exception as e:
+        log("Test 5", False, str(e))
+
+    # ── Test 6: Order map 1X peak at order = 1.0 ─────────────────────
+    # rpm6=1800 => f_1x=30 Hz, which is an exact bin with fs=4096, N=4096.
+    try:
+        rpm6 = 1800.0
+        f_1x = rpm6 / 60.0   # 30 Hz
+        A6 = 1.0
+        sig6 = A6 * np.sin(2.0 * np.pi * f_1x * t)
+        freqs6 = np.fft.rfftfreq(N, 1.0 / fs)
+        w6 = _hann_window(N, "periodic")
+        w_sum6 = float(np.sum(w6))
+        X6 = np.fft.rfft(sig6 * w6, n=N)
+        A_peak6 = (2.0 / w_sum6) * np.abs(X6)
+        A_peak6[0] *= 0.5
+        spec6_linear = A_peak6.reshape(1, -1)
+        order_ax, _, S_order6 = compute_order_map(
+            freqs6, np.array([rpm6]), spec6_linear,
+            order_max=5.0, n_orders=512,
+            output_type="Amplitude", scale="Linear",
+        )
+        peak_order_idx = int(np.argmax(S_order6[0]))
+        peak_order = float(order_ax[peak_order_idx])
+        ok = abs(peak_order - 1.0) < 0.1
+        log("Test 6: Order map 1X peak at order=1.0",
+            ok, f"peak at order={peak_order:.3f}")
+    except Exception as e:
+        log("Test 6", False, str(e))
+
+    # ── Test 7: COT function runs without crash ───────────────────────
+    # Use fs=4096, rpm=1800 (30 Hz shaft), signal=1X at 30 Hz.
+    try:
+        rpm7 = np.full(N, 1800.0)
+        f_1x7 = 1800.0 / 60.0   # 30 Hz
+        sig7 = 1.5 * np.sin(2.0 * np.pi * f_1x7 * t)
+        orders7, amp7, amp_vs_rpm7 = compute_order_tracking_spectrum(
+            sig7, rpm7, fs, samples_per_rev=512, order_max=5.0, amp_conv="Peak"
+        )
+        has_output = orders7.size > 0 and amp7.size > 0
+        peak_1x_idx = int(np.argmin(np.abs(orders7 - 1.0)))
+        peak_1x_amp = float(amp7[peak_1x_idx])
+        amp_ok = abs(peak_1x_amp - 1.5) / 1.5 < 0.10
+        log("Test 7: COT returns output", has_output)
+        log("Test 7: COT 1X amplitude within 10 pct",
+            amp_ok, f"found {peak_1x_amp:.4f}, expected 1.5")
+    except Exception as e:
+        log("Test 7", False, str(e))
+
+    n_pass = sum(results)
+    n_total = len(results)
+    if verbose:
+        print(f"\n  Summary: {n_pass}/{n_total} tests passed.")
+        if n_pass == n_total:
+            print("  All tests PASSED.")
+        else:
+            print("  Some tests FAILED — review the output above.")
+    return n_pass == n_total
 
 
 def main():

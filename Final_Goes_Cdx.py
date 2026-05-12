@@ -2365,7 +2365,31 @@ class WaterfallPlotWidget(QWidget):
         self.btn_add_cursor = QPushButton("Add cursor")
         self.btn_clear_cursors = QPushButton("Clear cursors")
         self.btn_open_3d = QPushButton("Open 3D")
+        self.btn_open_3d.setToolTip(
+            "Open a 3D waterfall view after the 2D waterfall has been computed. "
+            "Useful for presentation/shape inspection; use 2D heatmap for precise reading."
+        )
+        self.btn_open_3d_help = QToolButton()
+        self.btn_open_3d_help.setText("?")
+        self.btn_open_3d_help.setFixedWidth(22)
+        self.btn_open_3d_help.setToolTip("Click for explanation of Open 3D waterfall")
+        self.btn_open_3d_help.clicked.connect(lambda: QMessageBox.information(
+            self, "Open 3D Waterfall — Explanation",
+            "<b>Open 3D waterfall</b><br><br>Opens a standalone 3D view of the computed waterfall. "
+            "It is helpful for presentation and visualizing surface shape, but the 2D heatmap is usually better for exact cursor and color readings.<br><br>"
+            "<b>Tip:</b> use after parameters are finalized; repeated 3D windows can slow iterative tuning."
+        ))
         self.btn_open_2d_standalone = QPushButton("Open 2D Standalone")
+        self.btn_open_2d_help = QToolButton()
+        self.btn_open_2d_help.setText("?")
+        self.btn_open_2d_help.setFixedWidth(22)
+        self.btn_open_2d_help.setToolTip("Click for explanation of Open 2D Standalone")
+        self.btn_open_2d_help.clicked.connect(lambda: QMessageBox.information(
+            self, "Open 2D Standalone — Explanation",
+            "<b>Open 2D Standalone</b><br><br>Opens the waterfall heatmap in a separate Matplotlib window. "
+            "The standalone view inherits the current colormap, color limits, zoom viewport, and order cursors when available.<br><br>"
+            "<b>Use for:</b> publication-style export, comparing views, or keeping a waterfall visible while changing the main GUI."
+        ))
         self.btn_open_2d_standalone.setToolTip(
             "Open waterfall heatmap in a standalone matplotlib window. "
             "Inherits current colormap, color range (vmin/vmax), "
@@ -2430,7 +2454,9 @@ class WaterfallPlotWidget(QWidget):
         topbar.addWidget(self.btn_add_cursor)
         topbar.addWidget(self.btn_clear_cursors)
         topbar.addWidget(self.btn_open_3d)
+        topbar.addWidget(self.btn_open_3d_help)
         topbar.addWidget(self.btn_open_2d_standalone)
+        topbar.addWidget(self.btn_open_2d_help)
         topbar.addSpacing(10)
         topbar.addWidget(self.lbl_order_info, 1)
         topbar.addStretch(1)
@@ -5289,6 +5315,8 @@ class MainWindow(QMainWindow):
         self._active_canvas = None
         self._active_plot_key = None
         self._pending_waterfall_open_3d = False
+        self._waterfall_result_widget = None
+        self._waterfall_result_key = None
         self.custom_color_bands = default_custom_color_bands()
 
         self.btn_open = QPushButton("Open File (.xlsx / .tdms / .csv)")
@@ -5722,10 +5750,15 @@ class MainWindow(QMainWindow):
         row1.addSpacing(12)
         row1.addWidget(QLabel("Signal Type:"))
         row1.addWidget(self.cmb_signal_type, 1)
+        row1.addWidget(self._make_help_button("Signal Type — Explanation", self._help_html("signal_type"), "Signal Type"))
         ctl.addLayout(row1)
 
         ctl.addWidget(self.lbl_wf_hint)
-        ctl.addWidget(self.btn_export_cropped_tdms)
+        row_export = QHBoxLayout()
+        row_export.addWidget(self.btn_export_cropped_tdms)
+        row_export.addWidget(self._make_help_button("Export Cropped TDMS — Explanation", self._help_html("export_tdms"), "Export Cropped TDMS"))
+        row_export.addStretch(1)
+        ctl.addLayout(row_export)
         ctl.addWidget(QLabel("Channel(s) / Column(s):"))
         ctl.addWidget(self.list_channels)
 
@@ -5738,32 +5771,39 @@ class MainWindow(QMainWindow):
         row2 = QHBoxLayout()
         row2.addWidget(QLabel("fs (Hz):"))
         row2.addWidget(self.fs_spin)
+        row2.addWidget(self._make_help_button("Sampling Frequency — Explanation", self._help_html("fs"), "fs"))
         row2.addSpacing(14)
         row2.addWidget(self.chk_skip_first)
         row2.addSpacing(14)
         row2.addWidget(QLabel("Data Source:"))
         row2.addWidget(self.cmb_data_source)
+        row2.addWidget(self._make_help_button("Data Source — Explanation", self._help_html("data_source"), "Data Source"))
         row2.addStretch(1)
         ctl.addLayout(row2)
 
         row_filt = QHBoxLayout()
         row_filt.addWidget(self.chk_filter)
+        row_filt.addWidget(self._make_help_button("Butterworth Filter — Explanation", self._help_html("filter_enable"), "Butterworth filter"))
         row_filt.addSpacing(12)
         row_filt.addWidget(QLabel("Type:"))
         row_filt.addWidget(self.cmb_filter_type)
+        row_filt.addWidget(self._make_help_button("Filter Type — Explanation", self._help_html("filter_type"), "Filter Type"))
         row_filt.addSpacing(8)
         row_filt.addWidget(QLabel("Order:"))
         row_filt.addWidget(self.cmb_filter_order)
+        row_filt.addWidget(self._make_help_button("Filter Order — Explanation", self._help_html("filter_order"), "Filter Order"))
         row_filt.addSpacing(8)
         row_filt.addWidget(QLabel("Cutoff 1 (Hz):"))
         row_filt.addWidget(self.cut1_spin)
         row_filt.addWidget(self.lbl_cut2)
         row_filt.addWidget(self.cut2_spin)
+        row_filt.addWidget(self._make_help_button("Filter Cutoffs — Explanation", self._help_html("cutoffs"), "Cutoff frequencies"))
         row_filt.addStretch(1)
         ctl.addLayout(row_filt)
 
         row3 = QHBoxLayout()
         row3.addWidget(self.chk_crop)
+        row3.addWidget(self._make_help_button("Crop Time Window — Explanation", self._help_html("crop"), "Crop time window"))
         row3.addWidget(QLabel("Start (s):"))
         row3.addWidget(self.t0_spin)
         row3.addWidget(QLabel("End (s):"))
@@ -5778,16 +5818,22 @@ class MainWindow(QMainWindow):
         self.cmb_fourier_method.setVisible(False)
         row_fft.addWidget(QLabel("Buffer Size (NFFT):"))
         row_fft.addWidget(self.cmb_nfft)
+        row_fft.addWidget(self._make_help_button("Buffer Size / NFFT — Explanation", self._help_html("nfft"), "Buffer Size / NFFT"))
         row_fft.addWidget(QLabel("Overlap (%):"))
         row_fft.addWidget(self.ovl_spin)
+        row_fft.addWidget(self._make_help_button("Overlap — Explanation", self._help_html("overlap"), "Overlap"))
         row_fft.addWidget(QLabel("Output:"))
         row_fft.addWidget(self.cmb_out)
+        row_fft.addWidget(self._make_help_button("Output — Explanation", self._help_html("output"), "Output"))
         row_fft.addWidget(QLabel("Scale:"))
         row_fft.addWidget(self.cmb_scale)
+        row_fft.addWidget(self._make_help_button("Scale — Explanation", self._help_html("scale"), "Scale"))
         row_fft.addWidget(QLabel("Amplitude convention:"))
         row_fft.addWidget(self.cmb_amp_conv)
+        row_fft.addWidget(self._make_help_button("Amplitude Conversion — Explanation", self._help_html("amp"), "Amplitude conversion"))
         row_fft.addWidget(QLabel("Window:"))
         row_fft.addWidget(self.cmb_window_kind)
+        row_fft.addWidget(self._make_help_button("Window Type — Explanation", self._help_html("window"), "Window type"))
         row_fft.addStretch(1)
         ctl.addLayout(row_fft)
 
@@ -6145,16 +6191,21 @@ class MainWindow(QMainWindow):
             return self.mini_inner_time_lay
         if k == "avg":
             return self.mini_inner_avg_lay
-        # stft and waterfall both render as 2D color images → Spectrograms
+        if k in ("stft", "spectrogram", "spec", "image"):
+            return self.mini_inner_spec_lay
+        if k == "waterfall":
+            raise RuntimeError("Waterfall states are routed to the Waterfall tab result area, not Plot View mini sections.")
         return self.mini_inner_spec_lay
 
     def _clear_detail_tabs(self):
         for key, widget in list(self._detail_widgets.items()):
+            if widget is getattr(self, "_waterfall_result_widget", None):
+                continue
             idx = self.plot_pages.indexOf(widget)
             if idx >= 0:
                 self.plot_pages.removeTab(idx)
             widget.deleteLater()
-        self._detail_widgets.clear()
+            self._detail_widgets.pop(key, None)
         # Also tear down any open Large tabs from a previous plot batch.
         for key, widget in list(self._large_tab_widgets.items()):
             idx = self.large_tabs.indexOf(widget)
@@ -6214,6 +6265,7 @@ class MainWindow(QMainWindow):
         self._plot_states.clear()
         self._clear_overview_widgets()
         self._clear_detail_tabs()
+        self._clear_waterfall_result()
 
         self.lbl_overview_empty.setVisible(True)
         self._active_canvas = None
@@ -6603,8 +6655,9 @@ class MainWindow(QMainWindow):
             self._set_active_canvas(widget.canvas, widget.plot_key)
 
     def _reflow_overview_grid(self):
-        # Re-distribute mini widgets into the three section columns according
-        # to their plot kind (time / avg / stft+waterfall).
+        # Re-distribute normal mini widgets into the three section columns
+        # according to plot kind (time / avg / stft). Waterfall is explicitly
+        # excluded because it owns a dedicated Waterfall-tab result area.
         for lay in (self.mini_inner_time_lay, self.mini_inner_avg_lay, self.mini_inner_spec_lay):
             self._strip_mini_layout(lay)
 
@@ -6614,6 +6667,8 @@ class MainWindow(QMainWindow):
                 continue
             state = self._plot_states.get(key, {})
             kind = state.get("kind") or self._mini_kinds.get(key, "")
+            if str(kind).strip().lower() == "waterfall":
+                continue
             self._mini_kinds[key] = kind
             lay = self._section_layout_for_kind(kind)
             # Insert before the trailing stretch (last item).
@@ -6754,11 +6809,77 @@ class MainWindow(QMainWindow):
             self._set_active_canvas(widget.canvas, widget.plot_key)
 
     def _make_mini_for_state(self, st):
-        """Factory that picks the correct mini-widget class for a plot state."""
+        """Factory for normal Plot View mini cards. Waterfall is excluded."""
         kind = str(st.get("kind", "")).lower()
         if kind == "waterfall":
-            return WaterfallMiniWidget(st)
+            raise RuntimeError("Waterfall states must not create Plot View mini widgets.")
         return PlotMiniWidget(st)
+
+    def _show_waterfall_result(self, state: dict):
+        """Render a waterfall state in the Waterfall tab's dedicated result area.
+
+        This deliberately leaves the normal Plot View mini columns untouched so
+        existing Time-domain / Averaged Spectrum / Spectrogram results remain
+        available and waterfall never appears in the Spectrograms column.
+        """
+        if state.get("kind") != "waterfall":
+            raise RuntimeError("_show_waterfall_result requires a waterfall state.")
+
+        key = state["key"]
+        self._plot_states[key] = state
+        self._waterfall_result_key = key
+
+        if getattr(self, "_waterfall_result_widget", None) is not None:
+            old = self._waterfall_result_widget
+            try:
+                self._waterfall_result_lay.removeWidget(old)
+                old.setParent(None)
+                old.deleteLater()
+            except Exception:
+                pass
+            self._detail_widgets.pop(getattr(old, "plot_key", key), None)
+            self._waterfall_result_widget = None
+
+        detail = WaterfallDetailWidget(state)
+        detail.activated.connect(self._set_active_canvas)
+        self._connect_canvas_color_signals(detail.canvas)
+        self._draw_state_on_canvas(detail.canvas, state, preserve_limits=False)
+
+        self._waterfall_result_widget = detail
+        if hasattr(self, "lbl_wf_result_empty"):
+            self.lbl_wf_result_empty.setVisible(False)
+        self._waterfall_result_lay.addWidget(detail, 1)
+        self._detail_widgets[key] = detail
+        self._set_active_canvas(detail.canvas, key)
+
+        stats = state.get("stats_text", "")
+        self.lbl_stats.setText(stats)
+        if hasattr(self, "lbl_wf_status"):
+            self.lbl_wf_status.setText(stats or "Waterfall result ready.")
+        self.tabs.setCurrentWidget(self.tab_waterfall)
+
+        if self._pending_waterfall_open_3d:
+            self._pending_waterfall_open_3d = False
+            if hasattr(detail.canvas, "open_3d_window"):
+                detail.canvas.open_3d_window()
+
+    def _clear_waterfall_result(self):
+        widget = getattr(self, "_waterfall_result_widget", None)
+        if widget is not None:
+            try:
+                self._waterfall_result_lay.removeWidget(widget)
+                widget.setParent(None)
+                widget.deleteLater()
+            except Exception:
+                pass
+        key = getattr(self, "_waterfall_result_key", None)
+        if key is not None:
+            self._plot_states.pop(key, None)
+            self._detail_widgets.pop(key, None)
+        self._waterfall_result_widget = None
+        self._waterfall_result_key = None
+        if hasattr(self, "lbl_wf_result_empty"):
+            self.lbl_wf_result_empty.setVisible(True)
 
     def _on_mini_request_open(self, key: str):
         """Dispatch a mini's request_open: clicking the canvas updates the
@@ -6780,12 +6901,22 @@ class MainWindow(QMainWindow):
             self._show_inline_detail(key)
 
     def _on_plot_worker_finished(self, states):
-        self._plot_states = {st["key"]: st for st in states}
+        if states and all(st.get("kind") == "waterfall" for st in states):
+            self._show_waterfall_result(states[0])
+            return
+
+        normal_states = [st for st in states if st.get("kind") != "waterfall"]
+        if len(normal_states) != len(states):
+            self._err("Waterfall results were returned with normal plots; waterfall was kept out of Plot View.")
+        preserved_waterfall = {}
+        if getattr(self, "_waterfall_result_key", None) in self._plot_states:
+            preserved_waterfall[self._waterfall_result_key] = self._plot_states[self._waterfall_result_key]
+        self._plot_states = {**preserved_waterfall, **{st["key"]: st for st in normal_states}}
         self._clear_overview_widgets()
         self._clear_detail_tabs()
 
         all_stats = []
-        for st in states:
+        for st in normal_states:
             w = self._make_mini_for_state(st)
             self._mini_widgets[st["key"]] = w
             self._overview_order.append(st["key"])
@@ -6808,18 +6939,10 @@ class MainWindow(QMainWindow):
         self._reflow_overview_grid()
         self.tabs.setCurrentWidget(self.tab_plot)
 
-        if states:
-            first = states[0]
+        if normal_states:
+            first = normal_states[0]
             # Auto-populate the shared detail area with the first new plot.
             self._show_inline_detail(first["key"])
-            if first.get("kind") == "waterfall":
-                if hasattr(self, "lbl_wf_status"):
-                    self.lbl_wf_status.setText(first.get("stats_text", ""))
-                if self._pending_waterfall_open_3d:
-                    self._pending_waterfall_open_3d = False
-                    if self._inline_detail_widget is not None and \
-                       hasattr(self._inline_detail_widget.canvas, "open_3d_window"):
-                        self._inline_detail_widget.canvas.open_3d_window()
 
     def _on_plot_worker_error(self, msg: str):
         self.lbl_stats.setText("")
@@ -7514,9 +7637,12 @@ class MainWindow(QMainWindow):
   <li><b>Inspect</b> — zoom, pan, click to annotate. Use the Plot View tab for axis/color controls.</li>
   <li><b>Export</b> — use the Export button for PNG/PDF/TDMS output.</li>
 </ol>
+<p><b>Normal Plot View:</b> used only for Time-domain, Averaged Spectrum, and Spectrogram panels.
+One normal Plot request creates those three plot families for the selected channels.</p>
 <p><b>Waterfall workflow:</b> Switch to the <i>Waterfall</i> tab, open your acceleration and RPM files
 (can be the same file or different files), configure NFFT / Overlap / Spectra / Buffers, then click
-<i>Plot Waterfall</i>.</p>""")
+<i>Plot Waterfall</i>. Waterfall has a dedicated <i>Waterfall Result</i> display inside the Waterfall tab and
+<b>does not populate</b> the normal Time-domain / Averaged Spectrum / Spectrogram mini panels.</p>""")
 
         # ── 2. Signal & FFT Parameters ─────────────────────────────────
         _section("2 · Signal &amp; FFT Parameters", """
@@ -7550,6 +7676,12 @@ class MainWindow(QMainWindow):
 
         # ── 3. Waterfall & Order Tracking ──────────────────────────────
         _section("3 · Waterfall &amp; Order Tracking", """
+<p><b>Waterfall Result display:</b> waterfall uses acceleration + RPM and is rendered in its own
+Waterfall tab result area, separate from normal Plot View. A frequency waterfall is
+<b>Frequency vs RPM</b>. This is different from an STFT spectrogram, which is <b>Frequency vs Time</b>.</p>
+<p><b>Order Tracking Filter:</b> not a cursor. It changes the waterfall data by isolating or rejecting
+a selected-order band around <i>f = order × RPM / 60</i>. An order cursor is only a visual guide drawn
+on top of the result.</p>
 <table width="100%" cellspacing="4">
 <tr><td width="28%"><b>Number of Spectra</b></td>
     <td><b>Display density</b> — the minimum number of RPM rows shown in the waterfall after
@@ -7625,8 +7757,9 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
         _section("5 · Best Practices &amp; Warnings", """
 <ul>
   <li><b>Wrong fs</b> shifts the entire frequency axis — always verify fs matches your hardware setting.</li>
-  <li><b>Large Num Spectra</b> makes the plot look smoother but adds no real information beyond the raw frame count.</li>
-  <li><b>Large Num Buffers</b> may hide sharp spectral peaks — use sparingly.</li>
+  <li><b>Large Num Spectra</b> controls display interpolation density only; it makes the plot look smoother but adds no real information beyond the raw frame count.</li>
+  <li><b>Large Num Buffers</b> smooths neighboring frames and may hide sharp spectral peaks — use sparingly.</li>
+  <li><b>STFT vs Waterfall:</b> STFT is Frequency vs Time; Waterfall is Frequency vs RPM and appears only in the dedicated Waterfall Result area.</li>
   <li><b>Too much overlap</b> (e.g. 95 %) creates very many frames but does not improve frequency resolution.</li>
   <li><b>RPM = 0 or NaN in data</b> is treated as an invalid frame and excluded from the waterfall.</li>
   <li><b>RPM spikes</b> can corrupt order analysis — use the spike-rejection option (MAD-based).</li>
@@ -7646,6 +7779,49 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
         kw = text.strip().lower()
         for gb, full_text in self._help_sections:
             gb.setVisible(not kw or kw in full_text)
+
+    def _make_help_button(self, title: str, html: str, topic: str = None) -> QToolButton:
+        btn = QToolButton()
+        btn.setText("?")
+        btn.setFixedWidth(22)
+        btn.setToolTip(f"Click for explanation of {topic or title}")
+        btn.clicked.connect(lambda _=False, t=title, h=html: QMessageBox.information(self, t, h))
+        return btn
+
+    def _help_html(self, key: str) -> str:
+        help_map = {
+            "fs": "<b>Sampling frequency fs</b><br><br>Samples per second in Hz. It sets the frequency axis for FFT, averaged spectra, STFT, and velocity integration. If fs is too high or too low, every frequency feature shifts by the same ratio.<br><br><b>Start with:</b> the acquisition hardware sample rate or file metadata. Verify before interpreting orders or resonances.",
+            "nfft": "<b>Buffer Size / NFFT</b><br><br>Number of samples in each FFT window. Frequency spacing is Δf = fs / NFFT. Larger NFFT gives finer frequency bins but longer time/RPM averaging per frame; smaller NFFT follows transients better but has coarser frequency resolution.<br><br><b>Start with:</b> 4096 or 8192 for many vibration run-up datasets, then adjust from the displayed Δf.",
+            "overlap": "<b>Overlap %</b><br><br>How much adjacent FFT windows overlap. More overlap creates more frames and a smoother-looking STFT/waterfall, but it does not improve true frequency resolution.<br><br><b>Too high:</b> slower processing and highly correlated frames. <b>Start with:</b> 50–67%; use 75–90% only when you need denser display during rapid changes.",
+            "output": "<b>Output: Amplitude vs Power</b><br><br>Amplitude shows one-sided spectral magnitude in physical units using the selected Peak/RMS/P-P convention. Power stores RMS² per bin and averages in the power domain, which is often better for energy comparisons.<br><br><b>Use Amplitude</b> for peak readouts; <b>use Power</b> for energy/noise comparisons.",
+            "scale": "<b>Scale: Linear vs dB</b><br><br>Linear keeps physical values. dB compresses the dynamic range so small components near large peaks are visible. Amplitude dB uses 20·log10(value); Power dB uses 10·log10(value).<br><br><b>Warning:</b> do not compare amplitude-dB and power-dB as if they use the same reference.",
+            "amp": "<b>Amplitude conversion</b><br><br>Peak is the sinusoid amplitude A, RMS is A/√2 for a pure sine, and Peak-to-Peak is 2A. This affects amplitude spectra and waterfall levels when Output is Amplitude.<br><br><b>Start with:</b> RMS for vibration severity comparisons; Peak for component amplitude readouts.",
+            "window": "<b>Window type: Periodic vs Symmetric Hann</b><br><br>Periodic Hann is recommended for FFT/STFT/Welch-style spectral analysis and matches MATLAB hann(N,'periodic') / many analyzer conventions. Symmetric Hann matches numpy.hanning() and some legacy scripts.<br><br><b>Start with:</b> Periodic unless you must reproduce older symmetric-window results.",
+            "data_source": "<b>Data source: Unfiltered vs Filtered</b><br><br>Selects whether normal plotting uses the raw channel or the Butterworth-filtered signal. Filtered is useful for focusing on a band or removing low-frequency drift before spectra.<br><br><b>Warning:</b> filtering changes amplitudes and phase characteristics; document it when exporting plots.",
+            "filter_enable": "<b>Butterworth filter enable</b><br><br>Applies a zero-phase forward/backward Butterworth filter before plotting. Zero-phase avoids time shift but doubles the effective filtering action.<br><br><b>Use when:</b> removing drift, isolating a band, or rejecting unwanted content. Avoid filtering unless it supports the analysis question.",
+            "filter_type": "<b>Filter type</b><br><br>Low-pass keeps content below Cutoff 1; High-pass keeps content above Cutoff 1; Band-pass keeps between Cutoff 1 and Cutoff 2; Band-reject removes that band.<br><br><b>Check:</b> cutoff values must be below Nyquist (fs/2) and ordered correctly for band filters.",
+            "filter_order": "<b>Filter order</b><br><br>Higher order makes a steeper transition around the cutoff, but can increase ringing and edge artifacts. Because the app uses zero-phase filtering, the effective slope is stronger than a one-pass filter.<br><br><b>Start with:</b> 2–4; increase only when the transition band must be sharper.",
+            "cutoffs": "<b>Cutoff 1 / Cutoff 2</b><br><br>Frequency limits in Hz for the Butterworth filter. Single-cutoff filters use Cutoff 1. Band-pass and Band-reject use Cutoff 1 as the lower edge and Cutoff 2 as the upper edge.<br><br><b>Warning:</b> cutoffs at or above Nyquist (fs/2) are invalid and very low cutoffs can require long signals to behave well.",
+            "crop": "<b>Crop time window</b><br><br>Restricts analysis to Start–End seconds before plotting/export. This is useful for steady operating regions or a chosen run-up segment.<br><br><b>Too narrow:</b> may leave too few samples for NFFT or produce unstable low-frequency results. Start with a window that contains several FFT buffers.",
+            "signal_type": "<b>Signal type: Acceleration vs Velocity</b><br><br>Acceleration plots measured vibration in g. Velocity integrates acceleration after high-pass conditioning and displays velocity in mm/s.<br><br><b>Use Acceleration</b> for high-frequency bearing/gear content; <b>use Velocity</b> for many machine-vibration severity standards and lower-frequency motion.",
+            "export_tdms": "<b>Export cropped TDMS</b><br><br>Saves selected channels after the current crop settings, zero-aligning the time axis and preserving useful metadata where possible.<br><br><b>Check before export:</b> fs, selected channels, crop start/end, and whether Skip first sample is intended.",
+            "wf_acc_fs": "<b>Waterfall Acc fs</b><br><br>Sample rate of the acceleration signal. It defines the FFT frequency axis unless you choose to resample acceleration to the RPM timebase.<br><br><b>Start with:</b> the actual accelerometer acquisition rate; wrong values shift all waterfall frequencies and order-filter locations.",
+            "wf_rpm_fs": "<b>Waterfall RPM fs</b><br><br>Sample rate of the RPM/tach signal. The app aligns RPM with acceleration before assigning an RPM to each FFT frame.<br><br><b>Start with:</b> the tach acquisition rate. If RPM is sparse/noisy, use linear interpolation and inspect the stats/status text.",
+            "wf_resample": "<b>Resample mode</b><br><br>Controls which signal is interpolated so acceleration and RPM share a timebase. Resample RPM → Acc timebase usually preserves the vibration waveform and is recommended when acceleration is sampled faster.<br><br><b>Use Trim only</b> only when both files already share fs and timing.",
+            "wf_interp": "<b>Interpolation mode</b><br><br>Linear interpolation is smooth and usually best for RPM because speed changes continuously. Nearest preserves original samples but can create stair-step RPM labels.<br><br><b>Start with:</b> Linear for run-up/coast-down data.",
+            "wf_rpm_label": "<b>RPM label method</b><br><br>Assigns one RPM value to each FFT frame. Center sample is simple, Median rejects spikes, and Window-weighted Hann matches the FFT window weighting.<br><br><b>Start with:</b> Window-weighted (Hanning) for run-up/coast-down data.",
+            "wf_spectra": "<b>Num Spectra</b><br><br>Controls display interpolation density: the minimum number of RPM rows in the waterfall image. It makes the display smoother but does not increase physical resolution beyond the raw FFT frame count.<br><br><b>Start with:</b> near the raw frame count shown in the stats text.",
+            "wf_buffers": "<b>Num Buffers</b><br><br>Sliding average width across neighboring FFT frames before display. Larger values reduce random noise but blur narrow peaks and fast speed transitions.<br><br><b>Start with:</b> 1 (no smoothing), then 3–5 only if the waterfall is very noisy.",
+            "wf_otf_enable": "<b>Order Tracking Filter enable</b><br><br>Enables a true filter around the selected order trajectory f = order × RPM / 60. This changes the displayed waterfall data; it is not merely a cursor overlay.<br><br><b>Use when:</b> isolating one order family or rejecting it with band-stop mode.",
+            "wf_target_order": "<b>Target order k</b><br><br>The shaft order to isolate or reject. For example 1.0x follows f = RPM/60, 2.0x follows twice running speed.<br><br><b>Start with:</b> 1.0 for running speed, then known gear/blade/bearing orders as needed.",
+            "wf_half_bw": "<b>Half-bandwidth</b><br><br>Width on either side of the target order trajectory. Too narrow can miss smeared or speed-varying energy; too wide includes neighboring orders/noise.<br><br><b>Start with:</b> a small order bandwidth (such as 0.05–0.10 order) or a Hz width matched to expected speed variation.",
+            "wf_bw_unit": "<b>Bandwidth unit: Order vs Hz</b><br><br>Order bandwidth scales with RPM, keeping a proportional band around k×RPM/60. Hz bandwidth stays fixed in frequency regardless of RPM.<br><br><b>Use Order</b> for rotating-order phenomena; <b>use Hz</b> for fixed-frequency resonances.",
+            "wf_otf_type": "<b>Band-pass vs Band-stop</b><br><br>Band-pass keeps only the selected-order neighborhood. Band-stop removes that order neighborhood while leaving other content visible.<br><br><b>Warning:</b> either mode changes the data, unlike visual order cursors.",
+            "wf_trace": "<b>Show extracted trace vs RPM</b><br><br>Displays the selected-order amplitude trend in the lower waterfall panel. This helps quantify how an order grows or decays with speed.<br><br><b>Interpretation:</b> the trace follows the configured order/band settings and should be compared with the heatmap context.",
+            "wf_open_3d": "<b>Open 3D waterfall</b><br><br>Automatically opens a 3D standalone waterfall view after computation. Useful for presentations and shape inspection, but the 2D heatmap is usually better for precise cursor reading.<br><br><b>Tip:</b> leave off during iterative parameter tuning.",
+            "wf_open_2d": "<b>Open 2D Standalone</b><br><br>Opens the waterfall heatmap in a separate Matplotlib window using the current colormap, color limits, zoom viewport, and order cursors when available.<br><br><b>Use for:</b> publication-style export or comparing a standalone view with the main GUI.",
+        }
+        return help_map[key]
 
     def _show_num_spectra_help(self):
         QMessageBox.information(
@@ -7760,10 +7936,9 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
             "True resolution depends on the number of raw FFT frames (hop-size driven).\n"
             "Click the ? button for a full explanation."
         )
-        self.btn_wf_num_spectra_help = QToolButton()
-        self.btn_wf_num_spectra_help.setText("?")
-        self.btn_wf_num_spectra_help.setToolTip("Click for explanation of Number of Spectra")
-        self.btn_wf_num_spectra_help.clicked.connect(self._show_num_spectra_help)
+        self.btn_wf_num_spectra_help = self._make_help_button(
+            "Number of Spectra — Explanation", self._help_html("wf_spectra"), "Number of Spectra"
+        )
 
         self.wf_num_buffers_spin = QSpinBox()
         self.wf_num_buffers_spin.setRange(1, 500)
@@ -7774,10 +7949,9 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
             "RPM-speed transitions. Keep ≤ 3–5 for typical run-up data.\n"
             "Click the ? button for a full explanation."
         )
-        self.btn_wf_num_buffers_help = QToolButton()
-        self.btn_wf_num_buffers_help.setText("?")
-        self.btn_wf_num_buffers_help.setToolTip("Click for explanation of Number of Buffers")
-        self.btn_wf_num_buffers_help.clicked.connect(self._show_num_buffers_help)
+        self.btn_wf_num_buffers_help = self._make_help_button(
+            "Number of Buffers — Explanation", self._help_html("wf_buffers"), "Number of Buffers"
+        )
 
         self.wf_out = QComboBox()
         self.wf_out.addItems(["Amplitude", "Power"])
@@ -8001,9 +8175,11 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
         row_wf_1 = QHBoxLayout()
         row_wf_1.addWidget(QLabel("Acc fs (Hz):"))
         row_wf_1.addWidget(self.wf_fs_spin)
+        row_wf_1.addWidget(self._make_help_button("Waterfall Acc fs — Explanation", self._help_html("wf_acc_fs"), "Acc fs"))
         row_wf_1.addSpacing(14)
         row_wf_1.addWidget(QLabel("RPM fs (Hz):"))
         row_wf_1.addWidget(self.wf_rpm_fs_spin)
+        row_wf_1.addWidget(self._make_help_button("Waterfall RPM fs — Explanation", self._help_html("wf_rpm_fs"), "RPM fs"))
         row_wf_1.addSpacing(14)
         row_wf_1.addWidget(self.chk_wf_skip_first)
         row_wf_1.addStretch(1)
@@ -8011,6 +8187,7 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
 
         row_wf_2 = QHBoxLayout()
         row_wf_2.addWidget(self.chk_wf_crop)
+        row_wf_2.addWidget(self._make_help_button("Waterfall Crop Time Window — Explanation", self._help_html("crop"), "Waterfall crop time window"))
         row_wf_2.addWidget(QLabel("Start (s):"))
         row_wf_2.addWidget(self.wf_t0_spin)
         row_wf_2.addWidget(QLabel("End (s):"))
@@ -8021,26 +8198,34 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
         row_wf_align = QHBoxLayout()
         row_wf_align.addWidget(QLabel("Resample mode:"))
         row_wf_align.addWidget(self.cmb_wf_resample_mode)
+        row_wf_align.addWidget(self._make_help_button("Resample Mode — Explanation", self._help_html("wf_resample"), "Resample mode"))
         row_wf_align.addSpacing(12)
         row_wf_align.addWidget(QLabel("Interpolation:"))
         row_wf_align.addWidget(self.cmb_wf_interp)
+        row_wf_align.addWidget(self._make_help_button("Interpolation Mode — Explanation", self._help_html("wf_interp"), "Interpolation mode"))
         row_wf_align.addSpacing(12)
         row_wf_align.addWidget(QLabel("RPM label:"))
         row_wf_align.addWidget(self.cmb_wf_rpm_label_method)
+        row_wf_align.addWidget(self._make_help_button("RPM Label Method — Explanation", self._help_html("wf_rpm_label"), "RPM label method"))
         row_wf_align.addStretch(1)
         lay.addLayout(row_wf_align)
 
         row_wf_3 = QHBoxLayout()
         row_wf_3.addWidget(QLabel("Buffer Size (NFFT):"))
         row_wf_3.addWidget(self.wf_nfft)
+        row_wf_3.addWidget(self._make_help_button("Waterfall NFFT — Explanation", self._help_html("nfft"), "Waterfall NFFT"))
         row_wf_3.addWidget(QLabel("Overlap (%):"))
         row_wf_3.addWidget(self.wf_ovl_spin)
+        row_wf_3.addWidget(self._make_help_button("Waterfall Overlap — Explanation", self._help_html("overlap"), "Waterfall Overlap"))
         row_wf_3.addWidget(QLabel("Output:"))
         row_wf_3.addWidget(self.wf_out)
+        row_wf_3.addWidget(self._make_help_button("Waterfall Output — Explanation", self._help_html("output"), "Waterfall Output"))
         row_wf_3.addWidget(QLabel("Scale:"))
         row_wf_3.addWidget(self.wf_scale)
+        row_wf_3.addWidget(self._make_help_button("Waterfall Scale — Explanation", self._help_html("scale"), "Waterfall Scale"))
         row_wf_3.addWidget(QLabel("Amplitude convention:"))
         row_wf_3.addWidget(self.wf_amp_conv)
+        row_wf_3.addWidget(self._make_help_button("Waterfall Amplitude Conversion — Explanation", self._help_html("amp"), "Waterfall Amplitude conversion"))
         row_wf_3.addWidget(QLabel("Num Spectra:"))
         row_wf_3.addWidget(self.wf_num_spectra_spin)
         row_wf_3.addWidget(self.btn_wf_num_spectra_help)
@@ -8052,17 +8237,21 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
 
         row_wf_4 = QHBoxLayout()
         row_wf_4.addWidget(self.chk_wf_filter)
+        row_wf_4.addWidget(self._make_help_button("Waterfall Butterworth Filter — Explanation", self._help_html("filter_enable"), "Waterfall Butterworth filter"))
         row_wf_4.addSpacing(12)
         row_wf_4.addWidget(QLabel("Type:"))
         row_wf_4.addWidget(self.cmb_wf_filter_type)
+        row_wf_4.addWidget(self._make_help_button("Waterfall Filter Type — Explanation", self._help_html("filter_type"), "Waterfall Filter Type"))
         row_wf_4.addSpacing(8)
         row_wf_4.addWidget(QLabel("Order:"))
         row_wf_4.addWidget(self.cmb_wf_filter_order)
+        row_wf_4.addWidget(self._make_help_button("Waterfall Filter Order — Explanation", self._help_html("filter_order"), "Waterfall Filter Order"))
         row_wf_4.addSpacing(8)
         row_wf_4.addWidget(QLabel("Cutoff 1 (Hz):"))
         row_wf_4.addWidget(self.wf_cut1_spin)
         row_wf_4.addWidget(self.lbl_wf_cut2)
         row_wf_4.addWidget(self.wf_cut2_spin)
+        row_wf_4.addWidget(self._make_help_button("Waterfall Filter Cutoffs — Explanation", self._help_html("cutoffs"), "Waterfall cutoffs"))
         row_wf_4.addStretch(1)
         lay.addLayout(row_wf_4)
 
@@ -8071,6 +8260,7 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
         row_wf_5.addWidget(self.cmb_wf_filter_target)
         row_wf_5.addSpacing(12)
         row_wf_5.addWidget(self.chk_wf_open_3d)
+        row_wf_5.addWidget(self._make_help_button("Open 3D Waterfall — Explanation", self._help_html("wf_open_3d"), "Open 3D waterfall"))
         row_wf_5.addStretch(1)
         row_wf_5.addWidget(self.btn_wf_plot)
         lay.addLayout(row_wf_5)
@@ -8092,24 +8282,45 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
         # Order Tracking Filter row — the only order-related UI now visible.
         row_wf_otf = QHBoxLayout()
         row_wf_otf.addWidget(self.chk_wf_otf)
+        row_wf_otf.addWidget(self._make_help_button("Order Tracking Filter — Explanation", self._help_html("wf_otf_enable"), "Order Tracking Filter"))
         row_wf_otf.addSpacing(10)
         row_wf_otf.addWidget(QLabel("Target order (k):"))
         row_wf_otf.addWidget(self.wf_otf_order_spin)
+        row_wf_otf.addWidget(self._make_help_button("Target Order — Explanation", self._help_html("wf_target_order"), "Target order"))
         row_wf_otf.addWidget(QLabel("Half-BW:"))
         row_wf_otf.addWidget(self.wf_otf_bw_spin)
+        row_wf_otf.addWidget(self._make_help_button("Half-Bandwidth — Explanation", self._help_html("wf_half_bw"), "Half-bandwidth"))
         row_wf_otf.addWidget(self.cmb_wf_otf_bw_unit)
+        row_wf_otf.addWidget(self._make_help_button("Bandwidth Unit — Explanation", self._help_html("wf_bw_unit"), "Bandwidth unit"))
         row_wf_otf.addSpacing(8)
         row_wf_otf.addWidget(QLabel("Type:"))
         row_wf_otf.addWidget(self.cmb_wf_otf_type)
+        row_wf_otf.addWidget(self._make_help_button("Order Filter Type — Explanation", self._help_html("wf_otf_type"), "Band-pass vs Band-stop"))
         row_wf_otf.addWidget(QLabel("Filter order:"))
         row_wf_otf.addWidget(self.wf_otf_filter_order_spin)
+        row_wf_otf.addWidget(self._make_help_button("Order Filter Order — Explanation", self._help_html("filter_order"), "Order Tracking Filter order"))
         row_wf_otf.addSpacing(8)
         row_wf_otf.addWidget(self.chk_wf_otf_trace)
+        row_wf_otf.addWidget(self._make_help_button("Extracted Trace — Explanation", self._help_html("wf_trace"), "Show extracted trace vs RPM"))
         row_wf_otf.addStretch(1)
         lay.addLayout(row_wf_otf)
 
         lay.addWidget(self.lbl_wf_status)
-        lay.addStretch(1)
+
+        self.wf_result_group = QGroupBox("Waterfall Result")
+        self.wf_result_group.setStyleSheet(
+            "QGroupBox { font-weight: bold; border: 1px solid #999;"
+            " border-radius: 4px; margin-top: 8px; padding: 6px; }"
+            "QGroupBox::title { subcontrol-origin: margin; left: 8px; }"
+        )
+        self._waterfall_result_lay = QVBoxLayout(self.wf_result_group)
+        self.lbl_wf_result_empty = QLabel(
+            "No waterfall result yet. Configure acceleration/RPM sources above, then click Plot Waterfall."
+        )
+        self.lbl_wf_result_empty.setAlignment(Qt.AlignCenter)
+        self.lbl_wf_result_empty.setStyleSheet("color: #666;")
+        self._waterfall_result_lay.addWidget(self.lbl_wf_result_empty, 1)
+        lay.addWidget(self.wf_result_group, 1)
 
         self.btn_wf_acc_open.clicked.connect(lambda: self._open_waterfall_source("acc"))
         self.btn_wf_rpm_open.clicked.connect(lambda: self._open_waterfall_source("rpm"))

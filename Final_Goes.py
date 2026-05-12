@@ -1371,7 +1371,15 @@ class InteractivePlotWidget(QWidget):
         self._plot_item.setLabel("bottom", state.get("xlabel", ""))
         self._plot_item.setLabel("left", state.get("ylabel", ""))
 
-        if state["kind"] in ("time", "avg"):
+        kind = str(state.get("kind", "")).lower()
+        if kind == "waterfall":
+            raise RuntimeError(
+                "Waterfall states must be rendered with WaterfallPlotWidget, "
+                "not InteractivePlotWidget. "
+                "Use WaterfallMiniWidget / WaterfallDetailWidget for waterfall plots."
+            )
+
+        if kind in ("time", "avg"):
             self._draw_line_state(state)
         else:
             self._draw_image_state(state, color_cfg or {})
@@ -1434,6 +1442,14 @@ class InteractivePlotWidget(QWidget):
             self._set_home_range(0.0, 1.0, -1.0, 1.0)
 
     def _draw_image_state(self, state: dict, color_cfg: dict):
+        missing = [k for k in ("times", "freqs", "S") if k not in state]
+        if missing:
+            raise RuntimeError(
+                f"InteractivePlotWidget._draw_image_state requires keys "
+                f"{missing} in the plot state — got keys {list(state.keys())}. "
+                f"Hint: waterfall states (kind='waterfall') must be rendered "
+                f"with WaterfallPlotWidget instead."
+            )
         times = np.asarray(state["times"], dtype=np.float64)
         freqs = np.asarray(state["freqs"], dtype=np.float64)
         S = np.asarray(state["S"], dtype=np.float64)
@@ -2516,13 +2532,14 @@ class WaterfallPlotWidget(QWidget):
             elif current_shape and len(current_shape) >= 2:
                 ncols = max(int(current_shape[1]), 1)
 
-            print(
-                f"[{tag}] x=({xr[0]:.3f},{xr[1]:.3f}) w={xw:.3f} | "
-                f"y=({yr[0]:.3f},{yr[1]:.3f}) h={yw:.3f} | "
-                f"current_S={current_shape} | display_S={disp_shape} | "
-                f"full_S={full_shape} | analysis_S={analysis_shape} | "
-                f"px_per_freq_bin~{xw / float(ncols):.6f}"
-            )
+            if DEBUG:
+                print(
+                    f"[{tag}] x=({xr[0]:.3f},{xr[1]:.3f}) w={xw:.3f} | "
+                    f"y=({yr[0]:.3f},{yr[1]:.3f}) h={yw:.3f} | "
+                    f"current_S={current_shape} | display_S={disp_shape} | "
+                    f"full_S={full_shape} | analysis_S={analysis_shape} | "
+                    f"px_per_freq_bin~{xw / float(ncols):.6f}"
+                )
         except Exception as e:
             if DEBUG:
                 print(f"[{tag}] debug failed: {e}")
@@ -4015,6 +4032,63 @@ class WaterfallDetailWidget(QWidget):
         self.activated.emit(self.canvas, self.plot_key)
 
 
+class WaterfallMiniWidget(QFrame):
+    """Mini preview card for waterfall states.
+
+    Mirrors the public API of PlotMiniWidget (same signals, same buttons) but
+    its canvas is a WaterfallPlotWidget(mini=True) so that waterfall state
+    dicts — which carry rpms/frame_rpms instead of times — are rendered with
+    the correct widget.  Required because feeding a waterfall state into
+    InteractivePlotWidget.set_state crashes with KeyError: 'times'.
+    """
+    request_open = pyqtSignal(str)
+    request_close = pyqtSignal(str)
+    activated = pyqtSignal(object, str)
+
+    def __init__(self, state: dict):
+        super().__init__()
+        self.state = state
+        self.plot_key = state["key"]
+
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setFrameShadow(QFrame.Raised)
+
+        self.lbl = QLabel(state.get("short_title", self.plot_key))
+        self.lbl.setStyleSheet("font-weight: bold;")
+
+        self.btn_open = QPushButton("Open Large")
+        self.btn_close = QPushButton("Close")
+        self.btn_open.setFixedWidth(95)
+        self.btn_close.setFixedWidth(70)
+
+        self.canvas = WaterfallPlotWidget(mini=True)
+        self.canvas.setMinimumHeight(220)
+
+        top = QHBoxLayout()
+        top.addWidget(self.lbl, 1)
+        top.addWidget(self.btn_open)
+        top.addWidget(self.btn_close)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.addLayout(top)
+        lay.addWidget(self.canvas)
+
+        self.btn_open.clicked.connect(lambda: self.request_open.emit(self.plot_key))
+        self.btn_close.clicked.connect(lambda: self.request_close.emit(self.plot_key))
+        self.canvas.clicked.connect(self._on_canvas_clicked)
+
+    def _on_canvas_clicked(self):
+        self.activated.emit(self.canvas, self.plot_key)
+        self.request_open.emit(self.plot_key)
+
+    def set_selected(self, selected: bool):
+        if selected:
+            self.setStyleSheet("QFrame { border: 2px solid #D71920; }")
+        else:
+            self.setStyleSheet("")
+
+
 class FileOpenWorker(QObject):
     finished = pyqtSignal(object)
     error = pyqtSignal(str)
@@ -5090,52 +5164,85 @@ class PlotWorker(QObject):
 
             nfft = int(self.cfg["nfft"])
             overlap_pct = float(self.cfg["overlap_pct"])
-            out_type = self.cfg["out_type"]
-            scale = self.cfg["scale"]
             method = self.cfg["method"]
-            _, unit_lbl = self._amp_conv_factor_label(signal_kind)
 
-            if method == "Averaged Spectrum":
-                freqs, spec = self._compute_avg_spectrum(y, fs, nfft, overlap_pct, out_type, scale, signal_kind)
-                ylabel = build_spectrum_ylabel(out_type, scale, unit_lbl)
+            # Resolve independent AVG / STFT settings (fall back to globals).
+            avg_override = bool(self.cfg.get("avg_override", False))
+            stft_override = bool(self.cfg.get("stft_override", False))
+            avg_out = self.cfg.get("avg_out_type", self.cfg["out_type"]) if avg_override else self.cfg["out_type"]
+            avg_scale = self.cfg.get("avg_scale", self.cfg["scale"]) if avg_override else self.cfg["scale"]
+            avg_amp_conv = self.cfg.get("avg_amp_conv", self.cfg["amp_conv"]) if avg_override else self.cfg["amp_conv"]
+            stft_out = self.cfg.get("stft_out_type", self.cfg["out_type"]) if stft_override else self.cfg["out_type"]
+            stft_scale = self.cfg.get("stft_scale", self.cfg["scale"]) if stft_override else self.cfg["scale"]
+            stft_amp_conv = self.cfg.get("stft_amp_conv", self.cfg["amp_conv"]) if stft_override else self.cfg["amp_conv"]
 
+            wants_avg = method in ("Averaged Spectrum", "Both (Averaged + STFT)")
+            wants_stft = method in ("STFT (Spectrogram)", "Both (Averaged + STFT)")
+
+            if wants_avg:
+                # Temporarily swap amp_conv into cfg so existing helpers pick up
+                # the AVG-specific convention; restore after.
+                _saved_amp = self.cfg.get("amp_conv")
+                self.cfg["amp_conv"] = avg_amp_conv
+                try:
+                    freqs_a, spec_a = self._compute_avg_spectrum(
+                        y, fs, nfft, overlap_pct, avg_out, avg_scale, signal_kind
+                    )
+                finally:
+                    self.cfg["amp_conv"] = _saved_amp
+                _, unit_lbl_a = get_amp_conv_factor_label(avg_amp_conv, signal_kind)
+                ylabel_a = build_spectrum_ylabel(avg_out, avg_scale, unit_lbl_a)
                 states.append({
-                    "key": key,
+                    "key": f"avg|{key}",
                     "kind": "avg",
                     "name": nm,
                     "short_title": short_title,
-                    "title": f"{file_base} | {group_or_sheet} | Averaged Spectrum ({signal_name}){proc_title} | {nm} | NFFT={nfft}, Overlap={overlap_pct:.1f}% | {out_type} ({scale}) | {unit_lbl}",
+                    "title": (
+                        f"{file_base} | {group_or_sheet} | Averaged Spectrum "
+                        f"({signal_name}){proc_title} | {nm} | NFFT={nfft}, "
+                        f"Overlap={overlap_pct:.1f}% | {avg_out} ({avg_scale}) | {unit_lbl_a}"
+                    ),
                     "xlabel": "Frequency (Hz)",
-                    "ylabel": ylabel,
+                    "ylabel": ylabel_a,
                     "grid": True,
-                    "series": [{"x": freqs, "y": spec, "label": nm}],
+                    "series": [{"x": freqs_a, "y": spec_a, "label": nm}],
                     "stats_text": "",
                 })
-                continue
 
-            freqs, times, S = self._compute_stft(y, fs, nfft, overlap_pct, out_type, scale, signal_kind)
-            if crop:
-                times = times + t0
-
-            colorbar_label = build_spectrum_ylabel(out_type, scale, unit_lbl)
-
-            states.append({
-                "key": key,
-                "kind": "stft",
-                "name": nm,
-                "short_title": short_title,
-                "title": f"{file_base} | {group_or_sheet} | STFT Spectrogram ({signal_name}){proc_title} | {nm} | NFFT={nfft}, Overlap={overlap_pct:.1f}% | {out_type} ({scale}) | {unit_lbl}",
-                "xlabel": "Time (s)",
-                "ylabel": "Frequency (Hz)",
-                "freqs": freqs,
-                "times": times,
-                "S": S,
-                "out_type": out_type,
-                "scale": scale,
-                "unit_lbl": unit_lbl,
-                "colorbar_label": colorbar_label,
-                "stats_text": "",
-            })
+            if wants_stft:
+                _saved_amp = self.cfg.get("amp_conv")
+                self.cfg["amp_conv"] = stft_amp_conv
+                try:
+                    freqs_s, times_s, S = self._compute_stft(
+                        y, fs, nfft, overlap_pct, stft_out, stft_scale, signal_kind
+                    )
+                finally:
+                    self.cfg["amp_conv"] = _saved_amp
+                if crop:
+                    times_s = times_s + t0
+                _, unit_lbl_s = get_amp_conv_factor_label(stft_amp_conv, signal_kind)
+                colorbar_label = build_spectrum_ylabel(stft_out, stft_scale, unit_lbl_s)
+                states.append({
+                    "key": f"stft|{key}",
+                    "kind": "stft",
+                    "name": nm,
+                    "short_title": short_title,
+                    "title": (
+                        f"{file_base} | {group_or_sheet} | STFT Spectrogram "
+                        f"({signal_name}){proc_title} | {nm} | NFFT={nfft}, "
+                        f"Overlap={overlap_pct:.1f}% | {stft_out} ({stft_scale}) | {unit_lbl_s}"
+                    ),
+                    "xlabel": "Time (s)",
+                    "ylabel": "Frequency (Hz)",
+                    "freqs": freqs_s,
+                    "times": times_s,
+                    "S": S,
+                    "out_type": stft_out,
+                    "scale": stft_scale,
+                    "unit_lbl": unit_lbl_s,
+                    "colorbar_label": colorbar_label,
+                    "stats_text": "",
+                })
 
         if not states:
             raise RuntimeError("No data left to plot after preprocessing.")
@@ -5231,7 +5338,54 @@ class MainWindow(QMainWindow):
         ])
 
         self.cmb_fourier_method = QComboBox()
-        self.cmb_fourier_method.addItems(["Averaged Spectrum", "STFT (Spectrogram)"])
+        self.cmb_fourier_method.addItems([
+            "Averaged Spectrum",
+            "STFT (Spectrogram)",
+            "Both (Averaged + STFT)",
+        ])
+
+        # Independent AVG settings — used when the worker builds an averaged
+        # spectrum state.  These default to the global Output/Scale/Amplitude
+        # combos but can be overridden via the "AVG overrides" group below.
+        self.chk_avg_override = QCheckBox("AVG overrides")
+        self.chk_avg_override.setToolTip(
+            "When checked, the Averaged Spectrum uses its own Output/Scale/Convention\n"
+            "instead of the global FFT settings. Lets you have Avg=Linear while STFT=dB."
+        )
+        self.cmb_avg_out = QComboBox()
+        self.cmb_avg_out.addItems(["Amplitude", "Power"])
+        self.cmb_avg_scale = QComboBox()
+        self.cmb_avg_scale.addItems(["Linear", "dB"])
+        self.cmb_avg_amp_conv = QComboBox()
+        self.cmb_avg_amp_conv.addItems(["Peak", "RMS", "Peak-to-Peak"])
+        self.cmb_avg_amp_conv.setCurrentText("RMS")
+        for _w in (self.cmb_avg_out, self.cmb_avg_scale, self.cmb_avg_amp_conv):
+            _w.setEnabled(False)
+        self.chk_avg_override.toggled.connect(
+            lambda on: [w.setEnabled(on) for w in
+                        (self.cmb_avg_out, self.cmb_avg_scale, self.cmb_avg_amp_conv)]
+        )
+
+        # Independent STFT settings.
+        self.chk_stft_override = QCheckBox("STFT overrides")
+        self.chk_stft_override.setToolTip(
+            "When checked, the STFT/Spectrogram uses its own Output/Scale/Convention\n"
+            "instead of the global FFT settings. Lets you have STFT=dB while Avg=Linear."
+        )
+        self.cmb_stft_out = QComboBox()
+        self.cmb_stft_out.addItems(["Amplitude", "Power"])
+        self.cmb_stft_scale = QComboBox()
+        self.cmb_stft_scale.addItems(["Linear", "dB"])
+        self.cmb_stft_scale.setCurrentText("dB")
+        self.cmb_stft_amp_conv = QComboBox()
+        self.cmb_stft_amp_conv.addItems(["Peak", "RMS", "Peak-to-Peak"])
+        self.cmb_stft_amp_conv.setCurrentText("RMS")
+        for _w in (self.cmb_stft_out, self.cmb_stft_scale, self.cmb_stft_amp_conv):
+            _w.setEnabled(False)
+        self.chk_stft_override.toggled.connect(
+            lambda on: [w.setEnabled(on) for w in
+                        (self.cmb_stft_out, self.cmb_stft_scale, self.cmb_stft_amp_conv)]
+        )
 
         self.cmb_nfft = QComboBox()
         self.cmb_nfft.addItems([str(x) for x in [256, 512, 1024, 2048, 4096, 8192, 16384, 32768]])
@@ -5428,7 +5582,8 @@ class MainWindow(QMainWindow):
         mini_row_lay.addWidget(self.mini_col_avg, 1)
         mini_row_lay.addWidget(self.mini_col_spec, 1)
 
-        # --- Inline detail area (bottom half) ------------------------------
+        # --- Shared inline detail area --------------------------------------
+        # Stays on the "Selected" tab; updates when a mini plot is clicked.
         self.inline_detail_holder = QWidget()
         inline_lay = QVBoxLayout(self.inline_detail_holder)
         inline_lay.setContentsMargins(0, 4, 0, 0)
@@ -5442,14 +5597,28 @@ class MainWindow(QMainWindow):
         self._inline_detail_lay = inline_lay
         self._inline_detail_widget = None
 
-        # The Overview tab body uses a vertical splitter so the user can adjust
-        # how much room minis vs. the detail get.
+        # --- Large-tabs area (Open Large opens new closable tab here) -------
+        self.large_tabs = QTabWidget()
+        self.large_tabs.setTabsClosable(True)
+        self.large_tabs.setMovable(True)
+        self.large_tabs.setDocumentMode(True)
+        self.large_tabs.tabCloseRequested.connect(self._on_large_tab_close)
+        self.large_tabs.currentChanged.connect(self._on_large_tab_changed)
+        # Until the user opens at least one Large tab, keep the tab widget
+        # collapsed via setVisible(False).  The first addTab will show it.
+        self.large_tabs.setVisible(False)
+        self._large_tab_widgets = {}
+
+        # The Plot View tab body uses a vertical splitter so the user can
+        # adjust how much room minis vs. detail vs. large-tabs get.
         from PyQt5.QtWidgets import QSplitter
         self.plot_view_splitter = QSplitter(Qt.Vertical)
         self.plot_view_splitter.addWidget(mini_row_widget)
         self.plot_view_splitter.addWidget(self.inline_detail_holder)
+        self.plot_view_splitter.addWidget(self.large_tabs)
         self.plot_view_splitter.setStretchFactor(0, 1)
         self.plot_view_splitter.setStretchFactor(1, 2)
+        self.plot_view_splitter.setStretchFactor(2, 2)
 
         self.lbl_overview_empty = QLabel("No plots yet.")
         self.lbl_overview_empty.setStyleSheet("color: #666;")
@@ -5577,6 +5746,32 @@ class MainWindow(QMainWindow):
         row_fft.addStretch(1)
         ctl.addLayout(row_fft)
 
+        # Independent AVG / STFT overrides — let the user set, e.g.,
+        # Avg = Linear and STFT = dB at the same time.
+        row_avg_over = QHBoxLayout()
+        row_avg_over.addWidget(self.chk_avg_override)
+        row_avg_over.addSpacing(6)
+        row_avg_over.addWidget(QLabel("AVG Output:"))
+        row_avg_over.addWidget(self.cmb_avg_out)
+        row_avg_over.addWidget(QLabel("Scale:"))
+        row_avg_over.addWidget(self.cmb_avg_scale)
+        row_avg_over.addWidget(QLabel("Convention:"))
+        row_avg_over.addWidget(self.cmb_avg_amp_conv)
+        row_avg_over.addStretch(1)
+        ctl.addLayout(row_avg_over)
+
+        row_stft_over = QHBoxLayout()
+        row_stft_over.addWidget(self.chk_stft_override)
+        row_stft_over.addSpacing(6)
+        row_stft_over.addWidget(QLabel("STFT Output:"))
+        row_stft_over.addWidget(self.cmb_stft_out)
+        row_stft_over.addWidget(QLabel("Scale:"))
+        row_stft_over.addWidget(self.cmb_stft_scale)
+        row_stft_over.addWidget(QLabel("Convention:"))
+        row_stft_over.addWidget(self.cmb_stft_amp_conv)
+        row_stft_over.addStretch(1)
+        ctl.addLayout(row_stft_over)
+
         ctl.addWidget(self.lbl_fft_info)
         ctl.addWidget(self.lbl_stats)
         ctl.addStretch(1)
@@ -5585,17 +5780,35 @@ class MainWindow(QMainWindow):
         self._build_help_tab_ui()
 
         ptab = QVBoxLayout(self.tab_plot)
+        ptab.setContentsMargins(6, 6, 6, 6)
+        ptab.setSpacing(4)
 
+        # Clean detail-area toolbar — only zoom / reset / export, as requested.
+        # Axis labels, spectrogram colormap, vmin/vmax, "Apply Plot View" are
+        # moved into the Advanced Settings dialog (btn_plot_advanced below).
         row_nav = QHBoxLayout()
+        row_nav.addWidget(self.btn_rect_zoom)
         row_nav.addWidget(self.btn_zoom_in)
         row_nav.addWidget(self.btn_zoom_out)
         row_nav.addWidget(self.btn_reset_view)
-        row_nav.addWidget(self.btn_rect_zoom)
         row_nav.addSpacing(12)
-        row_nav.addWidget(self.btn_apply_plot_view)
         row_nav.addWidget(self.btn_export_plot)
         row_nav.addStretch(1)
+        self.btn_plot_advanced = QPushButton("Advanced Settings…")
+        self.btn_plot_advanced.setToolTip(
+            "Open advanced display settings: axis labels, spectrogram colormap, "
+            "color range, dynamic range."
+        )
+        row_nav.addWidget(self.btn_plot_advanced)
         ptab.addLayout(row_nav)
+
+        # The previously top-mounted axis / spectrogram / color-range rows live
+        # in a hidden auxiliary widget so signals/handlers still work; they are
+        # also packed inside the Advanced Settings dialog.
+        self._plot_view_aux_widget = QWidget()
+        self._plot_view_aux_widget.setVisible(False)
+        aux_lay = QVBoxLayout(self._plot_view_aux_widget)
+        aux_lay.setContentsMargins(0, 0, 0, 0)
 
         row_axis = QHBoxLayout()
         row_axis.addWidget(QLabel("X Axis Name:"))
@@ -5603,7 +5816,8 @@ class MainWindow(QMainWindow):
         row_axis.addSpacing(10)
         row_axis.addWidget(QLabel("Y Axis Name:"))
         row_axis.addWidget(self.edit_ylabel, 1)
-        ptab.addLayout(row_axis)
+        row_axis.addWidget(self.btn_apply_plot_view)
+        aux_lay.addLayout(row_axis)
 
         row_spec_top = QHBoxLayout()
         row_spec_top.addWidget(QLabel("Spectrogram render:"))
@@ -5617,7 +5831,7 @@ class MainWindow(QMainWindow):
         row_spec_top.addWidget(self.cmb_color_mode)
         row_spec_top.addWidget(self.btn_edit_bands)
         row_spec_top.addStretch(1)
-        ptab.addLayout(row_spec_top)
+        aux_lay.addLayout(row_spec_top)
 
         row_spec_bottom = QHBoxLayout()
         row_spec_bottom.addWidget(self.lbl_dyn_range)
@@ -5629,9 +5843,12 @@ class MainWindow(QMainWindow):
         row_spec_bottom.addWidget(QLabel("vmax:"))
         row_spec_bottom.addWidget(self.spec_vmax_spin)
         row_spec_bottom.addStretch(1)
-        ptab.addLayout(row_spec_bottom)
+        aux_lay.addLayout(row_spec_bottom)
 
+        ptab.addWidget(self._plot_view_aux_widget)
         ptab.addWidget(self.plot_pages, 1)
+
+        self.btn_plot_advanced.clicked.connect(self._open_plot_view_advanced_dialog)
 
         self.btn_open.clicked.connect(self.open_file)
         self.cmb_sheet.currentIndexChanged.connect(self.load_sheet_or_group)
@@ -5893,6 +6110,14 @@ class MainWindow(QMainWindow):
                 self.plot_pages.removeTab(idx)
             widget.deleteLater()
         self._detail_widgets.clear()
+        # Also tear down any open Large tabs from a previous plot batch.
+        for key, widget in list(self._large_tab_widgets.items()):
+            idx = self.large_tabs.indexOf(widget)
+            if idx >= 0:
+                self.large_tabs.removeTab(idx)
+            widget.deleteLater()
+        self._large_tab_widgets.clear()
+        self.large_tabs.setVisible(False)
         self._clear_inline_detail()
 
     def _clear_inline_detail(self):
@@ -5903,35 +6128,33 @@ class MainWindow(QMainWindow):
         self.lbl_inline_detail_empty.setVisible(True)
 
     def _show_inline_detail(self, key: str):
-        """Replace the inline detail area with a fresh detail widget for `key`."""
+        """Replace the shared inline detail area with a fresh widget for `key`.
+
+        Does NOT touch large-tab detail widgets — they live in self._large_tab_widgets
+        and remain available for comparison.
+        """
         if key not in self._plot_states:
             return
 
         state = self._plot_states[key]
 
-        # Drop any previously shown inline detail widget (and forget its entry
-        # in self._detail_widgets — only one inline detail exists at a time).
-        for k, w in list(self._detail_widgets.items()):
-            self._detail_widgets.pop(k, None)
-            try:
-                w.setParent(None)
-                w.deleteLater()
-            except Exception:
-                pass
-
         self.lbl_inline_detail_empty.setVisible(False)
+
+        # Discard the previous *inline* detail (but leave Large-tab details alone).
         if self._inline_detail_widget is not None:
+            prev = self._inline_detail_widget
+            # Remove its registration from _detail_widgets if it was the inline one.
+            for k, w in list(self._detail_widgets.items()):
+                if w is prev:
+                    self._detail_widgets.pop(k, None)
             try:
-                self._inline_detail_widget.setParent(None)
-                self._inline_detail_widget.deleteLater()
+                prev.setParent(None)
+                prev.deleteLater()
             except Exception:
                 pass
             self._inline_detail_widget = None
 
-        if state.get("kind") == "waterfall":
-            detail = WaterfallDetailWidget(state)
-        else:
-            detail = DetailPlotWidget(state)
+        detail = self._make_detail_for_state(state)
 
         detail.activated.connect(self._set_active_canvas)
         self._connect_canvas_color_signals(detail.canvas)
@@ -6367,6 +6590,16 @@ class MainWindow(QMainWindow):
                 self.plot_pages.removeTab(idx)
             detail.deleteLater()
 
+        # Also drop any matching Large tab.
+        large = self._large_tab_widgets.pop(key, None)
+        if large is not None:
+            idx = self.large_tabs.indexOf(large)
+            if idx >= 0:
+                self.large_tabs.removeTab(idx)
+            large.deleteLater()
+            if self.large_tabs.count() == 0:
+                self.large_tabs.setVisible(False)
+
         self._reflow_overview_grid()
 
         if self._active_plot_key == key:
@@ -6381,6 +6614,19 @@ class MainWindow(QMainWindow):
         self._sync_spectrogram_controls()
 
     def _draw_state_on_canvas(self, canvas, state: dict, preserve_limits=False):
+        kind = str(state.get("kind", "")).lower()
+        # Defensive routing: waterfall states must land on a WaterfallPlotWidget,
+        # everything else on an InteractivePlotWidget / TimeDomainZoomFFTWidget.
+        if kind == "waterfall" and not isinstance(canvas, WaterfallPlotWidget):
+            raise RuntimeError(
+                f"Refusing to draw a waterfall state on {type(canvas).__name__}; "
+                "waterfall plots require WaterfallPlotWidget."
+            )
+        if kind != "waterfall" and isinstance(canvas, WaterfallPlotWidget):
+            raise RuntimeError(
+                f"Refusing to draw a non-waterfall state (kind={kind!r}) "
+                "on a WaterfallPlotWidget."
+            )
         canvas.set_state(
             state,
             color_cfg=self._plot_color_cfg(),
@@ -6388,56 +6634,112 @@ class MainWindow(QMainWindow):
             preserve_annotations=True,
         )
 
+    def _make_detail_for_state(self, state):
+        """Factory: pick WaterfallDetailWidget vs DetailPlotWidget."""
+        kind = str(state.get("kind", "")).lower()
+        if kind == "waterfall":
+            return WaterfallDetailWidget(state)
+        return DetailPlotWidget(state)
+
     def _open_large_plot(self, key):
-        # In the new Plot-View layout there is a single inline detail area
-        # under the three mini sections; "Open Large" simply targets it.
-        self._show_inline_detail(key)
+        """Open the plot ``key`` in a new closable Large tab below.
+
+        - Does NOT overwrite the shared inline detail (so the user can keep
+          one plot selected while comparing it with several Large tabs).
+        - Reuses an existing Large tab if the same key is already opened.
+        - Supports multiple Large tabs for cross-sensor comparison.
+        """
+        if key not in self._plot_states:
+            return
+
+        existing = self._large_tab_widgets.get(key)
+        if existing is not None:
+            idx = self.large_tabs.indexOf(existing)
+            if idx >= 0:
+                self.large_tabs.setCurrentIndex(idx)
+                self._set_active_canvas(existing.canvas, key)
+                return
+
+        state = self._plot_states[key]
+        detail = self._make_detail_for_state(state)
+        detail.activated.connect(self._set_active_canvas)
+        self._connect_canvas_color_signals(detail.canvas)
+        self._draw_state_on_canvas(detail.canvas, state, preserve_limits=False)
+
+        tab_label = state.get("short_title", state.get("name", key))
+        if len(tab_label) > 32:
+            tab_label = tab_label[:29] + "…"
+        idx = self.large_tabs.addTab(detail, tab_label)
+        self.large_tabs.setVisible(True)
+        self.large_tabs.setCurrentIndex(idx)
+        self._large_tab_widgets[key] = detail
+        self._set_active_canvas(detail.canvas, key)
+
+    def _on_large_tab_close(self, index: int):
+        if index < 0:
+            return
+        widget = self.large_tabs.widget(index)
+        if widget is None:
+            return
+        # Find the key for this widget.
+        dead_key = None
+        for k, w in list(self._large_tab_widgets.items()):
+            if w is widget:
+                dead_key = k
+                break
+        self.large_tabs.removeTab(index)
+        widget.deleteLater()
+        if dead_key is not None:
+            self._large_tab_widgets.pop(dead_key, None)
+        if self.large_tabs.count() == 0:
+            self.large_tabs.setVisible(False)
+
+    def _on_large_tab_changed(self, index: int):
+        if index < 0:
+            return
+        widget = self.large_tabs.widget(index)
+        if widget is not None and hasattr(widget, "canvas") and hasattr(widget, "plot_key"):
+            self._set_active_canvas(widget.canvas, widget.plot_key)
+
+    def _make_mini_for_state(self, st):
+        """Factory that picks the correct mini-widget class for a plot state."""
+        kind = str(st.get("kind", "")).lower()
+        if kind == "waterfall":
+            return WaterfallMiniWidget(st)
+        return PlotMiniWidget(st)
+
+    def _on_mini_request_open(self, key: str):
+        """Dispatch a mini's request_open: clicking the canvas updates the
+        inline detail; pressing the explicit Open Large button opens a Large
+        tab.  We tell them apart by checking the QObject sender's class:
+        QPushButton emits via clicked, the InteractivePlotWidget emits via
+        canvas.clicked → mini._on_canvas_clicked."""
+        sender = self.sender()
+        # Mini widgets emit request_open from two places:
+        #   1) btn_open.clicked → sender() is a QPushButton
+        #   2) canvas.clicked   → sender() is the PlotMiniWidget / WaterfallMiniWidget itself
+        try:
+            from PyQt5.QtWidgets import QPushButton as _QPB
+        except Exception:
+            _QPB = None
+        if _QPB is not None and isinstance(sender, _QPB):
+            self._open_large_plot(key)
+        else:
+            self._show_inline_detail(key)
 
     def _on_plot_worker_finished(self, states):
         self._plot_states = {st["key"]: st for st in states}
         self._clear_overview_widgets()
         self._clear_detail_tabs()
 
-        if states and states[0].get("kind") == "waterfall":
-            st = states[0]
-
-            # Also add a mini in the Spectrograms section so the user can
-            # click between waterfalls if more than one is plotted in future.
-            mini = PlotMiniWidget(st)
-            self._mini_widgets[st["key"]] = mini
-            self._overview_order.append(st["key"])
-            self._mini_kinds[st["key"]] = "waterfall"
-            mini.request_open.connect(self._open_large_plot)
-            mini.request_close.connect(self._close_plot_by_key)
-            mini.activated.connect(self._set_active_canvas)
-            self._connect_canvas_color_signals(mini.canvas)
-            self._draw_state_on_canvas(mini.canvas, st, preserve_limits=False)
-
-            self._reflow_overview_grid()
-
-            # Show the waterfall in the inline detail area below the minis.
-            self._show_inline_detail(st["key"])
-            detail = self._inline_detail_widget
-
-            self.tabs.setCurrentWidget(self.tab_plot)
-            self.lbl_stats.setText(st.get("stats_text", ""))
-
-            if hasattr(self, "lbl_wf_status"):
-                self.lbl_wf_status.setText(st.get("stats_text", ""))
-            if self._pending_waterfall_open_3d:
-                self._pending_waterfall_open_3d = False
-                if detail is not None:
-                    detail.canvas.open_3d_window()
-            return
-
         all_stats = []
         for st in states:
-            w = PlotMiniWidget(st)
+            w = self._make_mini_for_state(st)
             self._mini_widgets[st["key"]] = w
             self._overview_order.append(st["key"])
             self._mini_kinds[st["key"]] = st.get("kind", "")
 
-            w.request_open.connect(self._open_large_plot)
+            w.request_open.connect(self._on_mini_request_open)
             w.request_close.connect(self._close_plot_by_key)
             w.activated.connect(self._set_active_canvas)
 
@@ -6452,9 +6754,16 @@ class MainWindow(QMainWindow):
 
         if states:
             first = states[0]
-            # Open the first plot in the inline detail area so the user
-            # immediately sees a large view.
+            # Auto-populate the shared detail area with the first new plot.
             self._show_inline_detail(first["key"])
+            if first.get("kind") == "waterfall":
+                if hasattr(self, "lbl_wf_status"):
+                    self.lbl_wf_status.setText(first.get("stats_text", ""))
+                if self._pending_waterfall_open_3d:
+                    self._pending_waterfall_open_3d = False
+                    if self._inline_detail_widget is not None and \
+                       hasattr(self._inline_detail_widget.canvas, "open_3d_window"):
+                        self._inline_detail_widget.canvas.open_3d_window()
 
     def _on_plot_worker_error(self, msg: str):
         self.lbl_stats.setText("")
@@ -6496,6 +6805,40 @@ class MainWindow(QMainWindow):
     def _on_rect_zoom_toggled(self, checked):
         if self._active_canvas is not None:
             self._active_canvas.set_rect_zoom_active(checked)
+
+    def _open_plot_view_advanced_dialog(self):
+        """Modal that exposes axis labels, colormap, color mode, and dB range.
+
+        The widgets themselves still live in the hidden ``_plot_view_aux_widget``;
+        we just temporarily reparent that widget into a QDialog while it is
+        being edited.  This avoids duplicating widget state.
+        """
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Plot View — Advanced Settings")
+        dlg_lay = QVBoxLayout(dlg)
+        dlg_lay.setContentsMargins(8, 8, 8, 8)
+
+        old_parent = self._plot_view_aux_widget.parentWidget()
+        self._plot_view_aux_widget.setVisible(True)
+        dlg_lay.addWidget(self._plot_view_aux_widget, 1)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Close)
+        btns.rejected.connect(dlg.reject)
+        btns.accepted.connect(dlg.accept)
+        dlg_lay.addWidget(btns)
+
+        dlg.resize(720, 220)
+        dlg.exec_()
+
+        # Restore the aux widget to its hidden home in the Plot View tab.
+        self._plot_view_aux_widget.setParent(old_parent)
+        self._plot_view_aux_widget.setVisible(False)
+        # Make sure it is re-inserted into the layout that owned it.
+        if old_parent is not None:
+            lay = old_parent.layout()
+            if lay is not None and lay.indexOf(self._plot_view_aux_widget) < 0:
+                # Re-add to layout (it should already be there; this is a safety net).
+                lay.insertWidget(lay.count() - 1, self._plot_view_aux_widget)
 
     def _apply_plot_view(self):
         if self._active_canvas is None or self._active_plot_key not in self._plot_states:
@@ -7187,24 +7530,25 @@ class MainWindow(QMainWindow):
     <td>Classic waterfall: X-axis = frequency (Hz), Y-axis = RPM, color = amplitude/power.
     Constant-frequency features appear as horizontal lines.
     Order-related features (which scale with RPM) appear as diagonal lines.</td></tr>
-<tr><td><b>Order Waterfall</b></td>
-    <td>Each frame spectrum is converted from frequency to order axis: order = f / (RPM/60).
-    X-axis = order, Y-axis = RPM, color = amplitude/power.
-    Rotating-machine harmonics (1X, 2X …) appear as nearly vertical lines.</td></tr>
-<tr><td><b>Order Cursor</b></td>
-    <td><i>Visual cursor only.</i> Draws a line at f = order × RPM / 60 across the waterfall and
-    extracts amplitude along that line.  This is not a filter — it is an interpolated
-    read-out from the existing spectrum.</td></tr>
-<tr><td><b>Computed Order Tracking</b></td>
-    <td>True order-tracking filter.  Acceleration is resampled from uniform time to uniform
-    angle (shaft angle θ = ∫ω dt). Order-domain FFT is computed in the angle domain.
-    This separates rotating harmonics cleanly even during rapid speed changes.</td></tr>
-<tr><td><b>Order Tracking Filter</b></td>
+<tr><td><b>Order Tracking Filter</b> (primary)</td>
     <td>nCode-like adaptive band-pass / band-stop centered on f<sub>c</sub>(t) = k · RPM(t) / 60.
     For each FFT frame a Butterworth-shaped frequency mask is applied so that only the
-    chosen order k (1x, 2x, …) survives in the displayed waterfall — every other order
-    ridge is suppressed.  Distinct from the visual <i>Order Cursor</i> and from
-    <i>Computed Order Tracking</i>.</td></tr>
+    chosen order k (1x, 2x, …) is <i>extracted/isolated</i> in the displayed waterfall —
+    every other order ridge is suppressed.  This is the recommended way to look at a
+    single order.  Set target order in the Waterfall tab.</td></tr>
+<tr><td><b>Order Cursor</b> (visual only)</td>
+    <td><i>Not a filter.</i> A diagonal line drawn at f = order · RPM/60 over the existing
+    waterfall, used as a visual guide.  Amplitude is read out by interpolation along the
+    line — the underlying spectrum is unchanged.  Order cursors are an advanced/optional
+    overlay; if needed they can still be added via the waterfall detail toolbar.</td></tr>
+<tr><td><b>Computed Order Tracking (COT)</b> (advanced)</td>
+    <td>Different concept from the Order Tracking Filter: acceleration is resampled from
+    uniform time to uniform shaft-angle (θ = ∫ω dt) and an order-domain FFT is computed
+    in the angle domain.  Hidden by default — kept for advanced users.  Requires a clean,
+    monotonic RPM signal.  <b>Do not confuse with the Order Tracking Filter.</b></td></tr>
+<tr><td><b>Order Waterfall</b> (advanced)</td>
+    <td>Converts each frame from Hz to order axis. Hidden by default — the standard Frequency
+    Waterfall plus the Order Tracking Filter usually does what you want.</td></tr>
 </table>""")
 
         # ── 4. Amplitude & Scale Conventions ───────────────────────────
@@ -7675,25 +8019,21 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
         row_wf_5.addWidget(self.btn_wf_plot)
         lay.addLayout(row_wf_5)
 
-        # ── Order waterfall + order-extraction row ──────────────────────
-        row_wf_ord = QHBoxLayout()
-        row_wf_ord.addWidget(QLabel("Domain:"))
-        row_wf_ord.addWidget(self.cmb_wf_domain)
-        row_wf_ord.addSpacing(10)
-        row_wf_ord.addWidget(QLabel("Order max:"))
-        row_wf_ord.addWidget(self.wf_order_max_spin)
-        row_wf_ord.addWidget(QLabel("Order bins:"))
-        row_wf_ord.addWidget(self.wf_order_bins_spin)
-        row_wf_ord.addSpacing(14)
-        row_wf_ord.addWidget(QLabel("Order BW:"))
-        row_wf_ord.addWidget(self.wf_order_bw_spin)
-        row_wf_ord.addWidget(self.cmb_wf_order_bw_unit)
-        row_wf_ord.addWidget(QLabel("Extract:"))
-        row_wf_ord.addWidget(self.cmb_wf_order_extract_mode)
-        row_wf_ord.addStretch(1)
-        lay.addLayout(row_wf_ord)
+        # ── Order Waterfall / COT / order-extraction rows are kept as
+        #    hidden advanced widgets.  The primary user-facing order feature
+        #    is the Order Tracking Filter below.  The cmb_wf_domain combo is
+        #    pinned to "Frequency Waterfall" so the order-domain code path
+        #    in PlotWorker is never taken from the UI.
+        self.cmb_wf_domain.setCurrentText("Frequency Waterfall")
+        for _w in (
+            self.cmb_wf_domain, self.wf_order_max_spin, self.wf_order_bins_spin,
+            self.wf_order_bw_spin, self.cmb_wf_order_bw_unit,
+            self.cmb_wf_order_extract_mode,
+            self.chk_wf_cot, self.wf_cot_spr_spin,
+        ):
+            _w.setVisible(False)
 
-        # Order Tracking Filter row (nCode-like, isolates a selected order)
+        # Order Tracking Filter row — the only order-related UI now visible.
         row_wf_otf = QHBoxLayout()
         row_wf_otf.addWidget(self.chk_wf_otf)
         row_wf_otf.addSpacing(10)
@@ -7711,15 +8051,6 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
         row_wf_otf.addWidget(self.chk_wf_otf_trace)
         row_wf_otf.addStretch(1)
         lay.addLayout(row_wf_otf)
-
-        # Computed Order Tracking row
-        row_wf_cot = QHBoxLayout()
-        row_wf_cot.addWidget(self.chk_wf_cot)
-        row_wf_cot.addSpacing(14)
-        row_wf_cot.addWidget(QLabel("Samples/Rev:"))
-        row_wf_cot.addWidget(self.wf_cot_spr_spin)
-        row_wf_cot.addStretch(1)
-        lay.addLayout(row_wf_cot)
 
         lay.addWidget(self.lbl_wf_status)
         lay.addStretch(1)
@@ -8044,6 +8375,17 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
             "method": self.cmb_fourier_method.currentText(),
             "amp_conv": self.cmb_amp_conv.currentText(),
             "window_kind": self.cmb_window_kind.currentText().lower(),
+
+            # Independent AVG / STFT settings (fall back to globals).
+            "avg_override": self.chk_avg_override.isChecked(),
+            "avg_out_type": self.cmb_avg_out.currentText(),
+            "avg_scale": self.cmb_avg_scale.currentText(),
+            "avg_amp_conv": self.cmb_avg_amp_conv.currentText(),
+
+            "stft_override": self.chk_stft_override.isChecked(),
+            "stft_out_type": self.cmb_stft_out.currentText(),
+            "stft_scale": self.cmb_stft_scale.currentText(),
+            "stft_amp_conv": self.cmb_stft_amp_conv.currentText(),
         }
 
         if wf_cfg is not None:

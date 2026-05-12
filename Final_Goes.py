@@ -3991,12 +3991,13 @@ class DetailPlotWidget(QWidget):
         self.title.setWordWrap(True)
         self.title.setStyleSheet("font-weight: bold;")
 
-        if state.get("kind") == "time":
-            self.canvas = TimeDomainZoomFFTWidget(mini=False)
-            self.canvas.setMinimumHeight(680)
-        else:
-            self.canvas = InteractivePlotWidget(mini=False)
-            self.canvas.setMinimumHeight(480)
+        # Use a plain InteractivePlotWidget for every non-waterfall kind so
+        # that the time-domain detail shows ONLY the time-domain trace —
+        # no stacked "visible-window FFT" subplot underneath.  The legacy
+        # TimeDomainZoomFFTWidget remains in the codebase for advanced use
+        # but is no longer the default detail renderer.
+        self.canvas = InteractivePlotWidget(mini=False)
+        self.canvas.setMinimumHeight(480)
 
         lay = QVBoxLayout(self)
         lay.addWidget(self.title)
@@ -5126,59 +5127,61 @@ class PlotWorker(QObject):
         raw_signals = self._load_selected_signals()
         states = []
 
+        # Resolve independent AVG / STFT settings once (fall back to globals).
+        avg_override = bool(self.cfg.get("avg_override", False))
+        stft_override = bool(self.cfg.get("stft_override", False))
+        avg_out = self.cfg.get("avg_out_type", self.cfg["out_type"]) if avg_override else self.cfg["out_type"]
+        avg_scale = self.cfg.get("avg_scale", self.cfg["scale"]) if avg_override else self.cfg["scale"]
+        avg_amp_conv = self.cfg.get("avg_amp_conv", self.cfg["amp_conv"]) if avg_override else self.cfg["amp_conv"]
+        stft_out = self.cfg.get("stft_out_type", self.cfg["out_type"]) if stft_override else self.cfg["out_type"]
+        stft_scale = self.cfg.get("stft_scale", self.cfg["scale"]) if stft_override else self.cfg["scale"]
+        stft_amp_conv = self.cfg.get("stft_amp_conv", self.cfg["amp_conv"]) if stft_override else self.cfg["amp_conv"]
+
+        method = self.cfg.get("method", "Both (Averaged + STFT)")
+        wants_avg = method in ("Averaged Spectrum", "Both (Averaged + STFT)")
+        wants_stft = method in ("STFT (Spectrogram)", "Both (Averaged + STFT)")
+
+        nfft = int(self.cfg["nfft"])
+        overlap_pct = float(self.cfg["overlap_pct"])
+
         for nm in names:
             y = self._get_processed_signal(np.asarray(raw_signals[nm]))
             short_title = f"{nm} | {signal_name}"
             proc_title = self._processing_title(use_filtered, signal_kind)
-            key = f"{mode}|{signal_kind}|{group_or_sheet}|{nm}"
+            base_key = f"{signal_kind}|{group_or_sheet}|{nm}"
 
-            if mode.startswith("Time Domain"):
-                start_offset = t0 if crop else 0.0
-                t = self._make_time_axis(y.size, fs, start_offset_s=start_offset)
+            # ── 1) ALWAYS emit a time-domain state ───────────────────────
+            start_offset = t0 if crop else 0.0
+            t = self._make_time_axis(y.size, fs, start_offset_s=start_offset)
+            states.append({
+                "key": f"time|{base_key}",
+                "kind": "time",
+                "name": nm,
+                "short_title": f"Time-domain: {nm} / {signal_name}",
+                "title": f"{file_base} | {group_or_sheet} | Time-domain ({signal_name}){proc_title} | {nm}",
+                "xlabel": "Time (s)",
+                "ylabel": self._signal_ylabel(signal_kind),
+                "grid": True,
+                "series": [{"x": t, "y": y, "label": nm}],
+                "time_signal": y.copy(),
+                "time_axis": t.copy(),
+                "fs": fs,
+                "signal_kind": signal_kind,
+                "fft_zoom_cfg": {
+                    "nfft": nfft,
+                    "overlap_pct": overlap_pct,
+                    "out_type": avg_out,
+                    "scale": avg_scale,
+                    "amp_conv": avg_amp_conv,
+                    "signal_kind": signal_kind,
+                    "window_kind": self.cfg.get("window_kind", "periodic"),
+                },
+                "stats_text": self._time_stats_text(nm, y, signal_kind),
+            })
 
-                states.append({
-                    "key": key,
-                    "kind": "time",
-                    "name": nm,
-                    "short_title": short_title,
-                    "title": f"{file_base} | {group_or_sheet} | {signal_name}{proc_title} | {nm}",
-                    "xlabel": "Time (s)",
-                    "ylabel": self._signal_ylabel(signal_kind),
-                    "grid": True,
-                    "series": [{"x": t, "y": y, "label": nm}],
-                    "time_signal": y.copy(),
-                    "time_axis": t.copy(),
-                    "fs": fs,
-                    "fft_zoom_cfg": {
-                        "nfft": int(self.cfg["nfft"]),
-                        "overlap_pct": float(self.cfg["overlap_pct"]),
-                        "out_type": self.cfg["out_type"],
-                        "scale": self.cfg["scale"],
-                        "amp_conv": self.cfg["amp_conv"],
-                        "signal_kind": signal_kind,
-                        "window_kind": self.cfg.get("window_kind", "periodic"),
-                    },
-                    "stats_text": self._time_stats_text(nm, y, signal_kind),
-                })
-                continue
-
-            nfft = int(self.cfg["nfft"])
-            overlap_pct = float(self.cfg["overlap_pct"])
-            method = self.cfg["method"]
-
-            # Resolve independent AVG / STFT settings (fall back to globals).
-            avg_override = bool(self.cfg.get("avg_override", False))
-            stft_override = bool(self.cfg.get("stft_override", False))
-            avg_out = self.cfg.get("avg_out_type", self.cfg["out_type"]) if avg_override else self.cfg["out_type"]
-            avg_scale = self.cfg.get("avg_scale", self.cfg["scale"]) if avg_override else self.cfg["scale"]
-            avg_amp_conv = self.cfg.get("avg_amp_conv", self.cfg["amp_conv"]) if avg_override else self.cfg["amp_conv"]
-            stft_out = self.cfg.get("stft_out_type", self.cfg["out_type"]) if stft_override else self.cfg["out_type"]
-            stft_scale = self.cfg.get("stft_scale", self.cfg["scale"]) if stft_override else self.cfg["scale"]
-            stft_amp_conv = self.cfg.get("stft_amp_conv", self.cfg["amp_conv"]) if stft_override else self.cfg["amp_conv"]
-
-            wants_avg = method in ("Averaged Spectrum", "Both (Averaged + STFT)")
-            wants_stft = method in ("STFT (Spectrogram)", "Both (Averaged + STFT)")
-
+            # If neither avg nor stft were requested we still produced a
+            # time-domain state, which is the minimum.
+            key = base_key
             if wants_avg:
                 # Temporarily swap amp_conv into cfg so existing helpers pick up
                 # the AVG-specific convention; restore after.
@@ -5196,7 +5199,8 @@ class PlotWorker(QObject):
                     "key": f"avg|{key}",
                     "kind": "avg",
                     "name": nm,
-                    "short_title": short_title,
+                    "signal_kind": signal_kind,
+                    "short_title": f"Averaged spectrum: {nm} / {signal_name}",
                     "title": (
                         f"{file_base} | {group_or_sheet} | Averaged Spectrum "
                         f"({signal_name}){proc_title} | {nm} | NFFT={nfft}, "
@@ -5226,7 +5230,8 @@ class PlotWorker(QObject):
                     "key": f"stft|{key}",
                     "kind": "stft",
                     "name": nm,
-                    "short_title": short_title,
+                    "signal_kind": signal_kind,
+                    "short_title": f"Spectrogram: {nm} / {signal_name}",
                     "title": (
                         f"{file_base} | {group_or_sheet} | STFT Spectrogram "
                         f"({signal_name}){proc_title} | {nm} | NFFT={nfft}, "
@@ -5329,6 +5334,23 @@ class MainWindow(QMainWindow):
         self.t1_spin.setValue(30.0)
         self.t1_spin.setEnabled(False)
 
+        # ── Signal Type selector (visible) ────────────────────────────────
+        # Replaces the old "Plot Mode" dropdown.  The user now only picks
+        # WHAT signal they are plotting; the worker always produces
+        # time + averaged-spectrum + STFT states for that signal type.
+        self.cmb_signal_type = QComboBox()
+        self.cmb_signal_type.addItems(["Acceleration", "Velocity"])
+        self.cmb_signal_type.setToolTip(
+            "Physical signal to plot.\n"
+            "One Plot click produces: Time-domain, Averaged spectrum, and STFT/Spectrogram\n"
+            "for every selected channel — separately for each panel of Plot View."
+        )
+
+        # ── Legacy "Plot Mode" combo (kept hidden) ────────────────────────
+        # A lot of internal helpers (_is_fourier_mode, _is_velocity_mode, …)
+        # still read this combo, so we keep it as the single source of truth
+        # for downstream code and drive it from cmb_signal_type instead of
+        # exposing it in the UI.
         self.cmb_mode = QComboBox()
         self.cmb_mode.addItems([
             "Time Domain (Acceleration)",
@@ -5336,6 +5358,21 @@ class MainWindow(QMainWindow):
             "Fourier Transform (Acceleration)",
             "Fourier Transform (Velocity)",
         ])
+        # Default to acceleration FFT — the worker always emits the time
+        # state too, so "Fourier Transform (…)" effectively means "all three".
+        self.cmb_mode.setCurrentText("Fourier Transform (Acceleration)")
+        self.cmb_mode.setVisible(False)
+
+        def _sync_mode_from_signal_type(*_):
+            sig = self.cmb_signal_type.currentText().strip()
+            target = (
+                "Fourier Transform (Velocity)"
+                if sig == "Velocity"
+                else "Fourier Transform (Acceleration)"
+            )
+            if self.cmb_mode.currentText() != target:
+                self.cmb_mode.setCurrentText(target)
+        self.cmb_signal_type.currentIndexChanged.connect(_sync_mode_from_signal_type)
 
         self.cmb_fourier_method = QComboBox()
         self.cmb_fourier_method.addItems([
@@ -5343,6 +5380,9 @@ class MainWindow(QMainWindow):
             "STFT (Spectrogram)",
             "Both (Averaged + STFT)",
         ])
+        # Default: emit both averaged and STFT alongside the always-emitted
+        # time-domain state.  Users can narrow it down to one method here.
+        self.cmb_fourier_method.setCurrentText("Both (Averaged + STFT)")
 
         # Independent AVG settings — used when the worker builds an averaged
         # spectrum state.  These default to the global Output/Scale/Amplitude
@@ -5675,8 +5715,8 @@ class MainWindow(QMainWindow):
         row1.addWidget(QLabel("Sheet / Group:"))
         row1.addWidget(self.cmb_sheet, 2)
         row1.addSpacing(12)
-        row1.addWidget(QLabel("Plot Mode:"))
-        row1.addWidget(self.cmb_mode, 1)
+        row1.addWidget(QLabel("Signal Type:"))
+        row1.addWidget(self.cmb_signal_type, 1)
         ctl.addLayout(row1)
 
         ctl.addWidget(self.lbl_wf_hint)

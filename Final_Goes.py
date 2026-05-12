@@ -3932,6 +3932,7 @@ class TimeDomainZoomFFTWidget(QWidget):
 
 class PlotMiniWidget(QFrame):
     request_open = pyqtSignal(str)
+    request_inline = pyqtSignal(str)
     request_close = pyqtSignal(str)
     activated = pyqtSignal(object, str)
 
@@ -3970,7 +3971,7 @@ class PlotMiniWidget(QFrame):
 
     def _on_canvas_clicked(self):
         self.activated.emit(self.canvas, self.plot_key)
-        self.request_open.emit(self.plot_key)
+        self.request_inline.emit(self.plot_key)
 
     def set_selected(self, selected: bool):
         if selected:
@@ -4043,6 +4044,7 @@ class WaterfallMiniWidget(QFrame):
     InteractivePlotWidget.set_state crashes with KeyError: 'times'.
     """
     request_open = pyqtSignal(str)
+    request_inline = pyqtSignal(str)
     request_close = pyqtSignal(str)
     activated = pyqtSignal(object, str)
 
@@ -4081,7 +4083,7 @@ class WaterfallMiniWidget(QFrame):
 
     def _on_canvas_clicked(self):
         self.activated.emit(self.canvas, self.plot_key)
-        self.request_open.emit(self.plot_key)
+        self.request_inline.emit(self.plot_key)
 
     def set_selected(self, selected: bool):
         if selected:
@@ -5137,9 +5139,11 @@ class PlotWorker(QObject):
         stft_scale = self.cfg.get("stft_scale", self.cfg["scale"]) if stft_override else self.cfg["scale"]
         stft_amp_conv = self.cfg.get("stft_amp_conv", self.cfg["amp_conv"]) if stft_override else self.cfg["amp_conv"]
 
-        method = self.cfg.get("method", "Both (Averaged + STFT)")
-        wants_avg = method in ("Averaged Spectrum", "Both (Averaged + STFT)")
-        wants_stft = method in ("STFT (Spectrogram)", "Both (Averaged + STFT)")
+        # Normal Plot View workflow always emits all three plot types for the
+        # selected signal quantity.  The legacy Fourier Method combo is kept
+        # only for backward compatibility and no longer controls state kinds.
+        wants_avg = True
+        wants_stft = True
 
         nfft = int(self.cfg["nfft"])
         overlap_pct = float(self.cfg["overlap_pct"])
@@ -5347,10 +5351,9 @@ class MainWindow(QMainWindow):
         )
 
         # ── Legacy "Plot Mode" combo (kept hidden) ────────────────────────
-        # A lot of internal helpers (_is_fourier_mode, _is_velocity_mode, …)
-        # still read this combo, so we keep it as the single source of truth
-        # for downstream code and drive it from cmb_signal_type instead of
-        # exposing it in the UI.
+        # Retained only so older callbacks/settings that expect cmb_mode do not
+        # crash.  Normal Plot View behavior reads cmb_signal_type and always
+        # generates all plot kinds.
         self.cmb_mode = QComboBox()
         self.cmb_mode.addItems([
             "Time Domain (Acceleration)",
@@ -5380,9 +5383,11 @@ class MainWindow(QMainWindow):
             "STFT (Spectrogram)",
             "Both (Averaged + STFT)",
         ])
-        # Default: emit both averaged and STFT alongside the always-emitted
-        # time-domain state.  Users can narrow it down to one method here.
+        # Legacy selector retained for settings-file/backward compatibility only.
+        # It is hidden and ignored by PlotWorker; one Plot click always creates
+        # Time-domain + Averaged Spectrum + STFT/Spectrogram.
         self.cmb_fourier_method.setCurrentText("Both (Averaged + STFT)")
+        self.cmb_fourier_method.setVisible(False)
 
         # Independent AVG settings — used when the worker builds an averaged
         # spectrum state.  These default to the global Output/Scale/Amplitude
@@ -5768,9 +5773,6 @@ class MainWindow(QMainWindow):
         ctl.addLayout(row3)
 
         row_fft = QHBoxLayout()
-        row_fft.addWidget(QLabel("Fourier Method:"))
-        row_fft.addWidget(self.cmb_fourier_method)
-        row_fft.addSpacing(12)
         row_fft.addWidget(QLabel("Buffer Size (NFFT):"))
         row_fft.addWidget(self.cmb_nfft)
         row_fft.addWidget(QLabel("Overlap (%):"))
@@ -6097,12 +6099,15 @@ class MainWindow(QMainWindow):
 
         canvases = []
         mini = self._mini_widgets.get(key)
-        detail = self._detail_widgets.get(key)
+        inline = self._inline_detail_widget
+        large = self._large_tab_widgets.get(key)
 
         if mini is not None:
             canvases.append(mini.canvas)
-        if detail is not None:
-            canvases.append(detail.canvas)
+        if inline is not None and getattr(inline, "plot_key", None) == key:
+            canvases.append(inline.canvas)
+        if large is not None:
+            canvases.append(large.canvas)
 
         for canvas in canvases:
             is_active = (canvas is self._active_canvas and self._active_plot_key == key)
@@ -6144,19 +6149,17 @@ class MainWindow(QMainWindow):
         return self.mini_inner_spec_lay
 
     def _clear_detail_tabs(self):
-        for key, widget in list(self._detail_widgets.items()):
-            idx = self.plot_pages.indexOf(widget)
-            if idx >= 0:
-                self.plot_pages.removeTab(idx)
-            widget.deleteLater()
-        self._detail_widgets.clear()
-        # Also tear down any open Large tabs from a previous plot batch.
+        # Tear down open Large tabs from a previous plot batch.  Large-tab
+        # detail widgets are tracked in both dictionaries: _large_tab_widgets
+        # is used for tab management and _detail_widgets is kept for legacy
+        # callers that expect opened detail widgets by plot key.
         for key, widget in list(self._large_tab_widgets.items()):
             idx = self.large_tabs.indexOf(widget)
             if idx >= 0:
                 self.large_tabs.removeTab(idx)
             widget.deleteLater()
         self._large_tab_widgets.clear()
+        self._detail_widgets.clear()
         self.large_tabs.setVisible(False)
         self._clear_inline_detail()
 
@@ -6183,10 +6186,6 @@ class MainWindow(QMainWindow):
         # Discard the previous *inline* detail (but leave Large-tab details alone).
         if self._inline_detail_widget is not None:
             prev = self._inline_detail_widget
-            # Remove its registration from _detail_widgets if it was the inline one.
-            for k, w in list(self._detail_widgets.items()):
-                if w is prev:
-                    self._detail_widgets.pop(k, None)
             try:
                 prev.setParent(None)
                 prev.deleteLater()
@@ -6202,7 +6201,6 @@ class MainWindow(QMainWindow):
 
         self._inline_detail_widget = detail
         self._inline_detail_lay.addWidget(detail, 1)
-        self._detail_widgets[key] = detail
         self._set_active_canvas(detail.canvas, key)
 
     def _reset_plot_workspace(self):
@@ -6377,13 +6375,17 @@ class MainWindow(QMainWindow):
             pass
 
     def _is_fourier_mode(self):
-        return self.cmb_mode.currentText().startswith("Fourier Transform")
+        # Legacy name: the normal Plot View always includes frequency-domain
+        # outputs (averaged spectrum + STFT) for the selected signal quantity.
+        return not self._is_waterfall_mode()
 
     def _is_velocity_mode(self):
-        return "Velocity" in self.cmb_mode.currentText()
+        return self.cmb_signal_type.currentText().strip() == "Velocity"
 
     def _is_velocity_time_mode(self):
-        return self.cmb_mode.currentText() == "Time Domain (Velocity)"
+        # The old Time Domain (Velocity) plot mode is no longer part of the
+        # normal user workflow; velocity is a signal quantity, not a plot kind.
+        return False
 
     def _is_waterfall_mode(self):
         return self.cmb_mode.currentText() == "Waterfall (RPM + Acceleration)"
@@ -6411,7 +6413,7 @@ class MainWindow(QMainWindow):
         return names[min(1, len(names) - 1)]
 
     def _selected_signal_kind(self):
-        return "vel" if self._is_velocity_mode() else "acc"
+        return "vel" if self.cmb_signal_type.currentText().strip() == "Velocity" else "acc"
 
     def _signal_name(self):
         return "Velocity" if self._selected_signal_kind() == "vel" else "Acceleration"
@@ -6519,9 +6521,9 @@ class MainWindow(QMainWindow):
         self._on_color_controls_changed()
 
     def _on_mode_change(self):
-        has_fft_settings = self._is_fourier_mode() or self._is_waterfall_mode() or self.cmb_mode.currentText().startswith("Time Domain")
+        has_fft_settings = True
 
-        self.cmb_fourier_method.setEnabled(not self._is_waterfall_mode() and self._is_fourier_mode())
+        self.cmb_fourier_method.setEnabled(False)
         self.cmb_nfft.setEnabled(has_fft_settings)
         self.ovl_spin.setEnabled(has_fft_settings)
         self.cmb_out.setEnabled(has_fft_settings)
@@ -6557,9 +6559,8 @@ class MainWindow(QMainWindow):
                 else f"Data source: {self.cmb_data_source.currentText()}"
             )
 
-            zoom_note = "   |   Visible time window -> Averaged Spectrum" if self.cmb_mode.currentText().startswith("Time Domain") else ""
             self.lbl_fft_info.setText(
-                f"Signal: {self._signal_name()}   |   {base_info}   |   Δf: {df:.6g} Hz   |   Window: {win_t:.6g} s   |   Hop: {hop} samples ({hop_t:.6g} s)   |   Amplitude convention: {unit_lbl}{zoom_note}"
+                f"Signal: {self._signal_name()}   |   {base_info}   |   Δf: {df:.6g} Hz   |   Window: {win_t:.6g} s   |   Hop: {hop} samples ({hop_t:.6g} s)   |   Amplitude convention: {unit_lbl}"
             )
         except Exception:
             self.lbl_fft_info.setText("Frequency resolution: -")
@@ -6620,18 +6621,16 @@ class MainWindow(QMainWindow):
         self._plot_states.pop(key, None)
         self._overview_order = [k for k in self._overview_order if k != key]
 
-        detail = self._detail_widgets.pop(key, None)
-        if detail is not None:
-            if detail is self._inline_detail_widget:
-                self._inline_detail_widget = None
-                self.lbl_inline_detail_empty.setVisible(True)
-            idx = self.plot_pages.indexOf(detail)
-            if idx >= 0:
-                self.plot_pages.removeTab(idx)
+        if self._inline_detail_widget is not None and getattr(self._inline_detail_widget, "plot_key", None) == key:
+            detail = self._inline_detail_widget
+            self._inline_detail_widget = None
+            self.lbl_inline_detail_empty.setVisible(True)
+            detail.setParent(None)
             detail.deleteLater()
 
         # Also drop any matching Large tab.
         large = self._large_tab_widgets.pop(key, None)
+        self._detail_widgets.pop(key, None)
         if large is not None:
             idx = self.large_tabs.indexOf(large)
             if idx >= 0:
@@ -6655,8 +6654,8 @@ class MainWindow(QMainWindow):
 
     def _draw_state_on_canvas(self, canvas, state: dict, preserve_limits=False):
         kind = str(state.get("kind", "")).lower()
-        # Defensive routing: waterfall states must land on a WaterfallPlotWidget,
-        # everything else on an InteractivePlotWidget / TimeDomainZoomFFTWidget.
+        # Defensive routing: waterfall states must land on a WaterfallPlotWidget;
+        # normal Plot View states render on InteractivePlotWidget.
         if kind == "waterfall" and not isinstance(canvas, WaterfallPlotWidget):
             raise RuntimeError(
                 f"Refusing to draw a waterfall state on {type(canvas).__name__}; "
@@ -6713,6 +6712,7 @@ class MainWindow(QMainWindow):
         self.large_tabs.setVisible(True)
         self.large_tabs.setCurrentIndex(idx)
         self._large_tab_widgets[key] = detail
+        self._detail_widgets[key] = detail
         self._set_active_canvas(detail.canvas, key)
 
     def _on_large_tab_close(self, index: int):
@@ -6731,6 +6731,7 @@ class MainWindow(QMainWindow):
         widget.deleteLater()
         if dead_key is not None:
             self._large_tab_widgets.pop(dead_key, None)
+            self._detail_widgets.pop(dead_key, None)
         if self.large_tabs.count() == 0:
             self.large_tabs.setVisible(False)
 
@@ -6749,23 +6750,12 @@ class MainWindow(QMainWindow):
         return PlotMiniWidget(st)
 
     def _on_mini_request_open(self, key: str):
-        """Dispatch a mini's request_open: clicking the canvas updates the
-        inline detail; pressing the explicit Open Large button opens a Large
-        tab.  We tell them apart by checking the QObject sender's class:
-        QPushButton emits via clicked, the InteractivePlotWidget emits via
-        canvas.clicked → mini._on_canvas_clicked."""
-        sender = self.sender()
-        # Mini widgets emit request_open from two places:
-        #   1) btn_open.clicked → sender() is a QPushButton
-        #   2) canvas.clicked   → sender() is the PlotMiniWidget / WaterfallMiniWidget itself
-        try:
-            from PyQt5.QtWidgets import QPushButton as _QPB
-        except Exception:
-            _QPB = None
-        if _QPB is not None and isinstance(sender, _QPB):
-            self._open_large_plot(key)
-        else:
-            self._show_inline_detail(key)
+        """Legacy slot: request_open now always means Open Large.
+
+        Mini canvas clicks use request_inline, so this fallback must not route
+        Open Large back into the shared inline detail area.
+        """
+        self._open_large_plot(key)
 
     def _on_plot_worker_finished(self, states):
         self._plot_states = {st["key"]: st for st in states}
@@ -6779,7 +6769,9 @@ class MainWindow(QMainWindow):
             self._overview_order.append(st["key"])
             self._mini_kinds[st["key"]] = st.get("kind", "")
 
-            w.request_open.connect(self._on_mini_request_open)
+            w.request_open.connect(self._open_large_plot)
+            if hasattr(w, "request_inline"):
+                w.request_inline.connect(self._show_inline_detail)
             w.request_close.connect(self._close_plot_by_key)
             w.activated.connect(self._set_active_canvas)
 
@@ -7492,7 +7484,7 @@ class MainWindow(QMainWindow):
   <li><b>Select sheet / group</b> — choose the sheet or TDMS group from the drop-down.</li>
   <li><b>Select channel(s)</b> — pick one or more columns from the channel list.</li>
   <li><b>Set fs</b> — enter the correct <i>sampling frequency</i> in Hz. This is the most critical parameter.</li>
-  <li><b>Choose analysis mode</b> — Time Domain, Fourier Transform, or Waterfall.</li>
+  <li><b>Choose signal type</b> — Acceleration or Velocity. One Plot click creates Time-domain, Averaged Spectrum, and Spectrogram panels.</li>
   <li><b>Configure FFT settings</b> — Buffer Size (NFFT), Overlap, Output, Scale, Amplitude convention.</li>
   <li><b>Click Plot</b>.</li>
   <li><b>Inspect</b> — zoom, pan, click to annotate. Use the Plot View tab for axis/color controls.</li>

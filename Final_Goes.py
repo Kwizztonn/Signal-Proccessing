@@ -3932,6 +3932,7 @@ class TimeDomainZoomFFTWidget(QWidget):
 
 class PlotMiniWidget(QFrame):
     request_open = pyqtSignal(str)
+    request_large = pyqtSignal(str)
     request_close = pyqtSignal(str)
     activated = pyqtSignal(object, str)
 
@@ -3964,7 +3965,7 @@ class PlotMiniWidget(QFrame):
         lay.addLayout(top)
         lay.addWidget(self.canvas)
 
-        self.btn_open.clicked.connect(lambda: self.request_open.emit(self.plot_key))
+        self.btn_open.clicked.connect(lambda: self.request_large.emit(self.plot_key))
         self.btn_close.clicked.connect(lambda: self.request_close.emit(self.plot_key))
         self.canvas.clicked.connect(self._on_canvas_clicked)
 
@@ -4043,6 +4044,7 @@ class WaterfallMiniWidget(QFrame):
     InteractivePlotWidget.set_state crashes with KeyError: 'times'.
     """
     request_open = pyqtSignal(str)
+    request_large = pyqtSignal(str)
     request_close = pyqtSignal(str)
     activated = pyqtSignal(object, str)
 
@@ -4075,7 +4077,7 @@ class WaterfallMiniWidget(QFrame):
         lay.addLayout(top)
         lay.addWidget(self.canvas)
 
-        self.btn_open.clicked.connect(lambda: self.request_open.emit(self.plot_key))
+        self.btn_open.clicked.connect(lambda: self.request_large.emit(self.plot_key))
         self.btn_close.clicked.connect(lambda: self.request_close.emit(self.plot_key))
         self.canvas.clicked.connect(self._on_canvas_clicked)
 
@@ -5137,9 +5139,12 @@ class PlotWorker(QObject):
         stft_scale = self.cfg.get("stft_scale", self.cfg["scale"]) if stft_override else self.cfg["scale"]
         stft_amp_conv = self.cfg.get("stft_amp_conv", self.cfg["amp_conv"]) if stft_override else self.cfg["amp_conv"]
 
-        method = self.cfg.get("method", "Both (Averaged + STFT)")
-        wants_avg = method in ("Averaged Spectrum", "Both (Averaged + STFT)")
-        wants_stft = method in ("STFT (Spectrogram)", "Both (Averaged + STFT)")
+        # Normal Plot View always creates the complete plot family for the
+        # selected physical signal: time-domain + averaged spectrum + STFT.
+        # The legacy Fourier Method combo remains hidden for compatibility,
+        # but it no longer gates which states are generated.
+        wants_avg = True
+        wants_stft = True
 
         nfft = int(self.cfg["nfft"])
         overlap_pct = float(self.cfg["overlap_pct"])
@@ -5768,9 +5773,9 @@ class MainWindow(QMainWindow):
         ctl.addLayout(row3)
 
         row_fft = QHBoxLayout()
-        row_fft.addWidget(QLabel("Fourier Method:"))
-        row_fft.addWidget(self.cmb_fourier_method)
-        row_fft.addSpacing(12)
+        # The old Fourier Method selector is hidden from the main workflow:
+        # one Plot action now always creates time + avg + STFT.
+        self.cmb_fourier_method.setVisible(False)
         row_fft.addWidget(QLabel("Buffer Size (NFFT):"))
         row_fft.addWidget(self.cmb_nfft)
         row_fft.addWidget(QLabel("Overlap (%):"))
@@ -6380,6 +6385,8 @@ class MainWindow(QMainWindow):
         return self.cmb_mode.currentText().startswith("Fourier Transform")
 
     def _is_velocity_mode(self):
+        if hasattr(self, "cmb_signal_type"):
+            return self.cmb_signal_type.currentText().strip() == "Velocity"
         return "Velocity" in self.cmb_mode.currentText()
 
     def _is_velocity_time_mode(self):
@@ -6411,6 +6418,11 @@ class MainWindow(QMainWindow):
         return names[min(1, len(names) - 1)]
 
     def _selected_signal_kind(self):
+        # The visible Signal Type selector is the main user-flow source of
+        # truth.  The hidden legacy cmb_mode is only synchronized for older
+        # helpers and must not decide which plot kinds are generated.
+        if hasattr(self, "cmb_signal_type"):
+            return "vel" if self.cmb_signal_type.currentText().strip() == "Velocity" else "acc"
         return "vel" if self._is_velocity_mode() else "acc"
 
     def _signal_name(self):
@@ -6519,9 +6531,10 @@ class MainWindow(QMainWindow):
         self._on_color_controls_changed()
 
     def _on_mode_change(self):
-        has_fft_settings = self._is_fourier_mode() or self._is_waterfall_mode() or self.cmb_mode.currentText().startswith("Time Domain")
+        has_fft_settings = True
 
-        self.cmb_fourier_method.setEnabled(not self._is_waterfall_mode() and self._is_fourier_mode())
+        # Hidden legacy control: normal Plot View always emits Avg + STFT.
+        self.cmb_fourier_method.setEnabled(False)
         self.cmb_nfft.setEnabled(has_fft_settings)
         self.ovl_spin.setEnabled(has_fft_settings)
         self.cmb_out.setEnabled(has_fft_settings)
@@ -6557,9 +6570,8 @@ class MainWindow(QMainWindow):
                 else f"Data source: {self.cmb_data_source.currentText()}"
             )
 
-            zoom_note = "   |   Visible time window -> Averaged Spectrum" if self.cmb_mode.currentText().startswith("Time Domain") else ""
             self.lbl_fft_info.setText(
-                f"Signal: {self._signal_name()}   |   {base_info}   |   Δf: {df:.6g} Hz   |   Window: {win_t:.6g} s   |   Hop: {hop} samples ({hop_t:.6g} s)   |   Amplitude convention: {unit_lbl}{zoom_note}"
+                f"Signal: {self._signal_name()}   |   {base_info}   |   Δf: {df:.6g} Hz   |   Window: {win_t:.6g} s   |   Hop: {hop} samples ({hop_t:.6g} s)   |   Amplitude convention: {unit_lbl}"
             )
         except Exception:
             self.lbl_fft_info.setText("Frequency resolution: -")
@@ -6779,7 +6791,11 @@ class MainWindow(QMainWindow):
             self._overview_order.append(st["key"])
             self._mini_kinds[st["key"]] = st.get("kind", "")
 
-            w.request_open.connect(self._on_mini_request_open)
+            w.request_open.connect(self._show_inline_detail)
+            if hasattr(w, "request_large"):
+                w.request_large.connect(self._open_large_plot)
+            else:
+                w.request_open.connect(self._on_mini_request_open)
             w.request_close.connect(self._close_plot_by_key)
             w.activated.connect(self._set_active_canvas)
 
@@ -7492,9 +7508,9 @@ class MainWindow(QMainWindow):
   <li><b>Select sheet / group</b> — choose the sheet or TDMS group from the drop-down.</li>
   <li><b>Select channel(s)</b> — pick one or more columns from the channel list.</li>
   <li><b>Set fs</b> — enter the correct <i>sampling frequency</i> in Hz. This is the most critical parameter.</li>
-  <li><b>Choose analysis mode</b> — Time Domain, Fourier Transform, or Waterfall.</li>
+  <li><b>Choose signal type</b> — Acceleration or Velocity. This selects the physical signal only.</li>
   <li><b>Configure FFT settings</b> — Buffer Size (NFFT), Overlap, Output, Scale, Amplitude convention.</li>
-  <li><b>Click Plot</b>.</li>
+  <li><b>Click Plot</b> — the Plot View creates Time-domain, Averaged Spectrum, and Spectrogram panels together.</li>
   <li><b>Inspect</b> — zoom, pan, click to annotate. Use the Plot View tab for axis/color controls.</li>
   <li><b>Export</b> — use the Export button for PNG/PDF/TDMS output.</li>
 </ol>
@@ -8412,7 +8428,7 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
             "overlap_pct": float(self.ovl_spin.value()),
             "out_type": self.cmb_out.currentText(),
             "scale": self.cmb_scale.currentText(),
-            "method": self.cmb_fourier_method.currentText(),
+            "method": "Both (Averaged + STFT)",
             "amp_conv": self.cmb_amp_conv.currentText(),
             "window_kind": self.cmb_window_kind.currentText().lower(),
 
@@ -8426,6 +8442,8 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
             "stft_out_type": self.cmb_stft_out.currentText(),
             "stft_scale": self.cmb_stft_scale.currentText(),
             "stft_amp_conv": self.cmb_stft_amp_conv.currentText(),
+            "stft_cmap": self.cmb_spec_cmap.currentText(),
+            "stft_dyn_range_db": int(self.spec_levels_spin.value()),
         }
 
         if wf_cfg is not None:

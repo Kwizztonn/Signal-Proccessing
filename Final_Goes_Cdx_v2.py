@@ -2303,6 +2303,9 @@ class WaterfallPlotWidget(QWidget):
     def __init__(self, mini=False, parent=None):
         super().__init__(parent)
         self.mini = bool(mini)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        if not self.mini:
+            self.setMinimumHeight(650)
         self.state = None
         self.plot_key = None
         self._rect_zoom_active = False
@@ -4049,8 +4052,11 @@ class WaterfallDetailWidget(QWidget):
         self.title.setStyleSheet("font-weight: bold;")
 
         self.canvas = WaterfallPlotWidget(mini=False)
-        self.canvas.setMinimumHeight(620)
+        self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.canvas.setMinimumHeight(700)
         self.canvas.clicked.connect(self._emit_active)
+
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         lay = QVBoxLayout(self)
         lay.addWidget(self.title)
@@ -5315,6 +5321,7 @@ class MainWindow(QMainWindow):
         self._active_canvas = None
         self._active_plot_key = None
         self._pending_waterfall_open_3d = False
+        self._waterfall_view_widget = None
         self._waterfall_result_widget = None
         self._waterfall_result_key = None
         self.custom_color_bands = default_custom_color_bands()
@@ -5718,10 +5725,12 @@ class MainWindow(QMainWindow):
 
         self.tab_controls = QWidget()
         self.tab_waterfall = QWidget()
+        self.tab_waterfall_view = QWidget()
         self.tab_plot = QWidget()
         self.tab_info = QWidget()
         self.tabs.addTab(self.tab_controls, self._make_tab_icon("controls"), "Controls")
         self.tabs.addTab(self.tab_waterfall, self._make_tab_icon("waterfall"), "Waterfall")
+        self.tabs.addTab(self.tab_waterfall_view, self._make_tab_icon("waterfall"), "Waterfall View")
         self.tabs.addTab(self.tab_plot, self._make_tab_icon("plot"), "Plot View")
         self.tabs.addTab(self.tab_info, self._make_tab_icon("help"), "Help / Info")
 
@@ -5868,6 +5877,7 @@ class MainWindow(QMainWindow):
         ctl.addStretch(1)
 
         self._build_waterfall_tab_ui()
+        self._build_waterfall_view_tab()
         self._build_help_tab_ui()
 
         ptab = QVBoxLayout(self.tab_plot)
@@ -6194,7 +6204,7 @@ class MainWindow(QMainWindow):
         if k in ("stft", "spectrogram", "spec", "image"):
             return self.mini_inner_spec_lay
         if k == "waterfall":
-            raise RuntimeError("Waterfall states are routed to the Waterfall tab result area, not Plot View mini sections.")
+            raise RuntimeError("Waterfall states are routed to the Waterfall View tab, not Plot View mini sections.")
         return self.mini_inner_spec_lay
 
     def _clear_detail_tabs(self):
@@ -6816,47 +6826,67 @@ class MainWindow(QMainWindow):
         return PlotMiniWidget(st)
 
     def _show_waterfall_result(self, state: dict):
-        """Render a waterfall state in the Waterfall tab's dedicated result area.
+        """Compatibility wrapper: waterfall states now render in Waterfall View."""
+        self._show_waterfall_view_result(state)
 
-        This deliberately leaves the normal Plot View mini columns untouched so
-        existing Time-domain / Averaged Spectrum / Spectrogram results remain
-        available and waterfall never appears in the Spectrograms column.
+    def _show_waterfall_view_result(self, state: dict):
+        """Render a waterfall state in the dedicated large Waterfall View tab.
+
+        This keeps the Waterfall tab control-only and keeps waterfall states out
+        of normal Plot View mini/detail panels, while still using the full
+        WaterfallDetailWidget/WaterfallPlotWidget stack (upper heatmap + lower
+        extracted order traces).
         """
         if state.get("kind") != "waterfall":
-            raise RuntimeError("_show_waterfall_result requires a waterfall state.")
+            raise RuntimeError("_show_waterfall_view_result requires a waterfall state.")
 
         key = state["key"]
         self._plot_states[key] = state
         self._waterfall_result_key = key
 
-        if getattr(self, "_waterfall_result_widget", None) is not None:
-            old = self._waterfall_result_widget
+        old = getattr(self, "_waterfall_view_widget", None)
+        if old is not None:
             try:
-                self._waterfall_result_lay.removeWidget(old)
+                self._waterfall_view_lay.removeWidget(old)
                 old.setParent(None)
                 old.deleteLater()
             except Exception:
                 pass
             self._detail_widgets.pop(getattr(old, "plot_key", key), None)
+            self._waterfall_view_widget = None
             self._waterfall_result_widget = None
 
+        if hasattr(self, "lbl_waterfall_view_empty"):
+            self.lbl_waterfall_view_empty.setVisible(False)
+            try:
+                self._waterfall_view_lay.removeWidget(self.lbl_waterfall_view_empty)
+            except Exception:
+                pass
+
         detail = WaterfallDetailWidget(state)
+        detail.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         detail.activated.connect(self._set_active_canvas)
         self._connect_canvas_color_signals(detail.canvas)
         self._draw_state_on_canvas(detail.canvas, state, preserve_limits=False)
 
+        self._waterfall_view_widget = detail
+        # Retain the old attribute name only as an alias for legacy cleanup paths;
+        # the widget is no longer embedded in the Waterfall controls tab.
         self._waterfall_result_widget = detail
-        if hasattr(self, "lbl_wf_result_empty"):
-            self.lbl_wf_result_empty.setVisible(False)
-        self._waterfall_result_lay.addWidget(detail, 1)
+        self._waterfall_view_lay.addWidget(detail, 1)
         self._detail_widgets[key] = detail
         self._set_active_canvas(detail.canvas, key)
 
         stats = state.get("stats_text", "")
         self.lbl_stats.setText(stats)
+        if hasattr(self, "lbl_waterfall_view_meta"):
+            self.lbl_waterfall_view_meta.setText(stats or state.get("title", "Waterfall result ready."))
         if hasattr(self, "lbl_wf_status"):
-            self.lbl_wf_status.setText(stats or "Waterfall result ready.")
-        self.tabs.setCurrentWidget(self.tab_waterfall)
+            self.lbl_wf_status.setText(stats or "Waterfall result ready in Waterfall View.")
+        if hasattr(self, "lbl_wf_result_empty"):
+            self.lbl_wf_result_empty.setText("Last result available in Waterfall View.")
+
+        self.tabs.setCurrentWidget(self.tab_waterfall_view)
 
         if self._pending_waterfall_open_3d:
             self._pending_waterfall_open_3d = False
@@ -6864,10 +6894,10 @@ class MainWindow(QMainWindow):
                 detail.canvas.open_3d_window()
 
     def _clear_waterfall_result(self):
-        widget = getattr(self, "_waterfall_result_widget", None)
+        widget = getattr(self, "_waterfall_view_widget", None)
         if widget is not None:
             try:
-                self._waterfall_result_lay.removeWidget(widget)
+                self._waterfall_view_lay.removeWidget(widget)
                 widget.setParent(None)
                 widget.deleteLater()
             except Exception:
@@ -6876,10 +6906,19 @@ class MainWindow(QMainWindow):
         if key is not None:
             self._plot_states.pop(key, None)
             self._detail_widgets.pop(key, None)
+        self._waterfall_view_widget = None
         self._waterfall_result_widget = None
         self._waterfall_result_key = None
+        if hasattr(self, "lbl_waterfall_view_empty"):
+            self.lbl_waterfall_view_empty.setVisible(True)
+            if self._waterfall_view_lay.indexOf(self.lbl_waterfall_view_empty) < 0:
+                self._waterfall_view_lay.addWidget(self.lbl_waterfall_view_empty, 1)
+        if hasattr(self, "lbl_waterfall_view_meta"):
+            self.lbl_waterfall_view_meta.setText("")
         if hasattr(self, "lbl_wf_result_empty"):
-            self.lbl_wf_result_empty.setVisible(True)
+            self.lbl_wf_result_empty.setText(
+                "Waterfall result opens in the Waterfall View tab. Configure acceleration/RPM sources above, then click Plot Waterfall."
+            )
 
     def _on_mini_request_open(self, key: str):
         """Dispatch a mini's request_open: clicking the canvas updates the
@@ -6902,7 +6941,7 @@ class MainWindow(QMainWindow):
 
     def _on_plot_worker_finished(self, states):
         if states and all(st.get("kind") == "waterfall" for st in states):
-            self._show_waterfall_result(states[0])
+            self._show_waterfall_view_result(states[0])
             return
 
         normal_states = [st for st in states if st.get("kind") != "waterfall"]
@@ -6984,6 +7023,10 @@ class MainWindow(QMainWindow):
     def _on_rect_zoom_toggled(self, checked):
         if self._active_canvas is not None:
             self._active_canvas.set_rect_zoom_active(checked)
+        if hasattr(self, "btn_wfv_rect_zoom") and self.btn_wfv_rect_zoom.isChecked() != checked:
+            self.btn_wfv_rect_zoom.blockSignals(True)
+            self.btn_wfv_rect_zoom.setChecked(checked)
+            self.btn_wfv_rect_zoom.blockSignals(False)
 
     def _open_plot_view_advanced_dialog(self):
         """Modal that exposes axis labels, colormap, color mode, and dB range.
@@ -7172,8 +7215,11 @@ class MainWindow(QMainWindow):
                         ax0.plot(fx[m], rpms[m], color=color, linewidth=1.5)
 
                         tr = self._active_canvas._extract_order_trace(order_val)
-                        mm = np.isfinite(tr) & np.isfinite(rpms)
-                        ax1.plot(rpms[mm], tr[mm], color=color, linewidth=1.6, label=f"Order {order_val:.2f}x")
+                        rpms_axis = getattr(self._active_canvas, "rpms_trace", np.array([]))
+                        if rpms_axis.size == 0 or rpms_axis.size != np.asarray(tr).size:
+                            rpms_axis = rpms
+                        mm = np.isfinite(tr) & np.isfinite(rpms_axis)
+                        ax1.plot(rpms_axis[mm], tr[mm], color=color, linewidth=1.6, label=f"Order {order_val:.2f}x")
 
                     ax1.legend(loc="best")
 
@@ -7641,7 +7687,7 @@ class MainWindow(QMainWindow):
 One normal Plot request creates those three plot families for the selected channels.</p>
 <p><b>Waterfall workflow:</b> Switch to the <i>Waterfall</i> tab, open your acceleration and RPM files
 (can be the same file or different files), configure NFFT / Overlap / Spectra / Buffers, then click
-<i>Plot Waterfall</i>. Waterfall has a dedicated <i>Waterfall Result</i> display inside the Waterfall tab and
+<i>Plot Waterfall</i>. Waterfall opens in the dedicated <i>Waterfall View</i> tab and
 <b>does not populate</b> the normal Time-domain / Averaged Spectrum / Spectrogram mini panels.</p>""")
 
         # ── 2. Signal & FFT Parameters ─────────────────────────────────
@@ -7676,9 +7722,10 @@ One normal Plot request creates those three plot families for the selected chann
 
         # ── 3. Waterfall & Order Tracking ──────────────────────────────
         _section("3 · Waterfall &amp; Order Tracking", """
-<p><b>Waterfall Result display:</b> waterfall uses acceleration + RPM and is rendered in its own
-Waterfall tab result area, separate from normal Plot View. A frequency waterfall is
-<b>Frequency vs RPM</b>. This is different from an STFT spectrogram, which is <b>Frequency vs Time</b>.</p>
+<p><b>Waterfall View display:</b> waterfall configuration stays in the Waterfall tab, while computed results open in the dedicated
+Waterfall View tab, separate from normal Plot View. The upper plot is a <b>Frequency vs RPM</b> heatmap with colorbar and order cursors;
+the lower plot is an extracted <b>Amplitude vs RPM</b> order-trace display for active orders such as 1.00x and 2.00x.
+This is different from an STFT spectrogram, which is <b>Frequency vs Time</b>.</p>
 <p><b>Order Tracking Filter:</b> not a cursor. It changes the waterfall data by isolating or rejecting
 a selected-order band around <i>f = order × RPM / 60</i>. An order cursor is only a visual guide drawn
 on top of the result.</p>
@@ -7759,7 +7806,7 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
   <li><b>Wrong fs</b> shifts the entire frequency axis — always verify fs matches your hardware setting.</li>
   <li><b>Large Num Spectra</b> controls display interpolation density only; it makes the plot look smoother but adds no real information beyond the raw frame count.</li>
   <li><b>Large Num Buffers</b> smooths neighboring frames and may hide sharp spectral peaks — use sparingly.</li>
-  <li><b>STFT vs Waterfall:</b> STFT is Frequency vs Time; Waterfall is Frequency vs RPM and appears only in the dedicated Waterfall Result area.</li>
+  <li><b>STFT vs Waterfall:</b> STFT is Frequency vs Time; Waterfall is Frequency vs RPM and appears only in the dedicated Waterfall View tab.</li>
   <li><b>Too much overlap</b> (e.g. 95 %) creates very many frames but does not improve frequency resolution.</li>
   <li><b>RPM = 0 or NaN in data</b> is treated as an invalid frame and excluded from the waterfall.</li>
   <li><b>RPM spikes</b> can corrupt order analysis — use the spike-rejection option (MAD-based).</li>
@@ -7856,6 +7903,113 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
             "Only increase it if your data is very noisy and you have confirmed that the "
             "features of interest are broad.",
         )
+
+    def _build_waterfall_view_tab(self):
+        """Build the dedicated large waterfall result tab.
+
+        The Waterfall tab remains a control/configuration surface; computed
+        waterfall states are rendered here with the full WaterfallDetailWidget
+        so the upper heatmap and lower order-trace plot both have room.
+        """
+        lay = QVBoxLayout(self.tab_waterfall_view)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.setSpacing(6)
+
+        toolbar = QHBoxLayout()
+        self.btn_wfv_rect_zoom = QPushButton("Rectangle Zoom")
+        self.btn_wfv_rect_zoom.setCheckable(True)
+        self.btn_wfv_zoom_in = QPushButton("Zoom In")
+        self.btn_wfv_zoom_out = QPushButton("Zoom Out")
+        self.btn_wfv_reset_view = QPushButton("Reset View")
+        self.btn_wfv_export = QPushButton("Export Current Plot")
+        self.btn_wfv_open_3d = QPushButton("Open 3D")
+        self.btn_wfv_open_2d = QPushButton("Open 2D Standalone")
+        self.btn_wfv_clear = QPushButton("Clear annotations/cursors")
+
+        for btn in (
+            self.btn_wfv_rect_zoom,
+            self.btn_wfv_zoom_in,
+            self.btn_wfv_zoom_out,
+            self.btn_wfv_reset_view,
+            self.btn_wfv_export,
+            self.btn_wfv_open_3d,
+            self.btn_wfv_open_2d,
+            self.btn_wfv_clear,
+        ):
+            toolbar.addWidget(btn)
+        toolbar.addStretch(1)
+        lay.addLayout(toolbar)
+
+        self.lbl_waterfall_view_meta = QLabel("")
+        self.lbl_waterfall_view_meta.setWordWrap(True)
+        self.lbl_waterfall_view_meta.setStyleSheet("color: #444;")
+        lay.addWidget(self.lbl_waterfall_view_meta)
+
+        self._waterfall_view_host = QWidget()
+        self._waterfall_view_host.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._waterfall_view_lay = QVBoxLayout(self._waterfall_view_host)
+        self._waterfall_view_lay.setContentsMargins(0, 0, 0, 0)
+        self._waterfall_view_lay.setSpacing(0)
+
+        self.lbl_waterfall_view_empty = QLabel(
+            "No waterfall result yet. Configure acceleration/RPM sources in the Waterfall tab, "
+            "then click Plot Waterfall."
+        )
+        self.lbl_waterfall_view_empty.setAlignment(Qt.AlignCenter)
+        self.lbl_waterfall_view_empty.setStyleSheet("color: #666; font-size: 14px;")
+        self.lbl_waterfall_view_empty.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._waterfall_view_lay.addWidget(self.lbl_waterfall_view_empty, 1)
+        lay.addWidget(self._waterfall_view_host, 1)
+
+        self._waterfall_view_widget = None
+        self._waterfall_result_widget = None
+        self._waterfall_result_key = None
+
+        self.btn_wfv_rect_zoom.toggled.connect(self._on_waterfall_view_rect_zoom_toggled)
+        self.btn_wfv_zoom_in.clicked.connect(lambda: self._zoom_active(0.8))
+        self.btn_wfv_zoom_out.clicked.connect(lambda: self._zoom_active(1.25))
+        self.btn_wfv_reset_view.clicked.connect(self._reset_active_view)
+        self.btn_wfv_export.clicked.connect(self._export_current_plot)
+        self.btn_wfv_open_3d.clicked.connect(self._open_active_waterfall_3d)
+        self.btn_wfv_open_2d.clicked.connect(self._open_active_waterfall_2d)
+        self.btn_wfv_clear.clicked.connect(self._clear_active_waterfall_annotations)
+
+    def _on_waterfall_view_rect_zoom_toggled(self, checked):
+        self._on_rect_zoom_toggled(checked)
+        if hasattr(self, "btn_rect_zoom") and self.btn_rect_zoom.isChecked() != checked:
+            self.btn_rect_zoom.blockSignals(True)
+            self.btn_rect_zoom.setChecked(checked)
+            self.btn_rect_zoom.blockSignals(False)
+
+    def _go_to_waterfall_view(self):
+        if hasattr(self, "tab_waterfall_view"):
+            self.tabs.setCurrentWidget(self.tab_waterfall_view)
+            widget = getattr(self, "_waterfall_view_widget", None)
+            if widget is not None:
+                self._set_active_canvas(widget.canvas, widget.plot_key)
+
+    def _open_active_waterfall_3d(self):
+        canvas = self._active_canvas
+        if canvas is None or not hasattr(canvas, "open_3d_window"):
+            self._err("There is no active waterfall plot to open in 3D.")
+            return
+        canvas.open_3d_window()
+
+    def _open_active_waterfall_2d(self):
+        canvas = self._active_canvas
+        if canvas is None or not hasattr(canvas, "open_2d_standalone_window"):
+            self._err("There is no active waterfall plot to open standalone.")
+            return
+        canvas.open_2d_standalone_window()
+
+    def _clear_active_waterfall_annotations(self):
+        canvas = self._active_canvas
+        if canvas is None:
+            return
+        if hasattr(canvas, "clear_click_annotations"):
+            canvas.clear_click_annotations()
+        if hasattr(canvas, "clear_cursors"):
+            canvas.clear_cursors()
 
     def _build_waterfall_tab_ui(self):
         self.btn_wf_acc_open = QPushButton("Open Acc file (.xlsx / .tdms / .csv)")
@@ -8307,20 +8461,23 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
 
         lay.addWidget(self.lbl_wf_status)
 
-        self.wf_result_group = QGroupBox("Waterfall Result")
+        self.wf_result_group = QGroupBox("Waterfall View")
         self.wf_result_group.setStyleSheet(
             "QGroupBox { font-weight: bold; border: 1px solid #999;"
             " border-radius: 4px; margin-top: 8px; padding: 6px; }"
             "QGroupBox::title { subcontrol-origin: margin; left: 8px; }"
         )
-        self._waterfall_result_lay = QVBoxLayout(self.wf_result_group)
+        wf_status_lay = QHBoxLayout(self.wf_result_group)
         self.lbl_wf_result_empty = QLabel(
-            "No waterfall result yet. Configure acceleration/RPM sources above, then click Plot Waterfall."
+            "Waterfall result opens in the Waterfall View tab. Configure acceleration/RPM sources above, then click Plot Waterfall."
         )
-        self.lbl_wf_result_empty.setAlignment(Qt.AlignCenter)
+        self.lbl_wf_result_empty.setWordWrap(True)
         self.lbl_wf_result_empty.setStyleSheet("color: #666;")
-        self._waterfall_result_lay.addWidget(self.lbl_wf_result_empty, 1)
-        lay.addWidget(self.wf_result_group, 1)
+        self.btn_go_waterfall_view = QPushButton("Open Waterfall View")
+        self.btn_go_waterfall_view.clicked.connect(self._go_to_waterfall_view)
+        wf_status_lay.addWidget(self.lbl_wf_result_empty, 1)
+        wf_status_lay.addWidget(self.btn_go_waterfall_view)
+        lay.addWidget(self.wf_result_group, 0)
 
         self.btn_wf_acc_open.clicked.connect(lambda: self._open_waterfall_source("acc"))
         self.btn_wf_rpm_open.clicked.connect(lambda: self._open_waterfall_source("rpm"))

@@ -88,11 +88,13 @@ except Exception:
 
 # --- SciPy (Butterworth + zero-phase) ---
 try:
-    from scipy.signal import butter, sosfiltfilt
+    from scipy.signal import butter, sosfiltfilt, sosfilt, detrend as scipy_detrend
     _HAVE_SCIPY = True
 except Exception:
     butter = None
     sosfiltfilt = None
+    sosfilt = None
+    scipy_detrend = None
     _HAVE_SCIPY = False
 
 if _HAVE_PG:
@@ -123,14 +125,143 @@ def get_amp_conv_factor_label(amp_conv: str, signal_kind: str):
 
 
 def build_spectrum_ylabel(output_type: str, scale: str, unit_lbl: str) -> str:
-    out = str(output_type).strip() or "Amplitude"
+    out = normalize_output_type(output_type) if "normalize_output_type" in globals() else (str(output_type).strip() or "Amplitude")
+    base_unit = "mm/s" if "mm/s" in str(unit_lbl) else "g"
+    if out == "Power":
+        label_unit = f"({base_unit})²"
+    elif out == "PSD":
+        label_unit = f"({base_unit})²/Hz"
+    elif out == "ASD":
+        label_unit = f"{base_unit}/√Hz"
+    else:
+        label_unit = unit_lbl
     scl = str(scale).strip().lower()
     if scl == "db":
-        return f"{out} ({unit_lbl}) [dB]"
-    return f"{out} ({unit_lbl})"
+        factor = "20log10" if out in ("Amplitude", "ASD") else "10log10"
+        return f"{out} ({label_unit}) [dB re 1, {factor}]"
+    return f"{out} ({label_unit})"
 
 
 
+
+
+def normalize_output_type(output_type: str) -> str:
+    """Return canonical spectrum output type: Amplitude, Power, PSD, or ASD."""
+    out = str(output_type or "Amplitude").strip().upper()
+    if out in ("PSD", "POWER SPECTRAL DENSITY"):
+        return "PSD"
+    if out in ("ASD", "AMPLITUDE SPECTRAL DENSITY"):
+        return "ASD"
+    if out.startswith("POW"):
+        return "Power"
+    return "Amplitude"
+
+
+def window_coherent_gain(w: np.ndarray) -> float:
+    w = np.asarray(w, dtype=np.float64)
+    return float(np.sum(w) / max(w.size, 1)) if w.size else 0.0
+
+
+def window_power(w: np.ndarray) -> float:
+    w = np.asarray(w, dtype=np.float64)
+    return float(np.sum(w * w))
+
+
+def window_enbw_hz(w: np.ndarray, fs: float) -> float:
+    w = np.asarray(w, dtype=np.float64)
+    s1 = float(np.sum(w))
+    if w.size == 0 or s1 == 0.0:
+        return np.nan
+    return float(fs) * float(np.sum(w * w)) / (s1 * s1)
+
+
+def one_sided_correction(nfft: int) -> np.ndarray:
+    """One-sided power correction for rFFT bins (DC/Nyquist not doubled)."""
+    nfft = max(2, int(nfft))
+    c = np.ones(nfft // 2 + 1, dtype=np.float64)
+    if c.size > 2:
+        if nfft % 2 == 0:
+            c[1:-1] = 2.0
+        else:
+            c[1:] = 2.0
+    elif c.size == 2 and nfft % 2 != 0:
+        c[1] = 2.0
+    return c
+
+
+def spectrum_db_factor(output_type: str) -> float:
+    out = normalize_output_type(output_type)
+    return 20.0 if out in ("Amplitude", "ASD") else 10.0
+
+
+def convert_linear_to_db(values: np.ndarray, output_type: str, ref: float = 1.0) -> np.ndarray:
+    eps = 1e-30
+    ref = abs(float(ref)) or 1.0
+    return spectrum_db_factor(output_type) * np.log10(np.maximum(np.asarray(values, dtype=np.float64), eps) / ref)
+
+
+def _amplitude_to_power(A: np.ndarray, nfft: int) -> np.ndarray:
+    """Convert one-sided peak amplitude bins to RMS^2 line power."""
+    A = np.asarray(A, dtype=np.float64)
+    P = (A / np.sqrt(2.0)) ** 2
+    if P.size:
+        P[0] = A[0] * A[0]
+        if nfft % 2 == 0 and P.size > 1:
+            P[-1] = A[-1] * A[-1]
+    return P
+
+
+def _power_to_peak_amplitude(P: np.ndarray, nfft: int) -> np.ndarray:
+    P = np.maximum(np.asarray(P, dtype=np.float64), 0.0)
+    A = np.sqrt(P) * np.sqrt(2.0)
+    if A.size:
+        A[0] = np.sqrt(P[0])
+        if nfft % 2 == 0 and A.size > 1:
+            A[-1] = np.sqrt(P[-1])
+    return A
+
+
+def compute_spectrum_frame(
+    segment: np.ndarray,
+    fs: float,
+    nfft: int,
+    amp_conv: str = "Peak",
+    signal_kind: str = "acc",
+    output_type: str = "Amplitude",
+    *,
+    window_kind: str = "periodic",
+):
+    """Shared one-sided FFT kernel with Amplitude/Power/PSD/ASD semantics."""
+    segment = np.nan_to_num(np.asarray(segment, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    fs = float(fs)
+    nfft = max(2, int(nfft))
+    freqs = np.fft.rfftfreq(nfft, d=1.0 / fs) if np.isfinite(fs) and fs > 0 else np.arange(nfft // 2 + 1)
+    if segment.size == 0 or not np.isfinite(fs) or fs <= 0.0:
+        return freqs, np.zeros(freqs.size, dtype=np.float64)
+    nseg = min(int(segment.size), nfft)
+    if nseg <= 1:
+        return freqs, np.zeros(freqs.size, dtype=np.float64)
+    x = segment[:nseg]
+    w = _hann_window(nseg, window_kind)
+    X = np.fft.rfft(x * w, n=nfft)
+    out = normalize_output_type(output_type)
+    if out in ("PSD", "ASD"):
+        U = window_power(w) or float(nseg)
+        psd = (np.abs(X) ** 2) / (fs * U)
+        psd *= one_sided_correction(nfft)
+        spec = np.sqrt(np.maximum(psd, 0.0)) if out == "ASD" else psd
+    else:
+        w_sum = float(np.sum(w)) or float(nseg)
+        A_peak = (2.0 * np.abs(X)) / w_sum
+        A_peak[0] *= 0.5
+        if nfft % 2 == 0 and A_peak.size > 1:
+            A_peak[-1] *= 0.5
+        if out == "Amplitude":
+            conv, _ = get_amp_conv_factor_label(amp_conv, signal_kind)
+            spec = A_peak * conv
+        else:
+            spec = _amplitude_to_power(A_peak, nfft)
+    return freqs, np.maximum(np.asarray(spec, dtype=np.float64), 0.0)
 
 def _hann_window(N: int, kind: str = "periodic") -> np.ndarray:
     """Hann window of length N.
@@ -237,7 +368,7 @@ def apply_order_tracking_filter(
     filter_order: int = 4,
     output_type: str = "Amplitude",
 ) -> tuple:
-    """nCode-like Order Tracking Filter (frame-based, RPM-adaptive).
+    """Frequency-domain order mask (frame-based, RPM-adaptive).
 
     For each FFT frame, computes the center frequency
         f_center = target_order * RPM_frame / 60
@@ -251,9 +382,8 @@ def apply_order_tracking_filter(
 
     Notes
     -----
-    This is a frame-based approximation of a true time-varying IIR filter.
-    It correctly isolates the chosen order in the displayed waterfall while
-    avoiding the implementation risk of a real-time adaptive Butterworth.
+    This is not a true nCode time-domain adaptive order filter. It is a
+    display/FFT-domain mask used to isolate order content in waterfall frames.
     """
     freqs = np.asarray(freqs, dtype=np.float64)
     frame_rpms = np.asarray(frame_rpms, dtype=np.float64)
@@ -267,7 +397,7 @@ def apply_order_tracking_filter(
     order_unit = str(bw_unit).strip().lower().startswith("order")
     n = int(max(1, filter_order))
     is_bandpass = str(filter_type).strip().lower().startswith("band-pass")
-    is_amplitude = str(output_type).strip().lower() == "amplitude"
+    is_amplitude = normalize_output_type(output_type) in ("Amplitude", "ASD")
 
     out = np.zeros_like(S)
     trace = np.zeros(S.shape[0], dtype=np.float64)
@@ -312,6 +442,140 @@ def apply_order_tracking_filter(
 
     return out, trace
 
+
+
+def apply_time_domain_order_tracking_filter(
+    signal: np.ndarray,
+    rpm: np.ndarray,
+    fs: float,
+    target_order: float,
+    half_bw: float,
+    bw_unit: str = "Order",
+    filter_type: str = "Band-pass",
+    filter_order: int = 4,
+    method: str = "blockwise_sosfiltfilt",
+    block_revs=None,
+    block_seconds=None,
+    crossfade: bool = True,
+) -> tuple:
+    """Approximate nCode-like time-domain adaptive order filter.
+
+    The instantaneous center frequency is k*RPM/60. Because scipy's Butterworth
+    design is LTI, this function applies SOS filters blockwise using the median
+    RPM in each block and overlap-add crossfading. Metadata records clamping,
+    rejected blocks, cutoff ranges, and warnings.
+    """
+    meta = {
+        "mode": "Time-domain adaptive order filter",
+        "enabled": True,
+        "target_order": float(target_order),
+        "half_bw": float(half_bw),
+        "bw_unit": bw_unit,
+        "filter_type": filter_type,
+        "filter_order": int(filter_order),
+        "method": method,
+        "block_count": 0,
+        "rejected_blocks": 0,
+        "cutoff_low_min": np.nan,
+        "cutoff_low_max": np.nan,
+        "cutoff_high_min": np.nan,
+        "cutoff_high_max": np.nan,
+        "rpm_min": np.nan,
+        "rpm_max": np.nan,
+        "warnings": [],
+    }
+    x = np.nan_to_num(np.asarray(signal, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    r_raw = np.asarray(rpm, dtype=np.float64)
+    n = min(x.size, r_raw.size)
+    if n == 0 or not np.isfinite(fs) or fs <= 0.0:
+        meta["warnings"].append("Empty signal/RPM or invalid sampling rate; filter bypassed.")
+        return x.copy(), meta
+    x = x[:n]
+    r_clean = clean_rpm_signal(r_raw[:n], mode="interpolate")
+    finite_r = r_clean[np.isfinite(r_clean) & (r_clean > 0)]
+    if finite_r.size < max(8, n // 100):
+        meta["warnings"].append("Insufficient finite positive RPM samples; filter bypassed.")
+        return x.copy(), meta
+    meta["rpm_min"] = float(np.min(finite_r)); meta["rpm_max"] = float(np.max(finite_r))
+    # Fill leading/trailing RPM from nearest valid for block labelling.
+    bad = ~np.isfinite(r_clean) | (r_clean <= 0)
+    if np.any(bad):
+        idx = np.arange(n)
+        good = np.where(~bad)[0]
+        r_clean = np.interp(idx, good, r_clean[good])
+        meta["warnings"].append("RPM invalid spans interpolated/fill-applied before adaptive filtering.")
+
+    nyq = 0.5 * float(fs)
+    target_order = float(target_order)
+    half_bw = max(float(half_bw), 1e-9)
+    order_bw = str(bw_unit).strip().lower().startswith("order")
+    btype = "bandpass" if str(filter_type).strip().lower().startswith("band-pass") else "bandstop"
+    filt_order = int(max(1, filter_order))
+
+    if block_seconds is None:
+        if block_revs is not None and np.nanmedian(r_clean) > 0:
+            block_seconds = max(0.05, float(block_revs) / (float(np.nanmedian(r_clean)) / 60.0))
+        else:
+            block_seconds = 0.5
+    block_len = int(max(32, round(float(block_seconds) * float(fs))))
+    block_len = min(max(block_len, 32), n)
+    overlap = int(0.25 * block_len) if crossfade and block_len > 64 else 0
+    step = max(1, block_len - overlap)
+
+    y_sum = np.zeros(n, dtype=np.float64)
+    w_sum = np.zeros(n, dtype=np.float64)
+    lows = []; highs = []
+    starts = list(range(0, n, step))
+    for start in starts:
+        stop = min(n, start + block_len)
+        if stop - start < max(16, 3 * filt_order * 2):
+            meta["rejected_blocks"] += 1
+            continue
+        rpm_rep = float(np.nanmedian(r_clean[start:stop]))
+        if not np.isfinite(rpm_rep) or rpm_rep <= 0:
+            meta["rejected_blocks"] += 1
+            continue
+        fc = target_order * rpm_rep / 60.0
+        hb = half_bw * rpm_rep / 60.0 if order_bw else half_bw
+        flo = fc - hb
+        fhi = fc + hb
+        orig = (flo, fhi)
+        flo = max(flo, max(1e-6, nyq * 1e-6))
+        fhi = min(fhi, nyq * (1.0 - 1e-6))
+        if not (0.0 < flo < fhi < nyq):
+            meta["rejected_blocks"] += 1
+            meta["warnings"].append(f"Rejected block {start}:{stop}; invalid cutoffs {orig} Hz.")
+            continue
+        if orig != (flo, fhi):
+            meta["warnings"].append("One or more adaptive filter cutoffs were clamped to valid Nyquist range.")
+        try:
+            sos = butter(filt_order, [flo / nyq, fhi / nyq], btype=btype, output="sos")
+            seg = x[start:stop]
+            padlen = min(seg.size - 1, 3 * (2 * sos.shape[0] + 1))
+            if sosfiltfilt is not None and seg.size > padlen + 1:
+                yb = sosfiltfilt(sos, seg, padlen=padlen)
+            else:
+                yb = sosfilt(sos, seg) if sosfilt is not None else seg.copy()
+            ww = np.ones(stop - start, dtype=np.float64)
+            if crossfade and overlap > 0 and ww.size > 2 * overlap:
+                ramp = np.linspace(0.0, 1.0, overlap, endpoint=False)
+                ww[:overlap] = ramp
+                ww[-overlap:] = ramp[::-1]
+            y_sum[start:stop] += yb * ww
+            w_sum[start:stop] += ww
+            lows.append(flo); highs.append(fhi); meta["block_count"] += 1
+        except Exception as e:
+            meta["rejected_blocks"] += 1
+            meta["warnings"].append(f"Adaptive filter block {start}:{stop} failed: {e}")
+    valid = w_sum > 0
+    y = x.copy()
+    y[valid] = y_sum[valid] / w_sum[valid]
+    if lows:
+        meta["cutoff_low_min"] = float(np.min(lows)); meta["cutoff_low_max"] = float(np.max(lows))
+        meta["cutoff_high_min"] = float(np.min(highs)); meta["cutoff_high_max"] = float(np.max(highs))
+    if meta["block_count"] == 0:
+        meta["warnings"].append("No adaptive filter blocks accepted; signal bypassed.")
+    return y, meta
 
 def compute_order_map(
     freqs: np.ndarray,
@@ -381,10 +645,7 @@ def compute_order_map(
 
     if str(scale).strip().lower() == "db":
         eps = 1e-30
-        if str(output_type).strip() == "Amplitude":
-            S_order_out = 20.0 * np.log10(S_order_linear + eps)
-        else:
-            S_order_out = 10.0 * np.log10(S_order_linear + eps)
+        S_order_out = convert_linear_to_db(S_order_linear, output_type)
     else:
         S_order_out = S_order_linear
 
@@ -401,139 +662,83 @@ def compute_order_tracking_spectrum(
     order_max: float = 20.0,
     amp_conv: str = "Peak",
     signal_kind: str = "acc",
+    *,
+    detrend: str = "None",
+    window_kind: str = "periodic",
+    return_metadata: bool = False,
 ) -> tuple:
-    """Computed Order Tracking — angle-domain resampling and FFT.
-
-    Algorithm
-    ---------
-    1. Compute instantaneous shaft angle θ(t) = ∫ ω(t) dt,
-       where ω(t) = 2π · RPM(t) / 60.
-    2. Resample acc from uniform time to uniform angle grid
-       (samples_per_rev points per revolution).
-    3. Compute one-sided FFT in the angle domain.
-    4. The X-axis is in orders (integer or fractional multiples of shaft speed).
-
-    Parameters
-    ----------
-    acc, rpm : (N,) arrays
-        Acceleration and RPM signals on the same uniform time grid.
-    fs : float
-        Sampling frequency in Hz (common, after alignment).
-    samples_per_rev : int
-        Resampling density: samples per shaft revolution.  512 or 1024 are
-        typical values.  Higher = finer order resolution.
-    order_max : float
-        Maximum order to include in the output.
-    amp_conv : str
-        "Peak", "RMS", or "Peak-to-Peak" amplitude convention.
-    signal_kind : str
-        "acc" or "vel" — selects the physical unit label.
-
-    Returns
-    -------
-    orders : (K,) array
-        Order axis from 0 to order_max.
-    amp_spectrum : (K,) array
-        One-sided amplitude spectrum in the requested convention.
-    amp_vs_rpm : dict with keys "rpms" and "amp"
-        Per-revolution RMS amplitude — useful for a run-up overview.
-    """
-    try:
-        from scipy.interpolate import interp1d as _interp1d
-        _HAVE_SCIPY_INTERP = True
-    except ImportError:
-        _HAVE_SCIPY_INTERP = False
-
+    """Computed Order Tracking using true RPM-driven angle resampling."""
+    meta = {"rpm_min": np.nan, "rpm_max": np.nan, "total_revs": 0.0,
+            "samples_per_rev": int(samples_per_rev), "order_max": float(order_max),
+            "rpm_interpolated": False, "warnings": []}
     acc = np.asarray(acc, dtype=np.float64)
-    rpm_clean = clean_rpm_signal(np.asarray(rpm, dtype=np.float64), mode="interpolate")
-
-    n = min(acc.size, rpm_clean.size)
-    if n < 4:
-        raise RuntimeError("Signal too short for computed order tracking.")
-    acc = acc[:n]
-    rpm_c = rpm_clean[:n]
-
-    # Replace remaining NaN with forward-fill then zero
-    nan_mask = ~np.isfinite(rpm_c)
-    if nan_mask.any():
-        for i in range(1, n):
-            if nan_mask[i] and not nan_mask[i - 1]:
-                rpm_c[i] = rpm_c[i - 1]
-                nan_mask[i] = False
-        rpm_c[nan_mask] = 0.0
-
-    dt = 1.0 / float(fs)
-    omega = 2.0 * np.pi * rpm_c / 60.0                  # rad/s
-    theta = np.cumsum(omega) * dt                         # shaft angle (rad)
-
-    total_revs = float(theta[-1]) / (2.0 * np.pi)
+    rpm_raw = np.asarray(rpm, dtype=np.float64)
+    fs = float(fs)
+    n = min(acc.size, rpm_raw.size)
+    if n <= 1 or not np.isfinite(fs) or fs <= 0.0:
+        raise RuntimeError("Computed Order Tracking requires same-length nonempty acc/RPM and valid fs.")
+    acc = np.nan_to_num(acc[:n], nan=0.0, posinf=0.0, neginf=0.0)
+    rpm_raw = rpm_raw[:n]
+    valid_raw = np.isfinite(rpm_raw) & (rpm_raw > 0.0)
+    if np.count_nonzero(valid_raw) < max(4, min(n, 16)):
+        raise RuntimeError("Computed Order Tracking: insufficient finite positive RPM samples.")
+    rpm_clean = clean_rpm_signal(rpm_raw, mode="interpolate")
+    bad = ~np.isfinite(rpm_clean) | (rpm_clean <= 0.0)
+    if np.any(~valid_raw) or np.any(bad):
+        meta["rpm_interpolated"] = True
+    if np.any(bad):
+        good = np.where(~bad)[0]
+        if good.size < 2:
+            raise RuntimeError("Computed Order Tracking: RPM cleaning left too few usable samples.")
+        rpm_clean = np.interp(np.arange(n), good, rpm_clean[good])
+        meta["warnings"].append("RPM leading/trailing invalid spans filled from nearest valid samples.")
+    finite = rpm_clean[np.isfinite(rpm_clean) & (rpm_clean > 0.0)]
+    if finite.size < 4:
+        raise RuntimeError("Computed Order Tracking: insufficient cleaned RPM samples.")
+    meta["rpm_min"] = float(np.min(finite)); meta["rpm_max"] = float(np.max(finite))
+    dsel = str(detrend).strip().lower()
+    if dsel in ("remove mean", "mean"):
+        acc = acc - float(np.mean(acc))
+    elif dsel.startswith("linear") and _HAVE_SCIPY:
+        acc = scipy_detrend(acc, type="linear")
+    dt = 1.0 / fs
+    omega = 2.0 * np.pi * rpm_clean / 60.0
+    theta = np.empty(n, dtype=np.float64)
+    theta[0] = 0.0
+    if n > 1:
+        theta[1:] = np.cumsum(0.5 * (omega[:-1] + omega[1:]) * dt)
+    keep = np.isfinite(theta) & np.isfinite(acc)
+    keep &= np.r_[True, np.diff(theta) > 1e-12]
+    theta_u = theta[keep]; acc_u = acc[keep]
+    if theta_u.size < 4:
+        raise RuntimeError("Computed Order Tracking: shaft angle is not sufficiently increasing for interpolation.")
+    total_revs = float((theta_u[-1] - theta_u[0]) / (2.0 * np.pi))
+    meta["total_revs"] = total_revs
     if total_revs < 0.5:
-        raise RuntimeError(
-            f"Computed Order Tracking: total shaft rotation is only {total_revs:.2f} "
-            "revolutions — too short for meaningful order analysis."
-        )
-
-    n_angle_samples = int(max(4, round(total_revs * samples_per_rev)))
-    theta_uniform = np.linspace(float(theta[0]), float(theta[-1]), n_angle_samples)
-
-    # Resample acc from theta(t) -> theta_uniform
-    if _HAVE_SCIPY_INTERP:
-        # Deduplicate theta (must be strictly increasing for interp)
-        _, unique_idx = np.unique(theta, return_index=True)
-        t_u = theta[unique_idx]
-        a_u = acc[unique_idx]
-        f_interp = _interp1d(t_u, a_u, kind="linear", bounds_error=False, fill_value=0.0)
-        acc_angle = f_interp(theta_uniform)
-    else:
-        acc_angle = np.interp(theta_uniform, theta, acc)
-
-    # One-sided FFT in angle domain
-    nfft_ot = n_angle_samples
-    w = _hann_window(nfft_ot, "periodic")
-    w_sum = float(np.sum(w)) or float(nfft_ot)
-    X = np.fft.rfft(acc_angle * w, n=nfft_ot)
-    mag = np.abs(X)
-    A_peak = (2.0 * mag) / w_sum
-    A_peak[0] *= 0.5
-    if (nfft_ot % 2 == 0) and A_peak.size > 1:
-        A_peak[-1] *= 0.5
-
-    # Order axis: Δorder = samples_per_rev / nfft_ot (≈ 1/total_revs per bin)
-    d_order = float(samples_per_rev) / float(nfft_ot)
-    orders_full = np.arange(A_peak.size, dtype=np.float64) * d_order
-
-    # Apply amplitude convention
-    conv, _ = get_amp_conv_factor_label(amp_conv, signal_kind)
-    amp_full = A_peak * conv
-
-    # Trim to order_max
-    keep = orders_full <= float(order_max)
-    orders = orders_full[keep]
-    amp_spectrum = amp_full[keep]
-
-    # Per-revolution amplitude vs RPM (RMS over each revolution)
-    rev_edges = np.arange(0.0, float(theta[-1]) + 2.0 * np.pi, 2.0 * np.pi)
-    rev_rpms = []
-    rev_amps = []
-    t_arr = np.arange(n, dtype=np.float64) * dt
-    for k in range(len(rev_edges) - 1):
-        lo = rev_edges[k]
-        hi = rev_edges[k + 1]
-        mask = (theta >= lo) & (theta < hi)
-        if not np.any(mask):
-            continue
-        rev_amps.append(float(np.sqrt(np.mean(acc[mask] ** 2))))
-        rev_rpms.append(float(np.mean(rpm_c[mask])))
-
-    return (
-        orders,
-        amp_spectrum,
-        {
-            "rpms": np.asarray(rev_rpms, dtype=np.float64),
-            "amp": np.asarray(rev_amps, dtype=np.float64),
-        },
+        raise RuntimeError(f"Computed Order Tracking: total shaft rotation is only {total_revs:.2f} revolutions.")
+    samples_per_rev = int(max(8, samples_per_rev))
+    n_angle_samples = int(max(8, round(total_revs * samples_per_rev)))
+    theta_uniform = np.linspace(float(theta_u[0]), float(theta_u[-1]), n_angle_samples)
+    acc_angle = np.interp(theta_uniform, theta_u, acc_u)
+    orders_full, spec = compute_spectrum_frame(
+        acc_angle, fs=float(samples_per_rev), nfft=n_angle_samples,
+        amp_conv=amp_conv, signal_kind=signal_kind, output_type="Amplitude",
+        window_kind=window_kind,
     )
-
+    keep_ord = orders_full <= float(order_max)
+    orders = orders_full[keep_ord]
+    amp_spectrum = spec[keep_ord]
+    rev_edges = np.arange(float(theta_u[0]), float(theta_u[-1]) + 2.0 * np.pi, 2.0 * np.pi)
+    rev_rpms = []; rev_amps = []
+    for k in range(len(rev_edges) - 1):
+        m = (theta >= rev_edges[k]) & (theta < rev_edges[k + 1])
+        if np.any(m):
+            rev_amps.append(float(np.sqrt(np.mean(acc[m] ** 2))))
+            rev_rpms.append(float(np.mean(rpm_clean[m])))
+    amp_vs_rpm = {"rpms": np.asarray(rev_rpms, dtype=np.float64), "amp": np.asarray(rev_amps, dtype=np.float64)}
+    if return_metadata:
+        return orders, amp_spectrum, amp_vs_rpm, meta
+    return orders, amp_spectrum, amp_vs_rpm
 
 def compute_one_sided_amp_spectrum_from_segment(
     segment: np.ndarray,
@@ -545,53 +750,13 @@ def compute_one_sided_amp_spectrum_from_segment(
     *,
     window_kind: str = "periodic",
 ):
-    """One valid segment -> one-sided spectrum.
+    """Backward-compatible wrapper for the shared one-sided spectrum kernel.
 
-    * Window length = nseg (actual segment); FFT length = nfft (zero-pad in rfft).
-    * window_kind selects periodic (default, recommended) or symmetric Hann.
-    * Amplitude output:  spec = A_peak * conv  (peak/RMS/p-p per amp_conv)
-    * Power output:      spec = RMS^2          (independent of amp_conv)
-    * DC and (when nfft even) Nyquist bins are NOT doubled.
+    Supports Amplitude, Power (RMS²/line), PSD (unit²/Hz), and ASD
+    (unit/√Hz).  Kept under its historical name so existing call sites and
+    plug-ins continue to work.
     """
-    segment = np.nan_to_num(np.asarray(segment, dtype=np.float64),
-                            nan=0.0, posinf=0.0, neginf=0.0)
-    fs = float(fs)
-    nfft = max(2, int(nfft))
-    freqs = np.fft.rfftfreq(nfft, d=1.0 / fs)
-
-    if segment.size == 0 or not np.isfinite(fs) or fs <= 0.0:
-        return freqs, np.zeros(freqs.size, dtype=np.float64)
-
-    nseg = int(segment.size)
-    if nseg > nfft:
-        segment = segment[:nfft]
-        nseg = nfft
-    if nseg <= 1:
-        return freqs, np.zeros(freqs.size, dtype=np.float64)
-
-    w = _hann_window(nseg, window_kind)
-    w_sum = float(np.sum(w)) or float(nseg)
-
-    X = np.fft.rfft(segment * w, n=nfft)
-    mag = np.abs(X)
-
-    A_peak = (2.0 * mag) / w_sum
-    A_peak[0] *= 0.5
-    if (nfft % 2 == 0) and (A_peak.size > 1):
-        A_peak[-1] *= 0.5
-
-    if str(output_type).strip() == "Amplitude":
-        conv, _ = get_amp_conv_factor_label(amp_conv, signal_kind)
-        spec = A_peak * conv
-    else:
-        # Power = RMS^2, regardless of amp_conv. DC and Nyquist are
-        # deterministic for a real signal -> RMS == peak there.
-        A_rms = A_peak / np.sqrt(2.0)
-        A_rms[0] = A_peak[0]
-        if (nfft % 2 == 0) and (A_rms.size > 1):
-            A_rms[-1] = A_peak[-1]
-        spec = A_rms * A_rms
-    return freqs, spec
+    return compute_spectrum_frame(segment, fs, nfft, amp_conv, signal_kind, output_type, window_kind=window_kind)
 
 def compute_avg_spectrum_from_signal(
     y: np.ndarray,
@@ -605,69 +770,52 @@ def compute_avg_spectrum_from_signal(
     *,
     window_kind: str = "periodic",
 ):
-    """nCode-/Welch-style averaged spectrum.
+    """Welch-style averaged spectrum with explicit output semantics.
 
-    Averaging is performed in the POWER domain (RMS^2 frames), then
-    converted to the requested output. Eliminates the Jensen-inequality
-    bias of amplitude-domain averaging. Vectorized framing + batched rfft.
+    Amplitude/Power frames are averaged in RMS² line-power domain and converted
+    back as requested. PSD/ASD use window-power normalization and are averaged
+    as PSD before ASD square-root conversion.
     """
-    y = np.nan_to_num(np.asarray(y, dtype=np.float64),
-                      nan=0.0, posinf=0.0, neginf=0.0)
-    fs = float(fs)
-    nfft = max(2, int(nfft))
+    y = np.nan_to_num(np.asarray(y, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    fs = float(fs); nfft = max(2, int(nfft))
     if y.size == 0 or not np.isfinite(fs) or fs <= 0.0:
         return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
-
     nperseg = min(nfft, int(y.size))
+    freqs = np.fft.rfftfreq(nfft, d=1.0 / fs)
     if nperseg <= 1:
-        return (np.fft.rfftfreq(nfft, d=1.0 / fs),
-                np.zeros(nfft // 2 + 1, dtype=np.float64))
-
+        return freqs, np.zeros(freqs.size, dtype=np.float64)
     ovl = float(np.clip(float(overlap_pct) / 100.0, 0.0, 0.95))
     hop = max(1, int(round(nperseg * (1.0 - ovl))))
     n_frames = 1 if y.size <= nperseg else 1 + (y.size - nperseg) // hop
-
-    w = _hann_window(nperseg, window_kind)
-    w_sum = float(np.sum(w)) or float(nperseg)
-    freqs = np.fft.rfftfreq(nfft, d=1.0 / fs)
-
     starts = np.arange(n_frames, dtype=np.int64) * hop
     starts = starts[starts + nperseg <= y.size]
     if starts.size == 0:
         return freqs, np.zeros(freqs.size, dtype=np.float64)
-
+    w = _hann_window(nperseg, window_kind)
     idx = starts[:, None] + np.arange(nperseg, dtype=np.int64)[None, :]
-    segs = y[idx] * w[None, :]
-    X = np.fft.rfft(segs, n=nfft, axis=1)
-
-    A_peak = (2.0 / w_sum) * np.abs(X)
-    A_peak[:, 0] *= 0.5
-    if (nfft % 2 == 0) and (A_peak.shape[1] > 1):
-        A_peak[:, -1] *= 0.5
-
-    A_rms = A_peak / np.sqrt(2.0)
-    A_rms[:, 0] = A_peak[:, 0]
-    if (nfft % 2 == 0) and (A_rms.shape[1] > 1):
-        A_rms[:, -1] = A_peak[:, -1]
-    P = A_rms * A_rms
-    P_avg = P.mean(axis=0)
-
-    if str(output_type).strip() == "Amplitude":
-        conv, _ = get_amp_conv_factor_label(amp_conv, signal_kind)
-        A_peak_avg = np.sqrt(np.maximum(P_avg, 0.0)) * np.sqrt(2.0)
-        A_peak_avg[0] = np.sqrt(max(P_avg[0], 0.0))
-        if (nfft % 2 == 0) and (A_peak_avg.size > 1):
-            A_peak_avg[-1] = np.sqrt(max(P_avg[-1], 0.0))
-        spec = A_peak_avg * conv
+    X = np.fft.rfft(y[idx] * w[None, :], n=nfft, axis=1)
+    out = normalize_output_type(output_type)
+    if out in ("PSD", "ASD"):
+        U = window_power(w) or float(nperseg)
+        Pxx = (np.abs(X) ** 2) / (fs * U)
+        Pxx *= one_sided_correction(nfft)[None, :]
+        P_avg = np.mean(Pxx, axis=0)
+        spec = np.sqrt(np.maximum(P_avg, 0.0)) if out == "ASD" else P_avg
     else:
-        spec = P_avg
-
-    if str(scale).strip().lower() == "db":
-        eps = 1e-30
-        if str(output_type).strip() == "Amplitude":
-            spec = 20.0 * np.log10(np.maximum(spec, eps))
+        w_sum = float(np.sum(w)) or float(nperseg)
+        A_peak = (2.0 / w_sum) * np.abs(X)
+        A_peak[:, 0] *= 0.5
+        if nfft % 2 == 0 and A_peak.shape[1] > 1:
+            A_peak[:, -1] *= 0.5
+        P = np.vstack([_amplitude_to_power(row.copy(), nfft) for row in A_peak])
+        P_avg = P.mean(axis=0)
+        if out == "Amplitude":
+            conv, _ = get_amp_conv_factor_label(amp_conv, signal_kind)
+            spec = _power_to_peak_amplitude(P_avg, nfft) * conv
         else:
-            spec = 10.0 * np.log10(np.maximum(spec, eps))
+            spec = P_avg
+    if str(scale).strip().lower() == "db":
+        spec = convert_linear_to_db(spec, out)
     return freqs, spec
 
 def resolve_color_limits(S: np.ndarray, scale: str, color_cfg: dict):
@@ -1878,7 +2026,7 @@ class ExportCroppedTdmsDialog(QDialog):
 def crop_and_zero_align(y: np.ndarray, fs: float, t0: float, t1: float,
                         skip_first: bool = False) -> np.ndarray:
     """Crop signal to [t0, t1] window and return the cropped array.
-    
+
     The caller treats the result as starting at t=0 (zero-aligned).
     Metadata (wf_start_offset=0, wf_increment=1/fs) handles the alignment.
     """
@@ -1912,7 +2060,7 @@ def export_cropped_tdms(output_path: str,
                         skip_first: bool = False,
                         source_properties: dict = None):
     """Export cropped, zero-aligned signals to a .tdms file.
-    
+
     Parameters
     ----------
     output_path : str
@@ -2007,7 +2155,7 @@ def export_cropped_tdms(output_path: str,
 
 class Waterfall2DStandaloneWindow(QDialog):
     """Standalone 2D waterfall colormap window with jet/turbo colormap.
-    
+
     Renders only the upper waterfall heatmap (no order trace subplot)
     using a continuous jet-like colormap (blue -> green -> yellow -> red).
     Captures the current viewport zoom if provided.
@@ -2582,9 +2730,7 @@ class WaterfallPlotWidget(QWidget):
             return S_linear
 
         eps = 1e-20
-        if output_type == "Amplitude":
-            return 20.0 * np.log10(S_linear + eps)
-        return 10.0 * np.log10(S_linear + eps)
+        return convert_linear_to_db(S_linear, output_type)
 
     def _debug_zoom_state(self, tag="zoom"):
         try:
@@ -3053,7 +3199,7 @@ class WaterfallPlotWidget(QWidget):
 
             xr = rpms_axis[m]
             yr = tr[m]
-            
+
 
             x_min = float(np.min(xr))
             x_max = float(np.max(xr))
@@ -3424,78 +3570,87 @@ class WaterfallPlotWidget(QWidget):
         return out
 
     def _extract_order_trace(self, order_value: float):
-        """Extract amplitude vs RPM along the order line f = order * RPM/60.
+        """Extract order trace using configured interpolation/peak/RMS-band mode.
 
-        Returned array is always aligned to ``self.rpms_trace`` (display grid).
-        When raw frame data is available, the trace is computed on the raw
-        (non-uniform) frame_rpms grid for quantitative accuracy, then resampled
-        to the display grid so the returned shape matches what callers expect.
+        Quantitative extraction uses frame_spectra_linear on freqs_analysis when
+        available; display-grid data is only a fallback. Linear spectra are used
+        first and converted to dB after extraction when needed.
         """
-        use_raw = (
-            self.frame_rpms.size > 0
-            and self.frame_spectra_linear.ndim == 2
-            and self.frame_spectra_linear.shape[0] == self.frame_rpms.size
-            and self.freqs_analysis.size > 0
-        )
-
+        state = self.state or {}
         target_rpms = self.rpms_trace if self.rpms_trace.size else self.rpms
         if target_rpms.size == 0:
             return np.array([], dtype=np.float64)
-
+        use_raw = (
+            self.frame_rpms.size > 0 and self.frame_spectra_linear.ndim == 2
+            and self.frame_spectra_linear.shape[0] == self.frame_rpms.size
+            and self.freqs_analysis.size > 0
+        )
         if use_raw:
             rpms_src = self.frame_rpms
             freqs_src = self.freqs_analysis
-            scale = (self.state.get("scale", "Linear") if self.state else "Linear")
-            out_type = (self.state.get("out_type", "Amplitude") if self.state else "Amplitude")
             S_lin = self.frame_spectra_linear
-            if str(scale).strip().lower() == "db":
-                eps = 1e-30
-                if str(out_type).strip() == "Amplitude":
-                    S_src = 20.0 * np.log10(np.maximum(S_lin, eps))
-                else:
-                    S_src = 10.0 * np.log10(np.maximum(S_lin, eps))
-            else:
-                S_src = S_lin
         else:
             rpms_src = self.rpms_trace if self.rpms_trace.size else self.rpms
-            S_src = self.S_trace if self.S_trace.size else self.S
             freqs_src = self.freqs_trace if self.freqs_trace.size else self.freqs
-
-        if S_src.size == 0 or rpms_src.size == 0 or freqs_src.size == 0:
+            S_src = self.S_trace if self.S_trace.size else self.S
+            scale0 = str(state.get("scale", "Linear")).lower()
+            out0 = normalize_output_type(state.get("out_type", "Amplitude"))
+            if scale0 == "db":
+                fac = spectrum_db_factor(out0)
+                S_lin = np.power(10.0, np.asarray(S_src, dtype=np.float64) / fac)
+            else:
+                S_lin = np.asarray(S_src, dtype=np.float64)
+        if S_lin.size == 0 or rpms_src.size == 0 or freqs_src.size == 0:
             return np.full(target_rpms.shape, np.nan, dtype=np.float64)
-
-        # Compute trace on its native RPM grid
-        freq_min = float(freqs_src[0])
-        freq_max = float(freqs_src[-1])
-        freq_track = (float(order_value) * rpms_src) / 60.0
-        out = np.full(rpms_src.shape, np.nan, dtype=np.float64)
-        for i in range(rpms_src.size):
-            f = freq_track[i]
-            if not np.isfinite(f) or f < freq_min or f > freq_max:
+        mode = str(state.get("order_extract_mode", state.get("waterfall_order_extract_mode", "Interpolated"))).strip()
+        bw = float(state.get("order_bw", state.get("waterfall_order_bw", 0.0)) or 0.0)
+        bw_unit = str(state.get("order_bw_unit", state.get("waterfall_order_bw_unit", "Hz"))).strip()
+        out_type = normalize_output_type(state.get("out_type", "Amplitude"))
+        values = np.full(rpms_src.shape, np.nan, dtype=np.float64)
+        fmin = float(freqs_src[0]); fmax = float(freqs_src[-1])
+        df = float(np.nanmedian(np.diff(freqs_src))) if freqs_src.size > 1 else 1.0
+        for i, rpm_i in enumerate(rpms_src):
+            fc = float(order_value) * float(rpm_i) / 60.0
+            if not np.isfinite(fc) or fc < fmin or fc > fmax:
                 continue
-            out[i] = np.interp(f, freqs_src, S_src[i, :], left=np.nan, right=np.nan)
-
-        # Align returned shape to the display grid
+            if mode == "Peak in band" and bw > 0.0:
+                hb = bw * rpm_i / 60.0 if bw_unit.lower().startswith("order") else bw
+                m = (freqs_src >= fc - hb) & (freqs_src <= fc + hb)
+                if np.any(m):
+                    values[i] = float(np.nanmax(S_lin[i, m]))
+            elif mode == "RMS band power" and bw > 0.0:
+                hb = bw * rpm_i / 60.0 if bw_unit.lower().startswith("order") else bw
+                m = (freqs_src >= fc - hb) & (freqs_src <= fc + hb)
+                if np.any(m):
+                    band = np.maximum(S_lin[i, m], 0.0)
+                    if out_type == "PSD":
+                        values[i] = float(np.sum(band) * df)
+                    elif out_type == "ASD":
+                        values[i] = float(np.sqrt(np.sum(band * band) * df))
+                    elif out_type == "Power":
+                        values[i] = float(np.sum(band))
+                    else:
+                        # Amplitude bins are converted to RMS² approximately,
+                        # summed, then converted back to peak amplitude.
+                        values[i] = float(np.sqrt(np.sum((band / np.sqrt(2.0)) ** 2)) * np.sqrt(2.0))
+            else:
+                values[i] = float(np.interp(fc, freqs_src, S_lin[i, :], left=np.nan, right=np.nan))
+        if str(state.get("scale", "Linear")).strip().lower() == "db":
+            values = convert_linear_to_db(values, out_type)
         if rpms_src.size != target_rpms.size or not np.array_equal(rpms_src, target_rpms):
-            finite = np.isfinite(out) & np.isfinite(rpms_src)
+            finite = np.isfinite(values) & np.isfinite(rpms_src)
             if np.count_nonzero(finite) < 2:
                 return np.full(target_rpms.shape, np.nan, dtype=np.float64)
-            x_in = rpms_src[finite]
-            y_in = out[finite]
-            sort_idx = np.argsort(x_in)
-            x_in = x_in[sort_idx]
-            y_in = y_in[sort_idx]
-            # np.unique-collapse duplicate RPM frames by averaging
+            x_in = rpms_src[finite]; y_in = values[finite]
+            sort_idx = np.argsort(x_in); x_in = x_in[sort_idx]; y_in = y_in[sort_idx]
             if np.any(np.diff(x_in) == 0):
                 uniq_x, inv = np.unique(x_in, return_inverse=True)
                 sums = np.bincount(inv, weights=y_in, minlength=uniq_x.size)
-                counts = np.bincount(inv, minlength=uniq_x.size).astype(np.float64)
-                counts[counts == 0] = 1.0
-                x_in = uniq_x
-                y_in = sums / counts
+                counts = np.bincount(inv, minlength=uniq_x.size).astype(np.float64); counts[counts == 0] = 1.0
+                x_in = uniq_x; y_in = sums / counts
             return np.interp(target_rpms, x_in, y_in, left=np.nan, right=np.nan)
+        return values
 
-        return out
 
     def _set_home(self):
         upper_freqs = self.freqs_full_display if self.freqs_full_display.size else self.freqs
@@ -3544,7 +3699,20 @@ class WaterfallPlotWidget(QWidget):
         self._legend = self.lower_item.addLegend(offset=(10, 10))
 
         self.lower_item.setLabel("bottom", "RPM")
-        self.lower_item.setLabel("left", self.state.get("colorbar_label", "Amplitude") if self.state else "Amplitude")
+        if self.state:
+            mode = self.state.get("order_extract_mode", "Interpolated")
+            bw = float(self.state.get("order_bw", 0.0) or 0.0)
+            unit = self.state.get("order_bw_unit", "Hz")
+            base_label = self.state.get("colorbar_label", "Amplitude")
+            if mode == "Peak in band" and bw > 0:
+                lower_label = f"Peak in ±{bw:g} {unit} band — {base_label}"
+            elif mode == "RMS band power" and bw > 0:
+                lower_label = f"RMS band power ±{bw:g} {unit} — {base_label}"
+            else:
+                lower_label = f"Interpolated order trace — {base_label}"
+        else:
+            lower_label = "Amplitude"
+        self.lower_item.setLabel("left", lower_label)
 
         rpms_src = self.rpms_trace if self.rpms_trace.size else self.rpms
         ymins = []
@@ -4424,20 +4592,46 @@ class PlotWorker(QObject):
         return self._apply_custom_butterworth_zero_phase(y, fs_use, *self._filter_params())
 
     def _apply_velocity_highpass(self, acc_g: np.ndarray, fs: float) -> np.ndarray:
-        return self._apply_custom_butterworth_zero_phase(acc_g, fs, "highpass", 4, 10.0, None)
+        hp = float(self.cfg.get("velocity_highpass_hz", 10.0))
+        if hp <= 0.0:
+            return np.asarray(acc_g, dtype=np.float64)
+        return self._apply_custom_butterworth_zero_phase(acc_g, fs, "highpass", 4, hp, None)
+
+    def _velocity_detrend(self, y: np.ndarray) -> np.ndarray:
+        mode = str(self.cfg.get("velocity_detrend", "Remove mean")).strip()
+        y = np.asarray(y, dtype=np.float64)
+        if mode == "None":
+            return y
+        if mode == "Linear detrend" and _HAVE_SCIPY:
+            return scipy_detrend(y, type="linear")
+        return y - float(np.mean(y)) if y.size else y
 
     def _integrate_acc_to_velocity(self, acc_g: np.ndarray, fs: float) -> np.ndarray:
+        """Acceleration(g) -> velocity(mm/s) with selectable integration method."""
+        acc_g = np.asarray(acc_g, dtype=np.float64)
         if acc_g.size == 0:
             return np.array([], dtype=np.float64)
-
+        fs = float(fs)
+        method = str(self.cfg.get("velocity_integration_method", "Time-domain trapezoidal"))
+        hp = float(self.cfg.get("velocity_highpass_hz", 10.0))
+        acc_si = self._velocity_detrend(np.nan_to_num(acc_g, nan=0.0, posinf=0.0, neginf=0.0)) * G0
+        if method == "Frequency-domain integration":
+            n = acc_si.size
+            A = np.fft.rfft(acc_si)
+            freqs = np.fft.rfftfreq(n, d=1.0 / fs)
+            V = np.zeros_like(A, dtype=np.complex128)
+            valid = freqs > max(hp, 0.0)
+            V[valid] = A[valid] / (1j * 2.0 * np.pi * freqs[valid])
+            v = np.fft.irfft(V, n=n)
+            return v * VEL_SCALE
+        # Backward compatible path: high-pass externally, then trapezoidal.
         dt = 1.0 / fs
-        acc_si = acc_g * G0
-
         v = np.zeros_like(acc_si, dtype=np.float64)
         if acc_si.size > 1:
             v[1:] = np.cumsum(0.5 * (acc_si[:-1] + acc_si[1:]) * dt)
-
+        v = self._velocity_detrend(v)
         return v * VEL_SCALE
+
 
     def _get_processed_signal(self, raw: np.ndarray) -> np.ndarray:
         fs = float(self.cfg["fs"])
@@ -4492,8 +4686,6 @@ class PlotWorker(QObject):
         n_frames = 1 if y.size <= nperseg else 1 + (y.size - nperseg) // hop
 
         window_kind = self.cfg.get("window_kind", "periodic")
-        w = _hann_window(nperseg, window_kind)
-        w_sum = float(np.sum(w)) or float(nperseg)
         freqs = np.fft.rfftfreq(nfft, d=1.0 / fs)
 
         starts = np.arange(n_frames, dtype=np.int64) * hop
@@ -4501,35 +4693,23 @@ class PlotWorker(QObject):
         if starts.size == 0:
             return freqs, np.array([], dtype=np.float64), np.empty((freqs.size, 0))
 
-        idx = starts[:, None] + np.arange(nperseg, dtype=np.int64)[None, :]
-        segs = y[idx] * w[None, :]
-        X = np.fft.rfft(segs, n=nfft, axis=1)
-
-        A_peak = (2.0 / w_sum) * np.abs(X)
-        A_peak[:, 0] *= 0.5
-        if (nfft % 2 == 0) and (A_peak.shape[1] > 1):
-            A_peak[:, -1] *= 0.5
-
-        if str(output_type).strip() == "Amplitude":
-            conv, _ = get_amp_conv_factor_label(self.cfg["amp_conv"], signal_kind)
-            S = (A_peak * conv).T
-        else:
-            A_rms = A_peak / np.sqrt(2.0)
-            A_rms[:, 0] = A_peak[:, 0]
-            if (nfft % 2 == 0) and (A_rms.shape[1] > 1):
-                A_rms[:, -1] = A_peak[:, -1]
-            S = (A_rms * A_rms).T
+        frames = []
+        for st in starts:
+            _, spec_i = compute_spectrum_frame(
+                y[st:st + nperseg], fs, nfft,
+                amp_conv=self.cfg.get("amp_conv", "Peak"),
+                signal_kind=signal_kind, output_type=output_type,
+                window_kind=window_kind,
+            )
+            frames.append(spec_i)
+        S = np.asarray(frames, dtype=np.float64).T
 
         # Center-of-frame timestamps (matches MATLAB/nCode and the
         # window-weighted RPM labels used by _compute_waterfall_map).
         times = (starts + (nperseg - 1) / 2.0) / fs
 
         if str(scale).strip().lower() == "db":
-            eps = 1e-30
-            if str(output_type).strip() == "Amplitude":
-                S = 20.0 * np.log10(np.maximum(S, eps))
-            else:
-                S = 10.0 * np.log10(np.maximum(S, eps))
+            S = convert_linear_to_db(S, output_type)
 
         return freqs, times, S
 
@@ -4603,9 +4783,7 @@ class PlotWorker(QObject):
             return S_linear
 
         eps = 1e-20
-        if output_type == "Amplitude":
-            return 20.0 * np.log10(S_linear + eps)
-        return 10.0 * np.log10(S_linear + eps)
+        return convert_linear_to_db(S_linear, output_type)
 
     def _build_dense_waterfall_display(self, frame_rpms: np.ndarray, spectra_linear: np.ndarray,
                                        output_type: str, scale: str,
@@ -4679,23 +4857,15 @@ class PlotWorker(QObject):
             raise RuntimeError("Could not build waterfall frames.")
 
         idx_t = starts[:, None] + np.arange(nperseg, dtype=np.int64)[None, :]
-        acc_segs = acc[idx_t] * w[None, :]
-        X = np.fft.rfft(acc_segs, n=nfft, axis=1)
-
-        A_peak = (2.0 / w_sum) * np.abs(X)
-        A_peak[:, 0] *= 0.5
-        if (nfft % 2 == 0) and (A_peak.shape[1] > 1):
-            A_peak[:, -1] *= 0.5
-
-        if str(output_type).strip() == "Amplitude":
-            conv, _ = get_amp_conv_factor_label(self.cfg["amp_conv"], "acc")
-            spectra_per_frame = A_peak * conv
-        else:
-            A_rms = A_peak / np.sqrt(2.0)
-            A_rms[:, 0] = A_peak[:, 0]
-            if (nfft % 2 == 0) and (A_rms.shape[1] > 1):
-                A_rms[:, -1] = A_peak[:, -1]
-            spectra_per_frame = A_rms * A_rms
+        spectra_rows = []
+        for st in starts:
+            _, spec_i = compute_spectrum_frame(
+                acc[st:st + nperseg], fs, nfft,
+                amp_conv=self.cfg.get("amp_conv", "Peak"), signal_kind="acc",
+                output_type=output_type, window_kind=window_kind,
+            )
+            spectra_rows.append(spec_i)
+        spectra_per_frame = np.asarray(spectra_rows, dtype=np.float64)
 
         rpm_segs = rpm[idx_t]
         method = str(rpm_label_method).strip()
@@ -4749,7 +4919,7 @@ class PlotWorker(QObject):
             target_rpms = np.array([min_rpm], dtype=np.float64)
             S_analysis_linear = spectra_smoothed[:1, :]
         else:
-            target_count = max(int(num_spectra), n_valid)
+            target_count = max(1, int(num_spectra))
             target_rpms = np.linspace(min_rpm, max_rpm, target_count, dtype=np.float64)
 
             if target_count == n_valid and np.all(np.diff(frame_rpms) > 0.0):
@@ -4788,6 +4958,10 @@ class PlotWorker(QObject):
             "frame_spectra_linear": spectra_smoothed,
             "rpms_display": rpms_display if rpms_display.size else target_rpms,
             "S_display": S_display if S_display.size else S_analysis,
+            "raw_frame_count": n_valid,
+            "analysis_spectrum_count": int(target_rpms.size),
+            "buffers_per_spectrum": int(num_buffers),
+            "analysis_interpolated": bool(target_rpms.size != n_valid or not np.all(np.diff(frame_rpms) > 0.0)),
         }
 
     def _processing_title(self, use_filtered: bool, signal_kind: str) -> str:
@@ -4795,9 +4969,9 @@ class PlotWorker(QObject):
             if use_filtered:
                 btype, order, f1, f2 = self._filter_params()
                 if btype in ("bandpass", "bandstop"):
-                    return f" | AccBase=Filtered | Butterworth {btype} | order={order} | fc=[{f1:g}, {f2:g}] Hz | zero-phase | AutoVel: HP 10 Hz | order=4 | zero-phase | integrate"
-                return f" | AccBase=Filtered | Butterworth {btype} | order={order} | fc={f1:g} Hz | zero-phase | AutoVel: HP 10 Hz | order=4 | zero-phase | integrate"
-            return " | AccBase=Unfiltered | AutoVel: HP 10 Hz | order=4 | zero-phase | integrate"
+                    return f" | AccBase=Filtered | Butterworth {btype} | order={order} | fc=[{f1:g}, {f2:g}] Hz | zero-phase | AutoVel: configurable HP | order=4 | zero-phase | integrate"
+                return f" | AccBase=Filtered | Butterworth {btype} | order={order} | fc={f1:g} Hz | zero-phase | AutoVel: configurable HP | order=4 | zero-phase | integrate"
+            return " | AccBase=Unfiltered | AutoVel: configurable HP | order=4 | zero-phase | integrate"
 
         if use_filtered:
             btype, order, f1, f2 = self._filter_params()
@@ -4856,6 +5030,20 @@ class PlotWorker(QObject):
 
         acc, rpm, wf_fs = self._align_waterfall_signals(acc, rpm, fs_acc, fs_rpm)
 
+        otf_time_info = None
+        otf_mode = str(self.cfg.get("waterfall_otf_mode", "Frequency-domain order mask" if self.cfg.get("waterfall_otf_enabled", False) else "Off"))
+        if otf_mode.startswith("Time-domain") and bool(self.cfg.get("waterfall_otf_enabled", False)):
+            acc, otf_time_info = apply_time_domain_order_tracking_filter(
+                acc, rpm, wf_fs,
+                target_order=float(self.cfg.get("waterfall_otf_order", 1.0)),
+                half_bw=float(self.cfg.get("waterfall_otf_bw", 0.25)),
+                bw_unit=str(self.cfg.get("waterfall_otf_bw_unit", "Order")),
+                filter_type=str(self.cfg.get("waterfall_otf_type", "Band-pass")),
+                filter_order=int(self.cfg.get("waterfall_otf_filter_order", 4)),
+                block_seconds=float(self.cfg.get("waterfall_otf_block_seconds", 0.5)),
+                crossfade=True,
+            )
+
         num_spectra = max(1, int(self.cfg.get("waterfall_num_spectra", 100)))
         num_buffers = max(1, int(self.cfg.get("waterfall_num_buffers", 1)))
         wf_domain = str(self.cfg.get("waterfall_domain", "Frequency Waterfall")).strip()
@@ -4865,10 +5053,12 @@ class PlotWorker(QObject):
             num_spectra, num_buffers, rpm_label_method=rpm_label_method
         )
 
-        # ── Order Tracking Filter (nCode-like) ──────────────────────────
+        # ── Order filter / mask ──────────────────────────
         # Mutates wf_map in place so the downstream frequency-domain or
         # order-domain waterfall reflects only the isolated order.
         otf_info = self._maybe_apply_order_tracking_filter(wf_map, out_type, scale)
+        if otf_time_info is not None:
+            otf_info = otf_time_info
 
         _, unit_lbl = self._amp_conv_factor_label("acc")
         colorbar_label = build_spectrum_ylabel(out_type, scale, unit_lbl)
@@ -4926,6 +5116,13 @@ class PlotWorker(QObject):
                 "scale": scale,
                 "out_type": out_type,
                 "colorbar_label": colorbar_label,
+                "order_extract_mode": self.cfg.get("waterfall_order_extract_mode", "Interpolated"),
+                "order_bw": float(self.cfg.get("waterfall_order_bw", 0.0)),
+                "order_bw_unit": self.cfg.get("waterfall_order_bw_unit", "Hz"),
+                "raw_frame_count": wf_map.get("raw_frame_count"),
+                "analysis_spectrum_count": wf_map.get("analysis_spectrum_count"),
+                "buffers_per_spectrum": wf_map.get("buffers_per_spectrum"),
+                "analysis_interpolated": wf_map.get("analysis_interpolated"),
                 "stats_text": (
                     f"Order Waterfall | Acc={acc_name} (fs={fs_acc:g} Hz) | "
                     f"RPM={rpm_name} (fs={fs_rpm:g} Hz) | FFT fs={wf_fs:g} Hz | "
@@ -5005,6 +5202,13 @@ class PlotWorker(QObject):
             "scale": scale,
             "out_type": out_type,
             "colorbar_label": colorbar_label,
+            "order_extract_mode": self.cfg.get("waterfall_order_extract_mode", "Interpolated"),
+            "order_bw": float(self.cfg.get("waterfall_order_bw", 0.0)),
+            "order_bw_unit": self.cfg.get("waterfall_order_bw_unit", "Hz"),
+            "raw_frame_count": wf_map.get("raw_frame_count"),
+            "analysis_spectrum_count": wf_map.get("analysis_spectrum_count"),
+            "buffers_per_spectrum": wf_map.get("buffers_per_spectrum"),
+            "analysis_interpolated": wf_map.get("analysis_interpolated"),
             "stats_text": (
                 f"Waterfall built from Acc={acc_name} ({acc_file_base}/{acc_group}, fs={fs_acc:g} Hz) and "
                 f"RPM={rpm_name} ({rpm_file_base}/{rpm_group}, fs={fs_rpm:g} Hz) | "
@@ -5012,16 +5216,17 @@ class PlotWorker(QObject):
                 f"Spectra={num_spectra} | Buffers/Spectrum={num_buffers}"
             ),
             # COT: computed when checkbox is enabled. Stored for downstream use.
-            "cot_results": self._maybe_compute_cot(acc, wf_map, wf_fs),
+            "cot_results": self._maybe_compute_cot(acc, rpm, wf_fs),
         }
 
     def _maybe_apply_order_tracking_filter(self, wf_map: dict, output_type: str, scale: str):
-        """Apply the nCode-like order tracking filter to ``wf_map`` in place.
+        """Apply the legacy frequency-domain order mask to ``wf_map`` in place.
 
         Returns a small dict describing what was applied (or ``None`` when the
         filter is disabled), so the caller can record it in the plot state.
         """
-        if not bool(self.cfg.get("waterfall_otf_enabled", False)):
+        mode = str(self.cfg.get("waterfall_otf_mode", "Frequency-domain order mask" if self.cfg.get("waterfall_otf_enabled", False) else "Off"))
+        if (not bool(self.cfg.get("waterfall_otf_enabled", False))) or mode.startswith("Time-domain"):
             return None
 
         try:
@@ -5077,6 +5282,7 @@ class PlotWorker(QObject):
 
             return {
                 "enabled": True,
+                "mode": "Frequency-domain order mask",
                 "target_order": target,
                 "half_bw": half_bw,
                 "bw_unit": bw_unit,
@@ -5091,39 +5297,37 @@ class PlotWorker(QObject):
                 print(f"[TRDSP] Order tracking filter failed: {e}")
             return None
 
-    def _maybe_compute_cot(self, acc: np.ndarray, wf_map: dict, fs: float):
-        """Compute COT if enabled in cfg; returns result dict or None."""
+    def _maybe_compute_cot(self, acc: np.ndarray, rpm_aligned: np.ndarray, fs: float):
+        """Compute COT from the full aligned RPM signal; returns result dict or None."""
         if not bool(self.cfg.get("waterfall_cot_enabled", False)):
             return None
         try:
+            acc = np.asarray(acc, dtype=np.float64)
+            rpm_aligned = np.asarray(rpm_aligned, dtype=np.float64)
+            if acc.size == 0 or rpm_aligned.size == 0 or acc.size != rpm_aligned.size:
+                return {"warning": "COT skipped: acceleration and aligned RPM must have same nonzero length."}
+            finite_pos = np.isfinite(rpm_aligned) & (rpm_aligned > 0.0)
+            if np.count_nonzero(finite_pos) < max(16, acc.size // 100):
+                return {"warning": "COT skipped: insufficient finite positive RPM samples."}
             spr = int(self.cfg.get("waterfall_cot_spr", 512))
             order_max = float(self.cfg.get("waterfall_order_max", 20.0))
-            frame_rpms = wf_map.get("frame_rpms", np.array([]))
-            if frame_rpms.size == 0:
-                return None
-            # Reconstruct a per-sample RPM approximation from frame RPMs.
-            # Accurate COT requires the full-length RPM signal — here we use the
-            # frame-level RPM as a step-function approximation.
-            # TODO: pass the original aligned rpm signal for fully accurate COT.
-            orders, amp_spectrum, amp_vs_rpm = compute_order_tracking_spectrum(
-                acc, np.full(acc.size, float(np.nanmean(frame_rpms))),
-                fs, spr, order_max,
+            orders, amp_spectrum, amp_vs_rpm, meta = compute_order_tracking_spectrum(
+                acc, rpm_aligned, fs, spr, order_max,
                 amp_conv=self.cfg.get("amp_conv", "Peak"),
-                signal_kind="acc",
+                signal_kind="acc", return_metadata=True,
             )
             return {
                 "orders": orders,
                 "amp_spectrum": amp_spectrum,
                 "amp_vs_rpm": amp_vs_rpm,
-                "note": (
-                    "COT uses full acc signal with constant mean RPM approximation. "
-                    "Pass aligned RPM for accurate angle-domain results."
-                ),
+                "metadata": meta,
+                "note": "COT used the full aligned RPM time history for angle-domain resampling.",
             }
         except Exception as e:
             if DEBUG:
                 print(f"[TRDSP] COT computation failed: {e}")
-            return None
+            return {"warning": f"COT failed: {e}"}
+
 
     @staticmethod
     def _nearest_interp_1d(x_src: np.ndarray, y_src: np.ndarray, x_dst: np.ndarray) -> np.ndarray:
@@ -5497,7 +5701,7 @@ class MainWindow(QMainWindow):
             "instead of the global FFT settings. Lets you have Avg=Linear while STFT=dB."
         )
         self.cmb_avg_out = QComboBox()
-        self.cmb_avg_out.addItems(["Amplitude", "Power"])
+        self.cmb_avg_out.addItems(["Amplitude", "Power", "PSD", "ASD"])
         self.cmb_avg_scale = QComboBox()
         self.cmb_avg_scale.addItems(["Linear", "dB"])
         self.cmb_avg_amp_conv = QComboBox()
@@ -5517,7 +5721,7 @@ class MainWindow(QMainWindow):
             "instead of the global FFT settings. Lets you have STFT=dB while Avg=Linear."
         )
         self.cmb_stft_out = QComboBox()
-        self.cmb_stft_out.addItems(["Amplitude", "Power"])
+        self.cmb_stft_out.addItems(["Amplitude", "Power", "PSD", "ASD"])
         self.cmb_stft_scale = QComboBox()
         self.cmb_stft_scale.addItems(["Linear", "dB"])
         self.cmb_stft_scale.setCurrentText("dB")
@@ -5542,7 +5746,7 @@ class MainWindow(QMainWindow):
         self.ovl_spin.setValue(67.0)
 
         self.cmb_out = QComboBox()
-        self.cmb_out.addItems(["Amplitude", "Power"])
+        self.cmb_out.addItems(["Amplitude", "Power", "PSD", "ASD"])
 
         self.cmb_scale = QComboBox()
         self.cmb_scale.addItems(["Linear", "dB"])
@@ -8302,7 +8506,7 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
         )
 
         self.wf_out = QComboBox()
-        self.wf_out.addItems(["Amplitude", "Power"])
+        self.wf_out.addItems(["Amplitude", "Power", "PSD", "ASD"])
         self.wf_scale = QComboBox()
         self.wf_scale.addItems(["Linear", "dB"])
         self.wf_amp_conv = QComboBox()
@@ -8394,7 +8598,7 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
             "RMS band power: square-root of mean power within the bandwidth window."
         )
 
-        # ── Order Tracking Filter (nCode-like) ─────────────────────────
+        # ── Order filter / mask ─────────────────────────
         # Adaptive band-pass / band-stop around f_center(t) = k * RPM(t) / 60.
         # Implemented frame-by-frame so the displayed waterfall isolates the
         # selected order; remaining bins are masked.  Distinct from
@@ -8403,9 +8607,16 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
         self.chk_wf_otf = QCheckBox("Order Tracking Filter (isolate selected order)")
         self.chk_wf_otf.setChecked(False)
         self.chk_wf_otf.setToolTip(
-            "When enabled, the waterfall is filtered around f = k * RPM/60.\n"
-            "Other order components are suppressed in the displayed map."
+            "When enabled, choose either an FFT-frame frequency-domain order mask or a time-domain adaptive order filter."
         )
+
+        self.cmb_wf_otf_mode = QComboBox()
+        self.cmb_wf_otf_mode.addItems(["Frequency-domain order mask", "Time-domain adaptive order filter"])
+        self.cmb_wf_otf_mode.setToolTip(
+            "Frequency-domain order mask: masks FFT waterfall bins only (legacy display isolation).\n"
+            "Time-domain adaptive order filter: blockwise SOS filter before FFT; closer to nCode but still approximate."
+        )
+        self.cmb_wf_otf_mode.setEnabled(False)
 
         self.wf_otf_order_spin = QDoubleSpinBox()
         self.wf_otf_order_spin.setRange(0.1, 200.0)
@@ -8451,6 +8662,7 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
 
         def _sync_otf_enabled(*_):
             on = self.chk_wf_otf.isChecked()
+            self.cmb_wf_otf_mode.setEnabled(on)
             self.wf_otf_order_spin.setEnabled(on)
             self.wf_otf_bw_spin.setEnabled(on)
             self.cmb_wf_otf_bw_unit.setEnabled(on)
@@ -8867,14 +9079,16 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
             "waterfall_order_extract_mode": self.cmb_wf_order_extract_mode.currentText(),
             "waterfall_cot_enabled": self.chk_wf_cot.isChecked(),
             "waterfall_cot_spr": int(self.wf_cot_spr_spin.value()),
-            # nCode-like Order Tracking Filter — isolates a single order in
+            # Order filter / mask — isolates a single order in
             # the displayed waterfall.
             "waterfall_otf_enabled": self.chk_wf_otf.isChecked(),
+            "waterfall_otf_mode": self.cmb_wf_otf_mode.currentText(),
             "waterfall_otf_order": float(self.wf_otf_order_spin.value()),
             "waterfall_otf_bw": float(self.wf_otf_bw_spin.value()),
             "waterfall_otf_bw_unit": self.cmb_wf_otf_bw_unit.currentText(),
             "waterfall_otf_type": self.cmb_wf_otf_type.currentText(),
             "waterfall_otf_filter_order": int(self.wf_otf_filter_order_spin.value()),
+            "waterfall_otf_block_seconds": 0.5,
             "waterfall_otf_show_trace": self.chk_wf_otf_trace.isChecked(),
             "waterfall_acc_name": acc_name,
             "waterfall_rpm_name": rpm_name,
@@ -8993,6 +9207,9 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
             "method": "Both (Averaged + STFT)",
             "amp_conv": self.cmb_amp_conv.currentText(),
             "window_kind": self.cmb_window_kind.currentText().lower(),
+            "velocity_integration_method": "Time-domain trapezoidal",
+            "velocity_highpass_hz": 10.0,
+            "velocity_detrend": "Remove mean",
 
             # Independent AVG / STFT settings (fall back to globals).
             "avg_override": self.chk_avg_override.isChecked(),
@@ -9326,7 +9543,22 @@ def run_signal_processing_self_tests(verbose: bool = True) -> bool:
     return n_pass == n_total
 
 
+def run_regression_tests(verbose: bool = True):
+    """Run headless DSP regression tests without launching the GUI."""
+    try:
+        from trdsp_regression_tests import run_regression_tests as _run
+        return _run(verbose=verbose)
+    except Exception as e:
+        if verbose:
+            print(f"Regression test runner failed to start: {e}")
+        return {"passed": 0, "failed": 1, "skipped": 0, "details": [("FAIL", "runner", str(e))]}
+
+
 def main():
+    if "--self-test" in sys.argv:
+        summary = run_regression_tests(verbose=True)
+        sys.exit(0 if int(summary.get("failed", 1)) == 0 else 1)
+
     app = QApplication(sys.argv)
 
     if not _HAVE_PG:

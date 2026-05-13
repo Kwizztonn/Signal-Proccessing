@@ -235,6 +235,7 @@ def apply_order_tracking_filter(
     bw_unit: str = "Order",
     filter_type: str = "Band-pass",
     filter_order: int = 4,
+    output_type: str = "Amplitude",
 ) -> tuple:
     """nCode-like Order Tracking Filter (frame-based, RPM-adaptive).
 
@@ -266,13 +267,21 @@ def apply_order_tracking_filter(
     order_unit = str(bw_unit).strip().lower().startswith("order")
     n = int(max(1, filter_order))
     is_bandpass = str(filter_type).strip().lower().startswith("band-pass")
+    is_amplitude = str(output_type).strip().lower() == "amplitude"
 
     out = np.zeros_like(S)
     trace = np.zeros(S.shape[0], dtype=np.float64)
 
-    # Pre-compute squared frequency axis for the Butterworth-style response
-    # |H(f)|^2 = 1 / (1 + ((f - fc)/bw)^(2n))  (band-pass)
-    # The band-stop response is 1 - |H(f)|^2.
+    # Butterworth power response:
+    #   |H(f)|^2 = 1 / (1 + ((f - fc)/bw)^(2n))   (band-pass)
+    # Band-stop power response = 1 - |H(f)|^2.
+    #
+    # LTI gain convention:
+    #   amplitude spectra     -> multiply by |H|   = sqrt(power response)
+    #   power / RMS^2 spectra -> multiply by |H|^2 = power response
+    #
+    # This keeps Amplitude and Power outputs consistent:
+    #   Power_after = Amplitude_after^2
     for i in range(S.shape[0]):
         rpm = frame_rpms[i]
         if not np.isfinite(rpm) or rpm <= 0.0:
@@ -287,11 +296,13 @@ def apply_order_tracking_filter(
             half_bw_hz = max(1e-9, bw)
 
         denom = ((freqs - f_center) / half_bw_hz) ** (2 * n)
-        H2 = 1.0 / (1.0 + denom)
-        if not is_bandpass:
-            H2 = 1.0 - H2
+        bp_power = 1.0 / (1.0 + denom)
+        power_gain = bp_power if is_bandpass else (1.0 - bp_power)
 
-        out[i, :] = S[i, :] * H2
+        if is_amplitude:
+            out[i, :] = S[i, :] * np.sqrt(power_gain)
+        else:
+            out[i, :] = S[i, :] * power_gain
 
         # Extracted trace (sum of band energy, sqrt for amplitude semantics).
         # We use the band-pass response regardless of selected type so that
@@ -5034,6 +5045,7 @@ class PlotWorker(QObject):
                 bw_unit=bw_unit,
                 filter_type=ftype,
                 filter_order=forder,
+                output_type=output_type,
             )
             wf_map["frame_spectra_linear"] = filtered_frames
 

@@ -14,6 +14,34 @@ from PyQt5.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView,
 )
 from PyQt5.QtGui import QPixmap, QPainter, QColor, QIcon
+
+try:
+    from PyQt5 import sip as _qt_sip
+except Exception:
+    try:
+        import sip as _qt_sip
+    except Exception:
+        _qt_sip = None
+
+
+def _qt_alive(obj) -> bool:
+    """Return False when a PyQt wrapper already lost its C++ QObject."""
+    if obj is None:
+        return False
+    if _qt_sip is not None:
+        try:
+            if _qt_sip.isdeleted(obj):
+                return False
+        except Exception:
+            pass
+    try:
+        obj.objectName()
+        return True
+    except RuntimeError:
+        return False
+    except Exception:
+        return True
+
 # --- PyQtGraph: interactive / fast plotting ---
 try:
     import pyqtgraph as pg
@@ -1036,8 +1064,15 @@ class InteractivePlotWidget(QWidget):
 
     def set_rect_zoom_active(self, active: bool):
         self._rect_zoom_active = bool(active)
-        if self._view_box is not None:
+        if self._view_box is None:
+            return
+        if not _qt_alive(self._view_box):
+            self._view_box = None
+            return
+        try:
             self._view_box.setMouseMode(pg.ViewBox.RectMode if active else pg.ViewBox.PanMode)
+        except RuntimeError:
+            self._view_box = None
 
     def get_view_box(self):
         return self._view_box
@@ -2305,7 +2340,7 @@ class WaterfallPlotWidget(QWidget):
         self.mini = bool(mini)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         if not self.mini:
-            self.setMinimumHeight(650)
+            self.setMinimumHeight(500)
         self.state = None
         self.plot_key = None
         self._rect_zoom_active = False
@@ -3267,9 +3302,21 @@ class WaterfallPlotWidget(QWidget):
     def set_rect_zoom_active(self, active: bool):
         self._rect_zoom_active = bool(active)
         mode = pg.ViewBox.RectMode if active else pg.ViewBox.PanMode
-        self.upper_item.getViewBox().setMouseMode(mode)
-        if not self.mini:
-            self.lower_item.getViewBox().setMouseMode(mode)
+        for item in (getattr(self, "upper_item", None), None if self.mini else getattr(self, "lower_item", None)):
+            if item is None:
+                continue
+            try:
+                vb = item.getViewBox()
+            except RuntimeError:
+                continue
+            except Exception:
+                continue
+            if not _qt_alive(vb):
+                continue
+            try:
+                vb.setMouseMode(mode)
+            except RuntimeError:
+                continue
 
     def zoom_axes(self, factor: float):
         try:
@@ -3809,8 +3856,13 @@ class TimeDomainZoomFFTWidget(QWidget):
         self._range_timer.start()
 
     def set_rect_zoom_active(self, active: bool):
-        self.upper.set_rect_zoom_active(active)
-        self.lower.set_rect_zoom_active(active)
+        for canvas in (getattr(self, "upper", None), getattr(self, "lower", None)):
+            if canvas is None or not _qt_alive(canvas):
+                continue
+            try:
+                canvas.set_rect_zoom_active(active)
+            except RuntimeError:
+                continue
 
     def zoom_axes(self, factor: float):
         self.upper.zoom_axes(factor)
@@ -3982,7 +4034,7 @@ class PlotMiniWidget(QFrame):
         self.btn_close.setFixedWidth(70)
 
         self.canvas = InteractivePlotWidget(mini=True)
-        self.canvas.setMinimumHeight(220)
+        self.canvas.setMinimumHeight(160)
 
         top = QHBoxLayout()
         top.addWidget(self.lbl, 1)
@@ -4027,7 +4079,7 @@ class DetailPlotWidget(QWidget):
         # TimeDomainZoomFFTWidget remains in the codebase for advanced use
         # but is no longer the default detail renderer.
         self.canvas = InteractivePlotWidget(mini=False)
-        self.canvas.setMinimumHeight(480)
+        self.canvas.setMinimumHeight(360)
 
         lay = QVBoxLayout(self)
         lay.addWidget(self.title)
@@ -4053,7 +4105,7 @@ class WaterfallDetailWidget(QWidget):
 
         self.canvas = WaterfallPlotWidget(mini=False)
         self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.canvas.setMinimumHeight(700)
+        self.canvas.setMinimumHeight(500)
         self.canvas.clicked.connect(self._emit_active)
 
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -4097,7 +4149,7 @@ class WaterfallMiniWidget(QFrame):
         self.btn_close.setFixedWidth(70)
 
         self.canvas = WaterfallPlotWidget(mini=True)
-        self.canvas.setMinimumHeight(220)
+        self.canvas.setMinimumHeight(160)
 
         top = QHBoxLayout()
         top.addWidget(self.lbl, 1)
@@ -6174,25 +6226,53 @@ class MainWindow(QMainWindow):
                 preserve_annotations=(preserve_active_annotations and is_active),
             )
 
+    def _is_qobject_alive(self, obj) -> bool:
+        return _qt_alive(obj)
+
+    def _safe_delete_widget(self, widget):
+        if widget is None or not self._is_qobject_alive(widget):
+            return
+        try:
+            widget.setParent(None)
+        except RuntimeError:
+            return
+        except Exception:
+            pass
+        try:
+            widget.deleteLater()
+        except RuntimeError:
+            pass
+        except Exception:
+            pass
+
     def _clear_overview_widgets(self):
         for w in list(self._mini_widgets.values()):
-            w.setParent(None)
-            w.deleteLater()
+            if self._active_canvas is getattr(w, "canvas", None):
+                self._active_canvas = None
+                self._active_plot_key = None
+            self._safe_delete_widget(w)
         self._mini_widgets.clear()
         self._mini_kinds.clear()
         self._overview_order.clear()
 
         for lay in (self.mini_inner_time_lay, self.mini_inner_avg_lay, self.mini_inner_spec_lay):
-            self._strip_mini_layout(lay)
+            self._strip_mini_layout(lay, delete_widgets=False)
 
-    def _strip_mini_layout(self, lay):
-        # Remove everything except the trailing stretch.
+    def _strip_mini_layout(self, lay, delete_widgets=False):
+        # Remove layout items without double-deleting widgets that are merely
+        # being reflowed between mini columns.  Widget deletion is explicit.
         while lay.count():
             item = lay.takeAt(0)
             w = item.widget()
-            if w:
-                w.setParent(None)
-                w.deleteLater()
+            if w is not None:
+                try:
+                    w.setParent(None)
+                except RuntimeError:
+                    continue
+                except Exception:
+                    pass
+                if delete_widgets:
+                    self._safe_delete_widget(w)
         lay.addStretch(1)
 
     def _section_layout_for_kind(self, kind: str):
@@ -6214,52 +6294,69 @@ class MainWindow(QMainWindow):
             idx = self.plot_pages.indexOf(widget)
             if idx >= 0:
                 self.plot_pages.removeTab(idx)
-            widget.deleteLater()
+            if widget is self._inline_detail_widget:
+                self._inline_detail_widget = None
+            self._safe_delete_widget(widget)
             self._detail_widgets.pop(key, None)
-        # Also tear down any open Large tabs from a previous plot batch.
-        for key, widget in list(self._large_tab_widgets.items()):
-            idx = self.large_tabs.indexOf(widget)
-            if idx >= 0:
-                self.large_tabs.removeTab(idx)
-            widget.deleteLater()
-        self._large_tab_widgets.clear()
-        self.large_tabs.setVisible(False)
+        self._clear_large_tabs()
         self._clear_inline_detail()
 
     def _clear_inline_detail(self):
-        if self._inline_detail_widget is not None:
-            self._inline_detail_widget.setParent(None)
-            self._inline_detail_widget.deleteLater()
+        detail = self._inline_detail_widget
+        if detail is not None:
+            for k, w in list(self._detail_widgets.items()):
+                if w is detail:
+                    self._detail_widgets.pop(k, None)
+            canvas = getattr(detail, "canvas", None)
+            if self._active_canvas is canvas:
+                self._active_canvas = None
+                self._active_plot_key = None
+            self._safe_delete_widget(detail)
             self._inline_detail_widget = None
         self.lbl_inline_detail_empty.setVisible(True)
+        self.inline_detail_holder.setVisible(False)
+
+    def _clear_large_tabs(self):
+        if not hasattr(self, "large_tabs"):
+            return
+        active_cleared = False
+        self.large_tabs.blockSignals(True)
+        try:
+            for key, widget in list(self._large_tab_widgets.items()):
+                canvas = getattr(widget, "canvas", None)
+                if self._active_canvas is canvas:
+                    active_cleared = True
+                idx = self.large_tabs.indexOf(widget)
+                if idx >= 0:
+                    self.large_tabs.removeTab(idx)
+                self._safe_delete_widget(widget)
+            while self.large_tabs.count():
+                widget = self.large_tabs.widget(0)
+                self.large_tabs.removeTab(0)
+                self._safe_delete_widget(widget)
+        finally:
+            self.large_tabs.blockSignals(False)
+        self._large_tab_widgets.clear()
+        self.large_tabs.setVisible(False)
+        if active_cleared:
+            self._active_canvas = None
+            self._active_plot_key = None
 
     def _show_inline_detail(self, key: str):
         """Replace the shared inline detail area with a fresh widget for `key`.
 
-        Does NOT touch large-tab detail widgets — they live in self._large_tab_widgets
-        and remain available for comparison.
+        Inline detail and Open Large are mutually exclusive in the single-large
+        Plot View: selecting a mini clears any large tab before showing detail.
         """
         if key not in self._plot_states:
             return
 
-        state = self._plot_states[key]
-
+        self._clear_large_tabs()
+        self._clear_inline_detail()
+        self.inline_detail_holder.setVisible(True)
         self.lbl_inline_detail_empty.setVisible(False)
 
-        # Discard the previous *inline* detail (but leave Large-tab details alone).
-        if self._inline_detail_widget is not None:
-            prev = self._inline_detail_widget
-            # Remove its registration from _detail_widgets if it was the inline one.
-            for k, w in list(self._detail_widgets.items()):
-                if w is prev:
-                    self._detail_widgets.pop(k, None)
-            try:
-                prev.setParent(None)
-                prev.deleteLater()
-            except Exception:
-                pass
-            self._inline_detail_widget = None
-
+        state = self._plot_states[key]
         detail = self._make_detail_for_state(state)
 
         detail.activated.connect(self._set_active_canvas)
@@ -6639,20 +6736,46 @@ class MainWindow(QMainWindow):
             self.lbl_fft_info.setText("Frequency resolution: -")
 
     def _set_active_canvas(self, canvas, plot_key):
-        if self._active_canvas is not None and self._active_canvas is not canvas:
-            self._active_canvas.set_rect_zoom_active(False)
+        old_canvas = self._active_canvas
+        if old_canvas is not None and old_canvas is not canvas:
+            if self._is_qobject_alive(old_canvas):
+                try:
+                    old_canvas.set_rect_zoom_active(False)
+                except RuntimeError:
+                    pass
+                except Exception:
+                    pass
+            else:
+                old_canvas = None
+
+        if canvas is not None and not self._is_qobject_alive(canvas):
+            self._active_canvas = None
+            self._active_plot_key = None
+            self._load_axis_editors_from_state(None)
+            return
 
         self._active_canvas = canvas
-        self._active_plot_key = plot_key
+        self._active_plot_key = plot_key if canvas is not None else None
 
-        for key, mini in self._mini_widgets.items():
-            mini.set_selected(key == plot_key and mini.canvas is canvas)
+        for key, mini in list(self._mini_widgets.items()):
+            if not self._is_qobject_alive(mini):
+                continue
+            try:
+                mini.set_selected(key == plot_key and getattr(mini, "canvas", None) is canvas)
+            except RuntimeError:
+                continue
 
         if self._active_canvas is not None:
-            self._active_canvas.set_rect_zoom_active(self.btn_rect_zoom.isChecked())
+            try:
+                self._active_canvas.set_rect_zoom_active(self.btn_rect_zoom.isChecked())
+            except RuntimeError:
+                self._active_canvas = None
+                self._active_plot_key = None
+            except Exception:
+                pass
 
         self._sync_spectrogram_controls()
-        self._load_axis_editors_from_state(self._plot_states.get(plot_key))
+        self._load_axis_editors_from_state(self._plot_states.get(self._active_plot_key))
 
     def _on_plot_page_changed(self, index):
         # The Plot View no longer uses tabs for detail pages; this hook is kept
@@ -6687,46 +6810,84 @@ class MainWindow(QMainWindow):
 
         self.lbl_overview_empty.setVisible(len(self._mini_widgets) == 0)
 
+    def _select_fallback_active_canvas(self):
+        if self.large_tabs.isVisible() and self.large_tabs.count() > 0:
+            widget = self.large_tabs.currentWidget()
+            if widget is not None and self._is_qobject_alive(widget):
+                canvas = getattr(widget, "canvas", None)
+                if self._is_qobject_alive(canvas):
+                    self._set_active_canvas(canvas, getattr(widget, "plot_key", None))
+                    return
+        detail = self._inline_detail_widget
+        if detail is not None and self._is_qobject_alive(detail):
+            canvas = getattr(detail, "canvas", None)
+            if self._is_qobject_alive(canvas):
+                self._set_active_canvas(canvas, getattr(detail, "plot_key", None))
+                return
+        for fallback_key in list(self._overview_order):
+            mini = self._mini_widgets.get(fallback_key)
+            canvas = getattr(mini, "canvas", None) if mini is not None else None
+            if self._is_qobject_alive(mini) and self._is_qobject_alive(canvas):
+                self._set_active_canvas(canvas, fallback_key)
+                return
+        self._active_canvas = None
+        self._active_plot_key = None
+        self._load_axis_editors_from_state(None)
+
     def _close_plot_by_key(self, key):
         mini = self._mini_widgets.pop(key, None)
         if mini is not None:
-            mini.setParent(None)
-            mini.deleteLater()
-        self._mini_kinds.pop(key, None)
+            try:
+                mini.request_open.disconnect()
+            except Exception:
+                pass
+            try:
+                mini.request_large.disconnect()
+            except Exception:
+                pass
+            try:
+                mini.request_close.disconnect()
+            except Exception:
+                pass
+            try:
+                mini.activated.disconnect()
+            except Exception:
+                pass
+            if self._active_canvas is getattr(mini, "canvas", None):
+                self._active_canvas = None
+                self._active_plot_key = None
+            self._safe_delete_widget(mini)
 
+        self._mini_kinds.pop(key, None)
         self._plot_states.pop(key, None)
         self._overview_order = [k for k in self._overview_order if k != key]
 
-        detail = self._detail_widgets.pop(key, None)
-        if detail is not None:
-            if detail is self._inline_detail_widget:
-                self._inline_detail_widget = None
-                self.lbl_inline_detail_empty.setVisible(True)
-            idx = self.plot_pages.indexOf(detail)
-            if idx >= 0:
-                self.plot_pages.removeTab(idx)
-            detail.deleteLater()
+        detail = self._inline_detail_widget
+        if detail is not None and getattr(detail, "plot_key", None) == key:
+            self._clear_inline_detail()
+        else:
+            removed_detail = self._detail_widgets.pop(key, None)
+            if removed_detail is not None and removed_detail is not getattr(self, "_waterfall_result_widget", None):
+                if self._active_canvas is getattr(removed_detail, "canvas", None):
+                    self._active_canvas = None
+                    self._active_plot_key = None
+                self._safe_delete_widget(removed_detail)
 
-        # Also drop any matching Large tab.
-        large = self._large_tab_widgets.pop(key, None)
+        large = self._large_tab_widgets.get(key)
         if large is not None:
             idx = self.large_tabs.indexOf(large)
             if idx >= 0:
-                self.large_tabs.removeTab(idx)
-            large.deleteLater()
-            if self.large_tabs.count() == 0:
-                self.large_tabs.setVisible(False)
+                self._on_large_tab_close(idx)
+            else:
+                self._large_tab_widgets.pop(key, None)
+                if self._active_canvas is getattr(large, "canvas", None):
+                    self._active_canvas = None
+                    self._active_plot_key = None
+                self._safe_delete_widget(large)
 
         self._reflow_overview_grid()
-
-        if self._active_plot_key == key:
-            self._active_canvas = None
-            self._active_plot_key = None
-            if self._mini_widgets:
-                first_key = next(iter(self._mini_widgets))
-                self._set_active_canvas(self._mini_widgets[first_key].canvas, first_key)
-            else:
-                self._load_axis_editors_from_state(None)
+        if self._active_plot_key == key or self._active_canvas is None or not self._is_qobject_alive(self._active_canvas):
+            self._select_fallback_active_canvas()
 
         self._sync_spectrogram_controls()
 
@@ -6759,23 +6920,12 @@ class MainWindow(QMainWindow):
         return DetailPlotWidget(state)
 
     def _open_large_plot(self, key):
-        """Open the plot ``key`` in a new closable Large tab below.
-
-        - Does NOT overwrite the shared inline detail (so the user can keep
-          one plot selected while comparing it with several Large tabs).
-        - Reuses an existing Large tab if the same key is already opened.
-        - Supports multiple Large tabs for cross-sensor comparison.
-        """
+        """Open only ``key`` in the single-selected Large Plot View area."""
         if key not in self._plot_states:
             return
 
-        existing = self._large_tab_widgets.get(key)
-        if existing is not None:
-            idx = self.large_tabs.indexOf(existing)
-            if idx >= 0:
-                self.large_tabs.setCurrentIndex(idx)
-                self._set_active_canvas(existing.canvas, key)
-                return
+        self._clear_inline_detail()
+        self._clear_large_tabs()
 
         state = self._plot_states[key]
         detail = self._make_detail_for_state(state)
@@ -6786,37 +6936,57 @@ class MainWindow(QMainWindow):
         tab_label = state.get("short_title", state.get("name", key))
         if len(tab_label) > 32:
             tab_label = tab_label[:29] + "…"
-        idx = self.large_tabs.addTab(detail, tab_label)
-        self.large_tabs.setVisible(True)
-        self.large_tabs.setCurrentIndex(idx)
         self._large_tab_widgets[key] = detail
+        self.large_tabs.blockSignals(True)
+        try:
+            idx = self.large_tabs.addTab(detail, tab_label)
+            self.large_tabs.setCurrentIndex(idx)
+        finally:
+            self.large_tabs.blockSignals(False)
+        self.large_tabs.setVisible(True)
         self._set_active_canvas(detail.canvas, key)
 
     def _on_large_tab_close(self, index: int):
-        if index < 0:
+        if index < 0 or index >= self.large_tabs.count():
             return
         widget = self.large_tabs.widget(index)
         if widget is None:
             return
-        # Find the key for this widget.
+
         dead_key = None
         for k, w in list(self._large_tab_widgets.items()):
             if w is widget:
                 dead_key = k
                 break
-        self.large_tabs.removeTab(index)
-        widget.deleteLater()
+
+        if self._active_canvas is getattr(widget, "canvas", None):
+            self._active_canvas = None
+            self._active_plot_key = None
+
+        self.large_tabs.blockSignals(True)
+        try:
+            self.large_tabs.removeTab(index)
+        finally:
+            self.large_tabs.blockSignals(False)
+
         if dead_key is not None:
             self._large_tab_widgets.pop(dead_key, None)
+        self._safe_delete_widget(widget)
+
         if self.large_tabs.count() == 0:
             self.large_tabs.setVisible(False)
+        self._select_fallback_active_canvas()
 
     def _on_large_tab_changed(self, index: int):
-        if index < 0:
+        if index < 0 or not self.large_tabs.isVisible():
             return
         widget = self.large_tabs.widget(index)
-        if widget is not None and hasattr(widget, "canvas") and hasattr(widget, "plot_key"):
-            self._set_active_canvas(widget.canvas, widget.plot_key)
+        if widget is None or not self._is_qobject_alive(widget):
+            return
+        canvas = getattr(widget, "canvas", None)
+        if not self._is_qobject_alive(canvas):
+            return
+        self._set_active_canvas(canvas, getattr(widget, "plot_key", None))
 
     def _make_mini_for_state(self, st):
         """Factory for normal Plot View mini cards. Waterfall is excluded."""
@@ -7013,16 +7183,28 @@ class MainWindow(QMainWindow):
         self._plot_thread.start()
 
     def _zoom_active(self, factor):
-        if self._active_canvas is not None:
-            self._active_canvas.zoom_axes(factor)
+        if self._active_canvas is not None and self._is_qobject_alive(self._active_canvas):
+            try:
+                self._active_canvas.zoom_axes(factor)
+            except RuntimeError:
+                self._active_canvas = None
+                self._active_plot_key = None
 
     def _reset_active_view(self):
-        if self._active_canvas is not None:
-            self._active_canvas.reset_view()
+        if self._active_canvas is not None and self._is_qobject_alive(self._active_canvas):
+            try:
+                self._active_canvas.reset_view()
+            except RuntimeError:
+                self._active_canvas = None
+                self._active_plot_key = None
 
     def _on_rect_zoom_toggled(self, checked):
-        if self._active_canvas is not None:
-            self._active_canvas.set_rect_zoom_active(checked)
+        if self._active_canvas is not None and self._is_qobject_alive(self._active_canvas):
+            try:
+                self._active_canvas.set_rect_zoom_active(checked)
+            except RuntimeError:
+                self._active_canvas = None
+                self._active_plot_key = None
         if hasattr(self, "btn_wfv_rect_zoom") and self.btn_wfv_rect_zoom.isChecked() != checked:
             self.btn_wfv_rect_zoom.blockSignals(True)
             self.btn_wfv_rect_zoom.setChecked(checked)

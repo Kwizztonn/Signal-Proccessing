@@ -117,13 +117,14 @@ except Exception:
 
 # --- SciPy (Butterworth + zero-phase) ---
 try:
-    from scipy.signal import butter, sosfiltfilt, sosfilt, detrend as scipy_detrend
+    from scipy.signal import butter, sosfiltfilt, sosfilt, detrend as scipy_detrend, find_peaks
     _HAVE_SCIPY = True
 except Exception:
     butter = None
     sosfiltfilt = None
     sosfilt = None
     scipy_detrend = None
+    find_peaks = None
     _HAVE_SCIPY = False
 
 if _HAVE_PG:
@@ -682,6 +683,174 @@ def compute_order_map(
     sort_idx = np.argsort(rpms_v)
     return order_axis, rpms_v[sort_idx], S_order_out[sort_idx]
 
+
+
+def _simple_find_peaks_1d(y: np.ndarray, min_height=None, min_distance_bins: int = 1) -> np.ndarray:
+    """Fallback local-maximum detector used when SciPy is unavailable."""
+    y = np.asarray(y, dtype=np.float64)
+    if y.size < 3:
+        return np.array([], dtype=np.int64)
+    finite = np.isfinite(y)
+    yy = np.where(finite, y, -np.inf)
+    peaks = np.flatnonzero((yy[1:-1] > yy[:-2]) & (yy[1:-1] >= yy[2:])) + 1
+    if min_height is not None:
+        peaks = peaks[yy[peaks] >= float(min_height)]
+    if peaks.size <= 1 or min_distance_bins <= 1:
+        return peaks.astype(np.int64)
+    # Greedy non-maximum suppression by strength.
+    kept = []
+    for idx in peaks[np.argsort(yy[peaks])[::-1]]:
+        if all(abs(int(idx) - int(k)) >= int(min_distance_bins) for k in kept):
+            kept.append(int(idx))
+    return np.array(sorted(kept), dtype=np.int64)
+
+
+def compute_campbell_peaks(
+    freqs,
+    rpms,
+    spectra_linear,
+    output_type="Amplitude",
+    *,
+    f_min=0.0,
+    f_max=None,
+    max_peaks_per_frame=5,
+    min_prominence=None,
+    min_height=None,
+    min_distance_hz=1.0,
+    order_lines=(1, 2, 3, 4, 5),
+    scale="Linear",
+):
+    """Detect spectral peaks for a Campbell diagram from linear waterfall spectra.
+
+    The function intentionally works on the quantitative analysis grid, not on
+    display-interpolated rows. Peak magnitudes are kept in linear engineering
+    units and also converted to the requested display scale for plotting/export.
+    """
+    freqs = np.asarray(freqs, dtype=np.float64)
+    rpms = np.asarray(rpms, dtype=np.float64)
+    spectra_linear = np.asarray(spectra_linear, dtype=np.float64)
+    warnings = []
+
+    empty = {
+        "peak_rpms": np.array([], dtype=np.float64),
+        "peak_freqs": np.array([], dtype=np.float64),
+        "peak_orders": np.array([], dtype=np.float64),
+        "peak_magnitudes_linear": np.array([], dtype=np.float64),
+        "peak_magnitudes_display": np.array([], dtype=np.float64),
+        "peak_frame_indices": np.array([], dtype=np.int64),
+        "order_lines": tuple(order_lines or ()),
+        "warnings": warnings,
+    }
+    if freqs.size == 0 or rpms.size == 0 or spectra_linear.size == 0:
+        warnings.append("No Campbell peak input data available.")
+        return empty
+    if spectra_linear.ndim != 2 or spectra_linear.shape[0] != rpms.size or spectra_linear.shape[1] != freqs.size:
+        warnings.append("Campbell peak input dimensions do not match.")
+        return empty
+
+    f0 = max(float(f_min), float(np.nanmin(freqs)))
+    f1 = float(np.nanmax(freqs)) if f_max is None else min(float(f_max), float(np.nanmax(freqs)))
+    band = np.isfinite(freqs) & (freqs >= f0) & (freqs <= f1)
+    if np.count_nonzero(band) < 3:
+        warnings.append("Campbell peak frequency band is too narrow.")
+        return empty
+
+    freq_band = freqs[band]
+    df = float(np.nanmedian(np.diff(freq_band))) if freq_band.size > 1 else 1.0
+    min_distance_bins = max(1, int(round(float(min_distance_hz) / max(df, 1e-12))))
+    use_scipy = bool(find_peaks is not None)
+    if not use_scipy:
+        warnings.append("SciPy find_peaks unavailable; using simple local-maximum fallback.")
+
+    pr, pf, po, pm, pi = [], [], [], [], []
+    max_keep = max(1, int(max_peaks_per_frame))
+    for frame_idx, rpm_i in enumerate(rpms):
+        rpm_f = float(rpm_i)
+        if not np.isfinite(rpm_f) or rpm_f <= 0.0:
+            continue
+        row = np.maximum(np.asarray(spectra_linear[frame_idx, band], dtype=np.float64), 0.0)
+        if row.size < 3 or not np.any(np.isfinite(row)):
+            continue
+        if use_scipy:
+            kwargs = {"distance": min_distance_bins}
+            if min_prominence is not None:
+                kwargs["prominence"] = float(min_prominence)
+            if min_height is not None:
+                kwargs["height"] = float(min_height)
+            peak_idx, _ = find_peaks(row, **kwargs)
+        else:
+            peak_idx = _simple_find_peaks_1d(row, min_height=min_height, min_distance_bins=min_distance_bins)
+        if peak_idx.size == 0:
+            continue
+        strongest = peak_idx[np.argsort(row[peak_idx])[::-1]][:max_keep]
+        for k in strongest:
+            freq_i = float(freq_band[int(k)])
+            mag_i = float(row[int(k)])
+            pr.append(rpm_f)
+            pf.append(freq_i)
+            po.append(freq_i / (rpm_f / 60.0))
+            pm.append(mag_i)
+            pi.append(int(frame_idx))
+
+    peak_mags = np.asarray(pm, dtype=np.float64)
+    if str(scale).strip().lower() == "db" and peak_mags.size:
+        peak_disp = convert_linear_to_db(peak_mags, output_type)
+    else:
+        peak_disp = peak_mags.copy()
+    return {
+        "peak_rpms": np.asarray(pr, dtype=np.float64),
+        "peak_freqs": np.asarray(pf, dtype=np.float64),
+        "peak_orders": np.asarray(po, dtype=np.float64),
+        "peak_magnitudes_linear": peak_mags,
+        "peak_magnitudes_display": peak_disp,
+        "peak_frame_indices": np.asarray(pi, dtype=np.int64),
+        "order_lines": tuple(order_lines or ()),
+        "warnings": warnings,
+    }
+
+
+def track_order_ridges(peaks, order_tolerance=0.08, min_points=5):
+    """Group Campbell peaks into simple order-like ridges by nearest order."""
+    orders = np.asarray(peaks.get("peak_orders", []), dtype=np.float64)
+    frames = np.asarray(peaks.get("peak_frame_indices", []), dtype=np.int64)
+    mags = np.asarray(peaks.get("peak_magnitudes_linear", []), dtype=np.float64)
+    if orders.size == 0:
+        return []
+    order_idx = np.lexsort((orders, frames))
+    ridges = []
+    point_ids = np.full(orders.shape, -1, dtype=np.int64)
+    tol = float(order_tolerance)
+    for idx in order_idx:
+        od = float(orders[idx])
+        if not np.isfinite(od):
+            continue
+        best = None
+        best_delta = tol
+        for ridx, ridge in enumerate(ridges):
+            delta = abs(od - float(ridge["last_order"]))
+            if delta <= best_delta:
+                best = ridx
+                best_delta = delta
+        if best is None:
+            best = len(ridges)
+            ridges.append({"indices": [], "last_order": od})
+        ridges[best]["indices"].append(int(idx))
+        ridges[best]["last_order"] = od
+        point_ids[idx] = best
+
+    out = []
+    for ridx, ridge in enumerate(ridges):
+        inds = np.asarray(ridge["indices"], dtype=np.int64)
+        if inds.size < int(min_points):
+            continue
+        out.append({
+            "ridge_id": int(ridx),
+            "point_indices": inds,
+            "mean_order": float(np.nanmean(orders[inds])),
+            "num_points": int(inds.size),
+            "max_magnitude": float(np.nanmax(mags[inds])) if mags.size else np.nan,
+        })
+    return out
 
 def compute_order_tracking_spectrum(
     acc: np.ndarray,
@@ -2556,6 +2725,10 @@ class WaterfallPlotWidget(QWidget):
         self.S = np.empty((0, 0), dtype=np.float64)
         self.rpms_analysis = np.array([], dtype=np.float64)
         self.S_analysis = np.empty((0, 0), dtype=np.float64)
+        self.analysis_spectra_linear = np.empty((0, 0), dtype=np.float64)
+        self.raw_frame_rpms = np.array([], dtype=np.float64)
+        self.raw_frame_center_times_s = np.array([], dtype=np.float64)
+        self.raw_frame_spectra_linear = np.empty((0, 0), dtype=np.float64)
         self.frame_rpms = np.array([], dtype=np.float64)
         self.frame_spectra_linear = np.empty((0, 0), dtype=np.float64)
         self.rpms_full_display = np.array([], dtype=np.float64)
@@ -2606,6 +2779,8 @@ class WaterfallPlotWidget(QWidget):
             "<b>Tip:</b> use after parameters are finalized; repeated 3D windows can slow iterative tuning."
         ))
         self.btn_open_2d_standalone = QPushButton("Open 2D Standalone")
+        self.btn_open_campbell = QPushButton("Open Campbell")
+        self.btn_open_campbell.setToolTip("Detect spectral peaks from the waterfall analysis grid and show them as a Campbell diagram.")
         self.btn_open_2d_help = QToolButton()
         self.btn_open_2d_help.setText("?")
         self.btn_open_2d_help.setFixedWidth(22)
@@ -2683,6 +2858,7 @@ class WaterfallPlotWidget(QWidget):
         topbar.addWidget(self.btn_open_3d_help)
         topbar.addWidget(self.btn_open_2d_standalone)
         topbar.addWidget(self.btn_open_2d_help)
+        topbar.addWidget(self.btn_open_campbell)
         topbar.addSpacing(10)
         topbar.addWidget(self.lbl_order_info, 1)
         topbar.addStretch(1)
@@ -2699,12 +2875,14 @@ class WaterfallPlotWidget(QWidget):
         self.btn_clear_cursors.clicked.connect(self.clear_cursors)
         self.btn_open_3d.clicked.connect(self.open_3d_window)
         self.btn_open_2d_standalone.clicked.connect(self.open_2d_standalone_window)
+        self.btn_open_campbell.clicked.connect(self.open_campbell_window)
 
         if self.mini:
             self.btn_add_cursor.hide()
             self.btn_clear_cursors.hide()
             self.btn_open_3d.hide()
             self.btn_open_2d_standalone.hide()
+            self.btn_open_campbell.hide()
             self.lbl_order_info.hide()
             self.lower.hide()
 
@@ -3609,12 +3787,21 @@ class WaterfallPlotWidget(QWidget):
         target_rpms = self.rpms_trace if self.rpms_trace.size else self.rpms
         if target_rpms.size == 0:
             return np.array([], dtype=np.float64)
-        use_raw = (
+        use_analysis = (
+            self.rpms_analysis.size > 0 and self.analysis_spectra_linear.ndim == 2
+            and self.analysis_spectra_linear.shape[0] == self.rpms_analysis.size
+            and self.freqs_analysis.size > 0
+        )
+        use_frames = (
             self.frame_rpms.size > 0 and self.frame_spectra_linear.ndim == 2
             and self.frame_spectra_linear.shape[0] == self.frame_rpms.size
             and self.freqs_analysis.size > 0
         )
-        if use_raw:
+        if use_analysis:
+            rpms_src = self.rpms_analysis
+            freqs_src = self.freqs_analysis
+            S_lin = self.analysis_spectra_linear
+        elif use_frames:
             rpms_src = self.frame_rpms
             freqs_src = self.freqs_analysis
             S_lin = self.frame_spectra_linear
@@ -3828,6 +4015,22 @@ class WaterfallPlotWidget(QWidget):
         )
         dlg.exec_()
 
+    def open_campbell_window(self):
+        """Open Campbell peak plot using the analysis grid, not display interpolation."""
+        if self.state is None:
+            return
+        freqs = np.asarray(self.state.get("freqs_analysis", self.freqs_analysis), dtype=np.float64)
+        rpms = np.asarray(self.state.get("analysis_rpms", self.rpms_analysis), dtype=np.float64)
+        spectra = np.asarray(self.state.get("analysis_spectra_linear", self.analysis_spectra_linear), dtype=np.float64)
+        if spectra.size == 0:
+            rpms = np.asarray(self.state.get("frame_rpms", self.frame_rpms), dtype=np.float64)
+            spectra = np.asarray(self.state.get("frame_spectra_linear", self.frame_spectra_linear), dtype=np.float64)
+        if freqs.size == 0 or rpms.size == 0 or spectra.size == 0:
+            QMessageBox.warning(self, "Campbell Plot", "No analysis-grid spectra are available for Campbell peak detection.")
+            return
+        dlg = CampbellPlotWidget(self.state, self)
+        dlg.exec_()
+
     def set_state(self, state: dict, color_cfg=None, preserve_view=False, preserve_annotations=False):
         color_cfg = color_cfg or {}
         self._last_color_cfg = dict(color_cfg)
@@ -3867,6 +4070,10 @@ class WaterfallPlotWidget(QWidget):
         self.S_trace = self.S_full_display.copy()
         self.rpms_analysis = np.asarray(state.get("rpms_analysis", state["rpms"]), dtype=np.float64)
         self.S_analysis = np.asarray(state.get("S_analysis", state["S"]), dtype=np.float64)
+        self.analysis_spectra_linear = np.asarray(state.get("analysis_spectra_linear", []), dtype=np.float64)
+        self.raw_frame_rpms = np.asarray(state.get("raw_frame_rpms", []), dtype=np.float64)
+        self.raw_frame_center_times_s = np.asarray(state.get("raw_frame_center_times_s", []), dtype=np.float64)
+        self.raw_frame_spectra_linear = np.asarray(state.get("raw_frame_spectra_linear", []), dtype=np.float64)
         self.frame_rpms = np.asarray(state.get("frame_rpms", []), dtype=np.float64)
         self.frame_spectra_linear = np.asarray(state.get("frame_spectra_linear", []), dtype=np.float64)
         self._viewport_dense_factor = float(max(1.0, state.get("viewport_dense_factor", 4)))
@@ -4002,6 +4209,177 @@ class WaterfallPlotWidget(QWidget):
         self._last_viewport_signature = None
         if not self.mini:
             self._visible_reinterp_timer.start()
+
+
+class CampbellPlotWidget(QDialog):
+    """Interactive Campbell diagram with peak detection from analysis-grid spectra."""
+
+    def __init__(self, state: dict, parent=None):
+        super().__init__(parent)
+        self.state = state or {}
+        self.peaks = None
+        self._order_items = []
+        self.setWindowTitle("Campbell Plot / Peak Tracking")
+        self.resize(1100, 760)
+
+        lay = QVBoxLayout(self)
+        ctrl = QHBoxLayout()
+        self.chk_order_lines = QCheckBox("Order lines 1x–5x")
+        self.chk_order_lines.setChecked(True)
+        self.spin_max_peaks = QSpinBox()
+        self.spin_max_peaks.setRange(1, 50)
+        self.spin_max_peaks.setValue(5)
+        self.edit_prominence = QLineEdit()
+        self.edit_prominence.setPlaceholderText("Min prominence (optional)")
+        self.edit_prominence.setFixedWidth(160)
+        self.btn_recompute = QPushButton("Recompute")
+        self.btn_export = QPushButton("Export peak table...")
+        ctrl.addWidget(self.chk_order_lines)
+        ctrl.addWidget(QLabel("Max peaks/frame:"))
+        ctrl.addWidget(self.spin_max_peaks)
+        ctrl.addWidget(self.edit_prominence)
+        ctrl.addWidget(self.btn_recompute)
+        ctrl.addWidget(self.btn_export)
+        ctrl.addStretch(1)
+        lay.addLayout(ctrl)
+
+        self.info = QLabel("")
+        self.info.setWordWrap(True)
+        lay.addWidget(self.info)
+
+        self.plot = pg.PlotWidget(background="w")
+        self.plot_item = self.plot.getPlotItem()
+        self.plot_item.showGrid(x=True, y=True, alpha=0.25)
+        self.plot_item.setLabel("bottom", "RPM")
+        self.plot_item.setLabel("left", "Frequency (Hz)")
+        lay.addWidget(self.plot, 1)
+
+        self.hover = QLabel(self.plot.viewport())
+        self.hover.setVisible(False)
+        self.hover.setStyleSheet("background: rgba(255,255,255,235); border: 1px solid #666; padding: 2px 4px;")
+        self._mouse_proxy = pg.SignalProxy(self.plot.scene().sigMouseMoved, rateLimit=30, slot=self._on_mouse_moved)
+
+        self.btn_recompute.clicked.connect(self.recompute)
+        self.btn_export.clicked.connect(self.export_csv)
+        self.chk_order_lines.stateChanged.connect(self._draw_order_lines)
+        self.recompute()
+
+    def _analysis_inputs(self):
+        freqs = np.asarray(self.state.get("freqs_analysis", self.state.get("freqs", [])), dtype=np.float64)
+        rpms = np.asarray(self.state.get("analysis_rpms", self.state.get("rpms_analysis", [])), dtype=np.float64)
+        spectra = np.asarray(self.state.get("analysis_spectra_linear", []), dtype=np.float64)
+        if spectra.size == 0:
+            rpms = np.asarray(self.state.get("frame_rpms", []), dtype=np.float64)
+            spectra = np.asarray(self.state.get("frame_spectra_linear", []), dtype=np.float64)
+        return freqs, rpms, spectra
+
+    def recompute(self):
+        freqs, rpms, spectra = self._analysis_inputs()
+        txt = self.edit_prominence.text().strip()
+        min_prom = float(txt) if txt else None
+        self.peaks = compute_campbell_peaks(
+            freqs, rpms, spectra,
+            output_type=self.state.get("out_type", "Amplitude"),
+            max_peaks_per_frame=int(self.spin_max_peaks.value()),
+            min_prominence=min_prom,
+            min_distance_hz=1.0,
+            order_lines=(1, 2, 3, 4, 5),
+            scale=self.state.get("scale", "Linear"),
+        )
+        self._redraw()
+
+    def _redraw(self):
+        self.plot_item.clear()
+        self._order_items = []
+        peaks = self.peaks or {}
+        rpm = np.asarray(peaks.get("peak_rpms", []), dtype=np.float64)
+        freq = np.asarray(peaks.get("peak_freqs", []), dtype=np.float64)
+        mag = np.asarray(peaks.get("peak_magnitudes_display", []), dtype=np.float64)
+        if rpm.size:
+            mfin = np.isfinite(mag)
+            mag_norm = np.zeros_like(mag, dtype=np.float64)
+            if np.any(mfin):
+                lo = float(np.nanmin(mag[mfin])); hi = float(np.nanmax(mag[mfin]))
+                if hi > lo:
+                    mag_norm = (mag - lo) / (hi - lo)
+            sizes = 5.0 + 12.0 * np.clip(mag_norm, 0.0, 1.0)
+            spots = [{"pos": (float(rpm[i]), float(freq[i])), "size": float(sizes[i]), "brush": pg.mkBrush(20, 90, 220, 160), "pen": pg.mkPen(20, 60, 120, 180)} for i in range(rpm.size)]
+            self.scatter = pg.ScatterPlotItem(spots=spots)
+            self.plot_item.addItem(self.scatter)
+        self._draw_order_lines()
+        warnings = peaks.get("warnings", []) if isinstance(peaks, dict) else []
+        self.info.setText(f"Detected peaks={int(rpm.size)} | Source=waterfall analysis grid" + (" | " + " ".join(warnings) if warnings else ""))
+
+    def _draw_order_lines(self):
+        for item in self._order_items:
+            try:
+                self.plot_item.removeItem(item)
+            except Exception:
+                pass
+        self._order_items = []
+        if self.peaks is None or not self.chk_order_lines.isChecked():
+            return
+        freqs, rpms_src, _ = self._analysis_inputs()
+        if rpms_src.size == 0 or freqs.size == 0:
+            return
+        r0 = float(np.nanmin(rpms_src)); r1 = float(np.nanmax(rpms_src))
+        rr = np.linspace(r0, r1, 200)
+        fmax = float(np.nanmax(freqs))
+        for od in self.peaks.get("order_lines", (1, 2, 3, 4, 5)):
+            ff = float(od) * rr / 60.0
+            m = ff <= fmax
+            item = self.plot_item.plot(rr[m], ff[m], pen=pg.mkPen((220, 80, 40), width=1, style=Qt.DashLine))
+            label = pg.TextItem(text=f"{float(od):g}x", color=(160, 60, 40), anchor=(0, 1))
+            if np.any(m):
+                label.setPos(float(rr[m][-1]), float(ff[m][-1]))
+                self.plot_item.addItem(label)
+                self._order_items.append(label)
+            self._order_items.append(item)
+
+    def _on_mouse_moved(self, evt):
+        if not self.peaks:
+            return
+        pos = evt[0] if isinstance(evt, (tuple, list)) else evt
+        if not self.plot.sceneBoundingRect().contains(pos):
+            self.hover.setVisible(False)
+            return
+        mp = self.plot_item.vb.mapSceneToView(pos)
+        rpm = np.asarray(self.peaks.get("peak_rpms", []), dtype=np.float64)
+        freq = np.asarray(self.peaks.get("peak_freqs", []), dtype=np.float64)
+        if rpm.size == 0:
+            return
+        xr, yr = self.plot_item.vb.viewRange()
+        dx = (rpm - float(mp.x())) / max(float(xr[1] - xr[0]), 1e-12)
+        dy = (freq - float(mp.y())) / max(float(yr[1] - yr[0]), 1e-12)
+        idx = int(np.argmin(dx * dx + dy * dy))
+        if dx[idx] * dx[idx] + dy[idx] * dy[idx] > 0.0025:
+            self.hover.setVisible(False)
+            return
+        orders = np.asarray(self.peaks.get("peak_orders", []), dtype=np.float64)
+        mags = np.asarray(self.peaks.get("peak_magnitudes_display", []), dtype=np.float64)
+        self.hover.setText(f"RPM={rpm[idx]:.3g}\nFreq={freq[idx]:.3g} Hz\nOrder={orders[idx]:.3g}x\nMag={mags[idx]:.3g}")
+        self.hover.adjustSize()
+        self.hover.move(int(pos.x()) + 12, int(pos.y()) + 12)
+        self.hover.setVisible(True)
+
+    def export_csv(self):
+        if not self.peaks or np.asarray(self.peaks.get("peak_rpms", [])).size == 0:
+            QMessageBox.information(self, "Export Campbell Peaks", "No peaks to export.")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Save Campbell peak table", "campbell_peaks.csv", "CSV Files (*.csv);;All Files (*)")
+        if not path:
+            return
+        frame = np.asarray(self.peaks["peak_frame_indices"], dtype=np.int64)
+        rpm = np.asarray(self.peaks["peak_rpms"], dtype=np.float64)
+        freq = np.asarray(self.peaks["peak_freqs"], dtype=np.float64)
+        order = np.asarray(self.peaks["peak_orders"], dtype=np.float64)
+        mag_lin = np.asarray(self.peaks["peak_magnitudes_linear"], dtype=np.float64)
+        mag_disp = np.asarray(self.peaks["peak_magnitudes_display"], dtype=np.float64)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("frame_index,rpm,frequency_hz,order,magnitude_linear,magnitude_display,output_type,scale\n")
+            for i in range(rpm.size):
+                fh.write(f"{int(frame[i])},{rpm[i]:.12g},{freq[i]:.12g},{order[i]:.12g},{mag_lin[i]:.12g},{mag_disp[i]:.12g},{self.state.get('out_type','Amplitude')},{self.state.get('scale','Linear')}\n")
+
 
 
 class TimeDomainZoomFFTWidget(QWidget):
@@ -4848,15 +5226,15 @@ class PlotWorker(QObject):
                                output_type: str, scale: str,
                                num_spectra: int = 100, num_buffers: int = 1,
                                rpm_label_method: str = "Window-weighted (Hanning)"):
-        """Waterfall FFT map. Vectorized framing/FFT, selectable Hann kind.
+        """Build separated raw, analysis, and display waterfall grids.
 
-        RPM NaN/<=0/Inf values are treated as invalid frames and excluded
-        from the output (they are NOT converted to 0 RPM).  Acceleration NaN
-        is zero-filled so it does not corrupt the FFT arithmetic.
+        Raw frame grid preserves time order.  Analysis grid is the quantitative
+        layer used by cursors, Campbell plots, peak tracking, and exports.
+        Display grid is visual interpolation only and must not be treated as new
+        physical information.
         """
         acc = np.nan_to_num(np.asarray(acc, dtype=np.float64),
                             nan=0.0, posinf=0.0, neginf=0.0)
-        # Keep RPM as-is; invalid samples are filtered at frame-labelling stage.
         rpm = np.asarray(rpm, dtype=np.float64)
         fs = float(fs)
         nfft = max(2, int(nfft))
@@ -4877,7 +5255,6 @@ class PlotWorker(QObject):
 
         window_kind = self.cfg.get("window_kind", "periodic")
         w = _hann_window(nperseg, window_kind)
-        w_sum = float(np.sum(w)) or float(nperseg)
         freqs = np.fft.rfftfreq(nfft, d=1.0 / fs)
 
         starts = np.arange(n_frames, dtype=np.int64) * hop
@@ -4894,103 +5271,180 @@ class PlotWorker(QObject):
                 output_type=output_type, window_kind=window_kind,
             )
             spectra_rows.append(spec_i)
-        spectra_per_frame = np.asarray(spectra_rows, dtype=np.float64)
+        raw_spectra_linear = np.asarray(spectra_rows, dtype=np.float64)
 
         rpm_segs = rpm[idx_t]
         method = str(rpm_label_method).strip()
         if method == "Center sample":
             center = (nperseg - 1) // 2
-            frame_rpms = rpm_segs[:, center]
+            raw_frame_rpms = rpm_segs[:, center]
         elif method == "Window-weighted (Hanning)":
             finite = np.isfinite(rpm_segs)
             rseg = np.where(finite, rpm_segs, 0.0)
             w_eff = np.where(finite, w[None, :], 0.0)
             denom = w_eff.sum(axis=1)
             with np.errstate(invalid="ignore", divide="ignore"):
-                frame_rpms = np.where(
+                raw_frame_rpms = np.where(
                     denom > 0,
                     (w_eff * rseg).sum(axis=1) / denom,
                     np.nanmedian(rpm_segs, axis=1),
                 )
         else:
-            frame_rpms = np.nanmedian(rpm_segs, axis=1)
+            raw_frame_rpms = np.nanmedian(rpm_segs, axis=1)
 
-        m = np.isfinite(frame_rpms)
-        spectra = spectra_per_frame[m]
-        frame_rpms = frame_rpms[m]
-        if frame_rpms.size < 2:
+        raw_frame_center_times_s = (starts.astype(np.float64) + 0.5 * float(nperseg - 1)) / fs
+        raw_valid_mask = np.isfinite(raw_frame_rpms) & (raw_frame_rpms > 0.0)
+        raw_frame_count_total = int(starts.size)
+        raw_frame_count_valid = int(np.count_nonzero(raw_valid_mask))
+        if raw_frame_count_valid < 2:
             raise RuntimeError("Not enough valid RPM frames for waterfall plotting.")
 
-        order = np.argsort(frame_rpms)
-        frame_rpms = frame_rpms[order]
-        spectra = spectra[order]
-        n_valid = int(frame_rpms.size)
+        valid_rpms_time = raw_frame_rpms[raw_valid_mask]
+        valid_times = raw_frame_center_times_s[raw_valid_mask]
+        valid_spectra_time = raw_spectra_linear[raw_valid_mask]
 
-        num_buffers = max(1, min(int(num_buffers), n_valid))
-        if num_buffers > 1:
-            half = num_buffers // 2
+        requested_buffers = max(1, int(num_buffers))
+        buffers_per_spectrum = max(1, min(requested_buffers, raw_frame_count_valid))
+        num_buffers_mode = str(self.cfg.get("waterfall_num_buffers_mode", "RPM-neighbor smoothing")).strip()
+        if num_buffers_mode not in ("Time-adjacent averaging", "RPM-neighbor smoothing"):
+            num_buffers_mode = "RPM-neighbor smoothing"
+        analysis_grid_mode = str(self.cfg.get("waterfall_analysis_grid_mode", "RPM-uniform analysis grid")).strip()
+        if analysis_grid_mode not in ("Raw valid frames", "RPM-uniform analysis grid"):
+            analysis_grid_mode = "RPM-uniform analysis grid"
+
+        smoothing_warning = ""
+        if requested_buffers > 5:
+            smoothing_warning = "Large Number of Buffers can smooth narrow peaks and hide rapid speed transitions."
+        if requested_buffers > max(5, raw_frame_count_valid // 3):
+            smoothing_warning = (smoothing_warning + " " if smoothing_warning else "") + "Number of Buffers is large relative to the valid frame count."
+
+        def _moving_average_rows(rows: np.ndarray, width: int) -> np.ndarray:
+            if width <= 1 or rows.shape[0] <= 1:
+                return rows.copy()
+            half = width // 2
             csum = np.vstack([
-                np.zeros((1, spectra.shape[1]), dtype=np.float64),
-                np.cumsum(spectra, axis=0, dtype=np.float64),
+                np.zeros((1, rows.shape[1]), dtype=np.float64),
+                np.cumsum(rows, axis=0, dtype=np.float64),
             ])
-            spectra_smoothed = np.empty_like(spectra)
-            for i in range(n_valid):
+            out = np.empty_like(rows)
+            for i in range(rows.shape[0]):
                 i0 = max(0, i - half)
-                i1 = min(n_valid, i + half + 1)
-                count = max(1, i1 - i0)
-                spectra_smoothed[i, :] = (csum[i1, :] - csum[i0, :]) / float(count)
-        else:
-            spectra_smoothed = spectra
+                i1 = min(rows.shape[0], i + half + 1)
+                out[i, :] = (csum[i1, :] - csum[i0, :]) / float(max(1, i1 - i0))
+            return out
 
-        min_rpm = float(frame_rpms[0])
-        max_rpm = float(frame_rpms[-1])
-        if min_rpm == max_rpm:
-            target_rpms = np.array([min_rpm], dtype=np.float64)
-            S_analysis_linear = spectra_smoothed[:1, :]
+        if buffers_per_spectrum <= 1:
+            smoothing_domain = "none"
+            smoothed_rpms = valid_rpms_time.copy()
+            smoothed_times = valid_times.copy()
+            smoothed_spectra = valid_spectra_time.copy()
+            analysis_sort_order = np.arange(smoothed_rpms.size, dtype=np.int64)
+        elif num_buffers_mode == "Time-adjacent averaging":
+            smoothing_domain = "time"
+            smoothed_rpms = valid_rpms_time.copy()
+            smoothed_times = valid_times.copy()
+            smoothed_spectra = _moving_average_rows(valid_spectra_time, buffers_per_spectrum)
+            analysis_sort_order = np.argsort(smoothed_rpms)
         else:
-            target_count = max(1, int(num_spectra))
-            target_rpms = np.linspace(min_rpm, max_rpm, target_count, dtype=np.float64)
+            smoothing_domain = "rpm"
+            rpm_order = np.argsort(valid_rpms_time)
+            smoothed_rpms = valid_rpms_time[rpm_order]
+            smoothed_times = valid_times[rpm_order]
+            smoothed_spectra = _moving_average_rows(valid_spectra_time[rpm_order], buffers_per_spectrum)
+            analysis_sort_order = rpm_order.astype(np.int64)
 
-            if target_count == n_valid and np.all(np.diff(frame_rpms) > 0.0):
-                S_analysis_linear = spectra_smoothed
+        smoothed_spectra = np.maximum(np.asarray(smoothed_spectra, dtype=np.float64), 0.0)
+
+        target_count = max(1, int(num_spectra))
+        analysis_interpolated = False
+        if analysis_grid_mode == "Raw valid frames":
+            analysis_axis_type = "time"
+            analysis_x_axis = smoothed_times.copy()
+            analysis_x_label = "Time (s)"
+            analysis_rpms = smoothed_rpms.copy()
+            analysis_spectra_linear = smoothed_spectra.copy()
+        else:
+            analysis_axis_type = "rpm"
+            rpm_sort = np.argsort(smoothed_rpms)
+            rpms_sorted = smoothed_rpms[rpm_sort]
+            spectra_sorted = smoothed_spectra[rpm_sort]
+            if rpms_sorted.size == 1 or float(rpms_sorted[0]) == float(rpms_sorted[-1]):
+                analysis_rpms = rpms_sorted[:1].copy()
+                analysis_spectra_linear = spectra_sorted[:1, :].copy()
             else:
-                uniq_rpms, uniq_spectra = self._aggregate_duplicate_rpms(frame_rpms, spectra_smoothed)
-                if uniq_rpms.size < 2:
-                    S_analysis_linear = np.repeat(uniq_spectra[:1, :], target_count, axis=0)
+                analysis_rpms = np.linspace(float(rpms_sorted[0]), float(rpms_sorted[-1]), target_count, dtype=np.float64)
+                if target_count == rpms_sorted.size and np.all(np.diff(rpms_sorted) > 0.0):
+                    analysis_spectra_linear = spectra_sorted.copy()
                 else:
-                    S_analysis_linear = np.empty((target_count, uniq_spectra.shape[1]), dtype=np.float64)
-                    for j in range(uniq_spectra.shape[1]):
-                        S_analysis_linear[:, j] = np.interp(target_rpms, uniq_rpms, uniq_spectra[:, j])
+                    uniq_rpms, uniq_spectra = self._aggregate_duplicate_rpms(rpms_sorted, spectra_sorted)
+                    if uniq_rpms.size < 2:
+                        analysis_spectra_linear = np.repeat(uniq_spectra[:1, :], target_count, axis=0)
+                    else:
+                        analysis_spectra_linear = np.empty((target_count, uniq_spectra.shape[1]), dtype=np.float64)
+                        for j in range(uniq_spectra.shape[1]):
+                            analysis_spectra_linear[:, j] = np.interp(analysis_rpms, uniq_rpms, uniq_spectra[:, j])
+                    analysis_interpolated = True
+            analysis_x_axis = analysis_rpms.copy()
+            analysis_x_label = "RPM"
 
-        S_analysis_linear = np.maximum(np.asarray(S_analysis_linear, dtype=np.float64), 0.0)
-        S_analysis = self._convert_waterfall_scale(S_analysis_linear, output_type, scale)
+        analysis_spectra_linear = np.maximum(np.asarray(analysis_spectra_linear, dtype=np.float64), 0.0)
+        analysis_spectra_display_scaled = self._convert_waterfall_scale(analysis_spectra_linear, output_type, scale)
 
         dense_factor = int(max(1, self.cfg.get("waterfall_display_dense_factor", 6)))
         max_points = int(max(200, self.cfg.get("waterfall_display_max_points", 12000)))
-        rpms_display, S_display = self._build_dense_waterfall_display(
-            frame_rpms=frame_rpms,
-            spectra_linear=spectra_smoothed,
+        display_rpms, display_S = self._build_dense_waterfall_display(
+            frame_rpms=smoothed_rpms,
+            spectra_linear=smoothed_spectra,
             output_type=output_type,
             scale=scale,
             base_count=int(max(1, num_spectra)),
             dense_factor=dense_factor,
             max_points=max_points,
         )
+        if display_rpms.size == 0:
+            display_rpms = analysis_rpms.copy()
+            display_S = analysis_spectra_display_scaled.copy()
+        display_interpolated = bool(display_rpms.size != smoothed_rpms.size or not np.all(np.diff(np.sort(smoothed_rpms)) > 0.0))
 
+        # Backward-compatible frame_* keys now refer to the smoothed valid-frame
+        # layer before any quantitative RPM-uniform interpolation.
         return {
             "freqs": freqs,
             "freqs_analysis": freqs.copy(),
             "freqs_display": freqs.copy(),
-            "rpms_analysis": target_rpms,
-            "S_analysis": S_analysis,
-            "frame_rpms": frame_rpms,
-            "frame_spectra_linear": spectra_smoothed,
-            "rpms_display": rpms_display if rpms_display.size else target_rpms,
-            "S_display": S_display if S_display.size else S_analysis,
-            "raw_frame_count": n_valid,
-            "analysis_spectrum_count": int(target_rpms.size),
-            "buffers_per_spectrum": int(num_buffers),
-            "analysis_interpolated": bool(target_rpms.size != n_valid or not np.all(np.diff(frame_rpms) > 0.0)),
+            "raw_frame_starts_sample": starts.copy(),
+            "raw_frame_center_times_s": raw_frame_center_times_s.copy(),
+            "raw_frame_rpms": raw_frame_rpms.copy(),
+            "raw_frame_spectra_linear": raw_spectra_linear.copy(),
+            "raw_frame_valid_mask": raw_valid_mask.copy(),
+            "raw_frame_count_total": raw_frame_count_total,
+            "raw_frame_count_valid": raw_frame_count_valid,
+            "analysis_axis_type": analysis_axis_type,
+            "analysis_x_axis": analysis_x_axis,
+            "analysis_x_label": analysis_x_label,
+            "analysis_rpms": analysis_rpms,
+            "analysis_spectra_linear": analysis_spectra_linear,
+            "analysis_spectra_display_scaled": analysis_spectra_display_scaled,
+            "analysis_spectrum_count": int(analysis_spectra_linear.shape[0]),
+            "analysis_interpolated": bool(analysis_interpolated),
+            "analysis_sort_order": analysis_sort_order,
+            "display_rpms": display_rpms,
+            "display_freqs": freqs.copy(),
+            "display_S": display_S,
+            "display_dense_factor": int(dense_factor),
+            "display_interpolated": bool(display_interpolated),
+            "rpms_analysis": analysis_rpms,
+            "S_analysis": analysis_spectra_display_scaled,
+            "frame_rpms": smoothed_rpms,
+            "frame_spectra_linear": smoothed_spectra,
+            "rpms_display": display_rpms,
+            "S_display": display_S,
+            "raw_frame_count": raw_frame_count_valid,
+            "buffers_per_spectrum": int(buffers_per_spectrum),
+            "num_buffers_mode": num_buffers_mode,
+            "smoothing_domain": smoothing_domain,
+            "smoothing_warning": smoothing_warning,
+            "waterfall_analysis_grid_mode": analysis_grid_mode,
         }
 
     def _processing_title(self, use_filtered: bool, signal_kind: str) -> str:
@@ -5098,8 +5552,8 @@ class PlotWorker(QObject):
             n_orders = int(self.cfg.get("waterfall_order_bins", 512))
             order_axis, sorted_rpms, S_order = compute_order_map(
                 wf_map["freqs_analysis"],
-                wf_map["frame_rpms"],
-                wf_map["frame_spectra_linear"],
+                wf_map.get("analysis_rpms", wf_map["frame_rpms"]),
+                wf_map.get("analysis_spectra_linear", wf_map["frame_spectra_linear"]),
                 order_max=order_max,
                 n_orders=n_orders,
                 output_type=out_type,
@@ -5142,6 +5596,20 @@ class PlotWorker(QObject):
                 # Keep raw frame data for order-cursor extraction
                 "frame_rpms": wf_map["frame_rpms"],
                 "frame_spectra_linear": wf_map["frame_spectra_linear"],
+                "raw_frame_starts_sample": wf_map.get("raw_frame_starts_sample"),
+                "raw_frame_center_times_s": wf_map.get("raw_frame_center_times_s"),
+                "raw_frame_rpms": wf_map.get("raw_frame_rpms"),
+                "raw_frame_spectra_linear": wf_map.get("raw_frame_spectra_linear"),
+                "raw_frame_valid_mask": wf_map.get("raw_frame_valid_mask"),
+                "raw_frame_count_total": wf_map.get("raw_frame_count_total"),
+                "raw_frame_count_valid": wf_map.get("raw_frame_count_valid"),
+                "analysis_rpms": wf_map.get("analysis_rpms"),
+                "analysis_spectra_linear": wf_map.get("analysis_spectra_linear"),
+                "num_buffers_mode": wf_map.get("num_buffers_mode"),
+                "smoothing_domain": wf_map.get("smoothing_domain"),
+                "smoothing_warning": wf_map.get("smoothing_warning"),
+                "waterfall_analysis_grid_mode": wf_map.get("waterfall_analysis_grid_mode"),
+                "display_interpolated": wf_map.get("display_interpolated"),
                 "scale": scale,
                 "out_type": out_type,
                 "colorbar_label": colorbar_label,
@@ -5153,9 +5621,12 @@ class PlotWorker(QObject):
                 "buffers_per_spectrum": wf_map.get("buffers_per_spectrum"),
                 "analysis_interpolated": wf_map.get("analysis_interpolated"),
                 "stats_text": (
-                    f"Order Waterfall | Acc={acc_name} (fs={fs_acc:g} Hz) | "
-                    f"RPM={rpm_name} (fs={fs_rpm:g} Hz) | FFT fs={wf_fs:g} Hz | "
-                    f"NFFT={nfft} | Spectra={num_spectra} | OrderMax={order_max:.1f}"
+                    f"Raw frames={wf_map.get('raw_frame_count_total')}, valid={wf_map.get('raw_frame_count_valid')} | "
+                    f"Analysis={'RPM-uniform' if wf_map.get('waterfall_analysis_grid_mode') == 'RPM-uniform analysis grid' else 'Raw frames'}, "
+                    f"spectra={wf_map.get('analysis_spectrum_count')}, interpolated={'yes' if wf_map.get('analysis_interpolated') else 'no'} | "
+                    f"Buffers={wf_map.get('buffers_per_spectrum')}, mode={wf_map.get('num_buffers_mode')} | "
+                    f"Display rows={int(np.asarray(wf_map.get('rpms_display', [])).size)}, interpolated={'yes' if wf_map.get('display_interpolated') else 'no'}"
+                    + (f" | {wf_map.get('smoothing_warning')}" if wf_map.get('smoothing_warning') else "")
                 ),
             }
 
@@ -5220,6 +5691,29 @@ class PlotWorker(QObject):
             "S_display": S_map,
             "frame_rpms": wf_map["frame_rpms"],
             "frame_spectra_linear": wf_map["frame_spectra_linear"],
+            "raw_frame_starts_sample": wf_map.get("raw_frame_starts_sample"),
+            "raw_frame_center_times_s": wf_map.get("raw_frame_center_times_s"),
+            "raw_frame_rpms": wf_map.get("raw_frame_rpms"),
+            "raw_frame_spectra_linear": wf_map.get("raw_frame_spectra_linear"),
+            "raw_frame_valid_mask": wf_map.get("raw_frame_valid_mask"),
+            "raw_frame_count_total": wf_map.get("raw_frame_count_total"),
+            "raw_frame_count_valid": wf_map.get("raw_frame_count_valid"),
+            "analysis_axis_type": wf_map.get("analysis_axis_type"),
+            "analysis_x_axis": wf_map.get("analysis_x_axis"),
+            "analysis_x_label": wf_map.get("analysis_x_label"),
+            "analysis_rpms": wf_map.get("analysis_rpms"),
+            "analysis_spectra_linear": wf_map.get("analysis_spectra_linear"),
+            "analysis_spectra_display_scaled": wf_map.get("analysis_spectra_display_scaled"),
+            "analysis_sort_order": wf_map.get("analysis_sort_order"),
+            "display_rpms": wf_map.get("display_rpms"),
+            "display_freqs": wf_map.get("display_freqs"),
+            "display_S": wf_map.get("display_S"),
+            "display_dense_factor": wf_map.get("display_dense_factor"),
+            "display_interpolated": wf_map.get("display_interpolated"),
+            "num_buffers_mode": wf_map.get("num_buffers_mode"),
+            "smoothing_domain": wf_map.get("smoothing_domain"),
+            "smoothing_warning": wf_map.get("smoothing_warning"),
+            "waterfall_analysis_grid_mode": wf_map.get("waterfall_analysis_grid_mode"),
             "viewport_dense_factor": float(max(1.0, self.cfg.get("waterfall_viewport_dense_factor", 6))),
             "viewport_min_points": int(max(200, self.cfg.get("waterfall_viewport_min_points", 1200))),
             "viewport_max_points": int(max(1000, self.cfg.get("waterfall_viewport_max_points", 10000))),
@@ -5239,10 +5733,12 @@ class PlotWorker(QObject):
             "buffers_per_spectrum": wf_map.get("buffers_per_spectrum"),
             "analysis_interpolated": wf_map.get("analysis_interpolated"),
             "stats_text": (
-                f"Waterfall built from Acc={acc_name} ({acc_file_base}/{acc_group}, fs={fs_acc:g} Hz) and "
-                f"RPM={rpm_name} ({rpm_file_base}/{rpm_group}, fs={fs_rpm:g} Hz) | "
-                f"{resample_mode} | Interp={interp_mode} | RPM label={rpm_label_method} | FFT fs={wf_fs:g} Hz | "
-                f"Spectra={num_spectra} | Buffers/Spectrum={num_buffers}"
+                f"Raw frames={wf_map.get('raw_frame_count_total')}, valid={wf_map.get('raw_frame_count_valid')} | "
+                f"Analysis={'RPM-uniform' if wf_map.get('waterfall_analysis_grid_mode') == 'RPM-uniform analysis grid' else 'Raw frames'}, "
+                f"spectra={wf_map.get('analysis_spectrum_count')}, interpolated={'yes' if wf_map.get('analysis_interpolated') else 'no'} | "
+                f"Buffers={wf_map.get('buffers_per_spectrum')}, mode={wf_map.get('num_buffers_mode')} | "
+                f"Display rows={int(np.asarray(wf_map.get('rpms_display', [])).size)}, interpolated={'yes' if wf_map.get('display_interpolated') else 'no'}"
+                + (f" | {wf_map.get('smoothing_warning')}" if wf_map.get('smoothing_warning') else "")
             ),
             # COT: computed when checkbox is enabled. Stored for downstream use.
             "cot_results": self._maybe_compute_cot(acc, rpm, wf_fs),
@@ -5306,8 +5802,11 @@ class PlotWorker(QObject):
             S_an_linear = _interp_to(rpms_analysis)
             S_dp_linear = _interp_to(rpms_display) if rpms_display.size else S_an_linear
 
-            wf_map["S_analysis"] = self._convert_waterfall_scale(S_an_linear, output_type, scale)
+            wf_map["analysis_spectra_linear"] = np.maximum(S_an_linear, 0.0)
+            wf_map["analysis_spectra_display_scaled"] = self._convert_waterfall_scale(S_an_linear, output_type, scale)
+            wf_map["S_analysis"] = wf_map["analysis_spectra_display_scaled"]
             wf_map["S_display"] = self._convert_waterfall_scale(S_dp_linear, output_type, scale)
+            wf_map["display_S"] = wf_map["S_display"]
 
             return {
                 "enabled": True,
@@ -8289,8 +8788,8 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
             "wf_resample": "<b>Resample mode</b><br><br>Controls which signal is interpolated so acceleration and RPM share a timebase. Resample RPM → Acc timebase usually preserves the vibration waveform and is recommended when acceleration is sampled faster.<br><br><b>Use Trim only</b> only when both files already share fs and timing.",
             "wf_interp": "<b>Interpolation mode</b><br><br>Linear interpolation is smooth and usually best for RPM because speed changes continuously. Nearest preserves original samples but can create stair-step RPM labels.<br><br><b>Start with:</b> Linear for run-up/coast-down data.",
             "wf_rpm_label": "<b>RPM label method</b><br><br>Assigns one RPM value to each FFT frame. Center sample is simple, Median rejects spikes, and Window-weighted Hann matches the FFT window weighting.<br><br><b>Start with:</b> Window-weighted (Hanning) for run-up/coast-down data.",
-            "wf_spectra": "<b>Num Spectra</b><br><br>Controls display interpolation density: the minimum number of RPM rows in the waterfall image. It makes the display smoother but does not increase physical resolution beyond the raw FFT frame count.<br><br><b>Start with:</b> near the raw frame count shown in the stats text.",
-            "wf_buffers": "<b>Num Buffers</b><br><br>Sliding average width across neighboring FFT frames before display. Larger values reduce random noise but blur narrow peaks and fast speed transitions.<br><br><b>Start with:</b> 1 (no smoothing), then 3–5 only if the waterfall is very noisy.",
+            "wf_spectra": "<b>Num Spectra</b><br><br>Raw frames are the true computed FFT frames. The analysis grid is the data used for measurements, order traces, Campbell plots, peak tracking, and exports. The display grid is visual interpolation only.<br><br>When Analysis grid is <b>RPM-uniform</b>, Num Spectra sets the number of quantitative RPM bins. When Analysis grid is <b>Raw valid frames</b>, Num Spectra does not change the measurement grid; display density may still interpolate visually.<br><br><b>Important:</b> increasing display density does not create new physical information.",
+            "wf_buffers": "<b>Num Buffers</b><br><br>Sliding average width across neighboring FFT frames. <b>Time-adjacent averaging</b> smooths valid frames in original time order before any RPM sorting. <b>RPM-neighbor smoothing</b> is the legacy behavior: sort by RPM first, then smooth neighboring RPM rows.<br><br><b>Start with:</b> 1 (no smoothing), then 3–5 only if the waterfall is very noisy. Large Number of Buffers can smooth narrow peaks and hide rapid speed transitions.",
             "wf_otf_enable": "<b>Order Tracking Filter enable</b><br><br>Enables a true filter around the selected order trajectory f = order × RPM / 60. This changes the displayed waterfall data; it is not merely a cursor overlay.<br><br><b>Use when:</b> isolating one order family or rejecting it with band-stop mode.",
             "wf_target_order": "<b>Target order k</b><br><br>The shaft order to isolate or reject. For example 1.0x follows f = RPM/60, 2.0x follows twice running speed.<br><br><b>Start with:</b> 1.0 for running speed, then known gear/blade/bearing orders as needed.",
             "wf_half_bw": "<b>Half-bandwidth</b><br><br>Width on either side of the target order trajectory. Too narrow can miss smeared or speed-varying energy; too wide includes neighboring orders/noise.<br><br><b>Start with:</b> a small order bandwidth (such as 0.05–0.10 order) or a Hz width matched to expected speed variation.",
@@ -8537,6 +9036,20 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
         )
         self.btn_wf_num_buffers_help = self._make_help_button(
             "Number of Buffers — Explanation", self._help_html("wf_buffers"), "Number of Buffers"
+        )
+        self.cmb_wf_num_buffers_mode = QComboBox()
+        self.cmb_wf_num_buffers_mode.addItems(["Time-adjacent averaging", "RPM-neighbor smoothing"])
+        self.cmb_wf_num_buffers_mode.setCurrentText("RPM-neighbor smoothing")
+        self.cmb_wf_num_buffers_mode.setToolTip(
+            "Time-adjacent averaging smooths neighboring FFT frames before RPM sorting.\n"
+            "RPM-neighbor smoothing preserves the legacy behavior."
+        )
+        self.cmb_wf_analysis_grid_mode = QComboBox()
+        self.cmb_wf_analysis_grid_mode.addItems(["Raw valid frames", "RPM-uniform analysis grid"])
+        self.cmb_wf_analysis_grid_mode.setCurrentText("RPM-uniform analysis grid")
+        self.cmb_wf_analysis_grid_mode.setToolTip(
+            "Raw valid frames keeps computed FFT frames for measurements.\n"
+            "RPM-uniform analysis grid interpolates to Num Spectra for legacy behavior."
         )
 
         self.wf_out = QComboBox()
@@ -8826,6 +9339,10 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
         row_wf_3.addWidget(QLabel("Num Buffers:"))
         row_wf_3.addWidget(self.wf_num_buffers_spin)
         row_wf_3.addWidget(self.btn_wf_num_buffers_help)
+        row_wf_3.addWidget(QLabel("Buffer mode:"))
+        row_wf_3.addWidget(self.cmb_wf_num_buffers_mode)
+        row_wf_3.addWidget(QLabel("Analysis grid:"))
+        row_wf_3.addWidget(self.cmb_wf_analysis_grid_mode)
         row_wf_3.addStretch(1)
         lay.addLayout(row_wf_3)
 
@@ -9105,6 +9622,8 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
             "waterfall_filter_target": self.cmb_wf_filter_target.currentText(),
             "waterfall_num_spectra": int(self.wf_num_spectra_spin.value()),
             "waterfall_num_buffers": int(self.wf_num_buffers_spin.value()),
+            "waterfall_num_buffers_mode": self.cmb_wf_num_buffers_mode.currentText(),
+            "waterfall_analysis_grid_mode": self.cmb_wf_analysis_grid_mode.currentText(),
             "waterfall_domain": self.cmb_wf_domain.currentText(),
             "waterfall_order_max": float(self.wf_order_max_spin.value()),
             "waterfall_order_bins": int(self.wf_order_bins_spin.value()),
@@ -9565,6 +10084,93 @@ def run_signal_processing_self_tests(verbose: bool = True) -> bool:
             amp_ok, f"found {peak_1x_amp:.4f}, expected 1.5")
     except Exception as e:
         log("Test 7", False, str(e))
+
+
+    # ── Test 8: Waterfall raw-frame preservation ─────────────────────
+    try:
+        worker = object.__new__(PlotWorker)
+        worker.cfg = {
+            "window_kind": "periodic", "amp_conv": "Peak",
+            "waterfall_display_dense_factor": 3,
+            "waterfall_analysis_grid_mode": "Raw valid frames",
+            "waterfall_num_buffers_mode": "Time-adjacent averaging",
+        }
+        fs8 = 512.0
+        n8 = 4096
+        tt8 = np.arange(n8) / fs8
+        rpm8 = 2000.0 + 400.0 * np.sin(2.0 * np.pi * tt8 / tt8[-1])
+        sig8 = np.sin(2.0 * np.pi * 40.0 * tt8)
+        wf8 = worker._compute_waterfall_map(sig8, rpm8, fs8, 256, 50.0, "Amplitude", "Linear", 30, 1)
+        times_mono = np.all(np.diff(wf8["raw_frame_center_times_s"]) > 0.0)
+        raw_not_sorted = np.any(np.diff(wf8["raw_frame_rpms"][wf8["raw_frame_valid_mask"]]) < 0.0)
+        log("Test 8: Raw frame center times are monotonic", times_mono)
+        log("Test 8: Raw frame RPMs preserve non-sorted time order", raw_not_sorted)
+    except Exception as e:
+        log("Test 8", False, str(e))
+
+    # ── Test 9: RPM-uniform analysis grid sorted ascending ────────────
+    try:
+        worker.cfg.update({
+            "waterfall_analysis_grid_mode": "RPM-uniform analysis grid",
+            "waterfall_num_buffers_mode": "RPM-neighbor smoothing",
+        })
+        wf9 = worker._compute_waterfall_map(sig8, rpm8, fs8, 256, 50.0, "Amplitude", "Linear", 40, 3)
+        sorted_ok = np.all(np.diff(wf9["analysis_rpms"]) >= 0.0)
+        log("Test 9: RPM-uniform analysis_rpms sorted ascending", sorted_ok)
+    except Exception as e:
+        log("Test 9", False, str(e))
+
+    # ── Test 10: Time-adjacent smoothing stays in time domain first ───
+    try:
+        worker.cfg.update({
+            "waterfall_analysis_grid_mode": "Raw valid frames",
+            "waterfall_num_buffers_mode": "Time-adjacent averaging",
+        })
+        sig10 = np.zeros(4096, dtype=np.float64)
+        sig10[1400:1500] = 10.0 * np.sin(2.0 * np.pi * 80.0 * np.arange(100) / fs8)
+        rpm10 = np.linspace(3500.0, 1500.0, sig10.size)  # descending RPM makes RPM order different from time order
+        wf10 = worker._compute_waterfall_map(sig10, rpm10, fs8, 256, 50.0, "Amplitude", "Linear", 30, 3)
+        raw_energy = np.sum(wf10["raw_frame_spectra_linear"][wf10["raw_frame_valid_mask"]], axis=1)
+        sm_energy = np.sum(wf10["frame_spectra_linear"], axis=1)
+        raw_peak = int(np.argmax(raw_energy))
+        sm_peak = int(np.argmax(sm_energy))
+        time_local = abs(raw_peak - sm_peak) <= 1 and wf10["smoothing_domain"] == "time"
+        log("Test 10: Time-adjacent smoothing performed before RPM sorting", time_local,
+            f"raw_peak={raw_peak}, smoothed_peak={sm_peak}")
+    except Exception as e:
+        log("Test 10", False, str(e))
+
+    # ── Test 11: Campbell detects 1X and 2X order peaks ───────────────
+    try:
+        freqs11 = np.linspace(0.0, 250.0, 501)
+        rpms11 = np.linspace(1200.0, 3600.0, 50)
+        spec11 = np.zeros((rpms11.size, freqs11.size), dtype=np.float64)
+        for i, rr in enumerate(rpms11):
+            for od, amp in ((1.0, 5.0), (2.0, 3.0)):
+                kk = int(np.argmin(np.abs(freqs11 - od * rr / 60.0)))
+                spec11[i, kk] = amp
+        peaks11 = compute_campbell_peaks(freqs11, rpms11, spec11, max_peaks_per_frame=2, min_height=1.0)
+        orders11 = np.asarray(peaks11["peak_orders"], dtype=np.float64)
+        ok1 = np.any(np.abs(orders11 - 1.0) < 0.08)
+        ok2 = np.any(np.abs(orders11 - 2.0) < 0.08)
+        log("Test 11: Campbell peaks include order 1X", ok1)
+        log("Test 11: Campbell peaks include order 2X", ok2)
+    except Exception as e:
+        log("Test 11", False, str(e))
+
+    # ── Test 12: Display grid separated from analysis grid ────────────
+    try:
+        worker.cfg.update({
+            "waterfall_analysis_grid_mode": "Raw valid frames",
+            "waterfall_num_buffers_mode": "Time-adjacent averaging",
+            "waterfall_display_dense_factor": 5,
+        })
+        wf12 = worker._compute_waterfall_map(sig8, rpm8, fs8, 256, 50.0, "Amplitude", "Linear", 20, 1)
+        separated = (wf12["S_display"].shape[0] > wf12["analysis_spectra_linear"].shape[0]
+                     and wf12["analysis_spectrum_count"] == wf12["analysis_spectra_linear"].shape[0])
+        log("Test 12: Display rows can exceed analysis rows without changing analysis count", separated)
+    except Exception as e:
+        log("Test 12", False, str(e))
 
     n_pass = sum(results)
     n_total = len(results)

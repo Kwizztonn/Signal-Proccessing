@@ -2511,6 +2511,23 @@ class WaterfallPlotWidget(QWidget):
         self._upper_color_bar = None
         self._suspend_colorbar_sync = False
         self._last_color_cfg = {}
+        self.show_order_trace_panel = True
+        self._last_waterfall_splitter_sizes = None
+        self._waterfall_advanced_dialog = None
+        self._embedded_toolbar_mode = False
+        self.waterfall_display_settings = {
+            "x_axis_name": "Frequency (Hz)",
+            "y_axis_name": "RPM",
+            "render_mode": "ImageItem",
+            "colormap": "viridis",
+            "reverse_colors": False,
+            "color_mode": "Continuous",
+            "dynamic_range_db": 80.0,
+            "manual_color_range": False,
+            "vmin": None,
+            "vmax": None,
+            "show_order_trace_panel": True,
+        }
         self._cursor_colors = [
             (220, 60, 60),
             (70, 180, 90),
@@ -2592,6 +2609,13 @@ class WaterfallPlotWidget(QWidget):
             "Inherits current colormap, color range (vmin/vmax), "
             "zoom viewport, and order cursors from the main view."
         )
+        self.chk_show_order_trace = QCheckBox("Order trace")
+        self.chk_show_order_trace.setChecked(True)
+        self.chk_show_order_trace.setToolTip("Show or hide the lower order trace panel.")
+        self.btn_waterfall_advanced_settings = QPushButton("Advanced Settings")
+        self.btn_waterfall_advanced_settings.setToolTip(
+            "Open advanced display settings for the waterfall plot."
+        )
         self.lbl_order_info = QLabel("Active orders: -")
         self.lbl_order_info.setStyleSheet("color: #333; font-weight: 600;")
 
@@ -2650,10 +2674,12 @@ class WaterfallPlotWidget(QWidget):
         topbar = QHBoxLayout()
         topbar.addWidget(self.btn_add_cursor)
         topbar.addWidget(self.btn_clear_cursors)
+        topbar.addWidget(self.chk_show_order_trace)
         topbar.addWidget(self.btn_open_3d)
         topbar.addWidget(self.btn_open_3d_help)
         topbar.addWidget(self.btn_open_2d_standalone)
         topbar.addWidget(self.btn_open_2d_help)
+        topbar.addWidget(self.btn_waterfall_advanced_settings)
         topbar.addSpacing(10)
         topbar.addWidget(self.lbl_order_info, 1)
         topbar.addStretch(1)
@@ -2662,22 +2688,217 @@ class WaterfallPlotWidget(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         if not self.mini:
             lay.addLayout(topbar)
-        lay.addWidget(self.upper, 3)
-        if not self.mini:
-            lay.addWidget(self.lower, 2)
+            self.waterfall_splitter = QSplitter(Qt.Vertical)
+            self.waterfall_splitter.addWidget(self.upper)
+            self.waterfall_splitter.addWidget(self.lower)
+            self.waterfall_splitter.setStretchFactor(0, 7)
+            self.waterfall_splitter.setStretchFactor(1, 3)
+            self.waterfall_splitter.setSizes([700, 300])
+            lay.addWidget(self.waterfall_splitter, 1)
+        else:
+            self.waterfall_splitter = None
+            lay.addWidget(self.upper, 1)
+            self.lower.hide()
 
         self.btn_add_cursor.clicked.connect(self._add_cursor_default)
         self.btn_clear_cursors.clicked.connect(self.clear_cursors)
+        self.chk_show_order_trace.toggled.connect(self.set_order_trace_visible)
+        self.btn_waterfall_advanced_settings.clicked.connect(self._open_waterfall_advanced_settings)
         self.btn_open_3d.clicked.connect(self.open_3d_window)
         self.btn_open_2d_standalone.clicked.connect(self.open_2d_standalone_window)
 
         if self.mini:
             self.btn_add_cursor.hide()
             self.btn_clear_cursors.hide()
+            self.chk_show_order_trace.hide()
+            self.btn_waterfall_advanced_settings.hide()
             self.btn_open_3d.hide()
+            self.btn_open_3d_help.hide()
             self.btn_open_2d_standalone.hide()
+            self.btn_open_2d_help.hide()
             self.lbl_order_info.hide()
             self.lower.hide()
+
+    def _get_order_trace_widget(self):
+        """Return the lower order-trace widget without assuming a future name."""
+        for name in ("lower", "lower_plot", "plot_lower"):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                return widget
+        item = getattr(self, "lower_item", None)
+        if item is not None:
+            try:
+                return item.getViewWidget()
+            except Exception:
+                return None
+        return None
+
+    def _sync_order_trace_controls(self):
+        checked = bool(getattr(self, "show_order_trace_panel", True))
+        for widget in (
+            getattr(self, "chk_show_order_trace", None),
+            getattr(getattr(self, "_waterfall_advanced_dialog", None), "chk_show_order_trace_panel", None),
+        ):
+            if widget is None:
+                continue
+            try:
+                old = widget.blockSignals(True)
+                widget.setChecked(checked)
+                widget.blockSignals(old)
+            except Exception:
+                pass
+        if hasattr(self, "waterfall_display_settings"):
+            self.waterfall_display_settings["show_order_trace_panel"] = checked
+
+    def set_order_trace_visible(self, visible: bool):
+        visible = bool(visible)
+        lower_widget = self._get_order_trace_widget()
+        splitter = getattr(self, "waterfall_splitter", None)
+
+        if not visible and splitter is not None:
+            try:
+                sizes = splitter.sizes()
+                if sizes and len(sizes) >= 2 and sizes[-1] > 0:
+                    self._last_waterfall_splitter_sizes = list(sizes)
+            except Exception:
+                pass
+
+        self.show_order_trace_panel = visible
+        if lower_widget is not None:
+            lower_widget.setVisible(visible and not self.mini)
+
+        if splitter is not None and not self.mini:
+            try:
+                if visible:
+                    sizes = self._last_waterfall_splitter_sizes
+                    if not sizes or len(sizes) < 2 or sizes[-1] <= 0:
+                        total = max(2, sum(splitter.sizes()) or splitter.height() or 1000)
+                        sizes = [int(total * 0.7), max(1, int(total * 0.3))]
+                    splitter.setSizes(sizes)
+                else:
+                    sizes = splitter.sizes()
+                    upper_size = max(1, sum(sizes) if sizes else splitter.height() or 1000)
+                    splitter.setSizes([upper_size, 0])
+            except Exception:
+                pass
+
+        self._sync_order_trace_controls()
+
+    def set_embedded_toolbar_mode(self, embedded: bool):
+        self._embedded_toolbar_mode = bool(embedded)
+        for widget in (
+            getattr(self, "btn_open_3d", None),
+            getattr(self, "btn_open_3d_help", None),
+            getattr(self, "btn_open_2d_standalone", None),
+            getattr(self, "btn_open_2d_help", None),
+            getattr(self, "btn_waterfall_advanced_settings", None),
+        ):
+            if widget is not None:
+                widget.setVisible((not self._embedded_toolbar_mode) and (not self.mini))
+
+    def _open_waterfall_advanced_settings(self):
+        dlg = getattr(self, "_waterfall_advanced_dialog", None)
+        if dlg is None or not _qt_alive(dlg):
+            dlg = WaterfallAdvancedSettingsDialog(self)
+            self._waterfall_advanced_dialog = dlg
+        dlg.refresh_from_widget()
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _waterfall_color_data(self):
+        for arr in (getattr(self, "_display_S", None), getattr(self, "S", None), getattr(self, "S_full_display", None)):
+            if arr is None:
+                continue
+            data = np.asarray(arr, dtype=np.float64)
+            if data.size:
+                valid = data[np.isfinite(data)]
+                if valid.size:
+                    return valid
+        return np.array([], dtype=np.float64)
+
+    def apply_waterfall_display_settings(self, settings: dict):
+        settings = dict(settings or {})
+        merged = dict(getattr(self, "waterfall_display_settings", {}))
+        merged.update(settings)
+        merged["show_order_trace_panel"] = bool(merged.get("show_order_trace_panel", True))
+        merged["reverse_colors"] = bool(merged.get("reverse_colors", False))
+        merged["manual_color_range"] = bool(merged.get("manual_color_range", False))
+        try:
+            merged["dynamic_range_db"] = float(merged.get("dynamic_range_db", 80.0))
+        except Exception:
+            merged["dynamic_range_db"] = 80.0
+
+        if merged.get("manual_color_range", False):
+            try:
+                vmin = float(merged.get("vmin"))
+                vmax = float(merged.get("vmax"))
+            except Exception:
+                QMessageBox.warning(self, "Invalid color range", "Manual vmin/vmax values must be numeric.")
+                return False
+            if not (np.isfinite(vmin) and np.isfinite(vmax) and vmin < vmax):
+                QMessageBox.warning(self, "Invalid color range", "Manual color range requires vmin < vmax.")
+                return False
+        else:
+            valid = self._waterfall_color_data()
+            if valid.size:
+                vmax = float(np.nanmax(valid))
+                vmin = float(vmax - max(1.0, float(merged.get("dynamic_range_db", 80.0))))
+            else:
+                vmin, vmax = 0.0, 1.0
+            merged["vmin"] = vmin
+            merged["vmax"] = vmax
+
+        self.waterfall_display_settings = merged
+        self.show_order_trace_panel = bool(merged.get("show_order_trace_panel", True))
+
+        x_label = str(merged.get("x_axis_name") or "Frequency (Hz)")
+        y_label = str(merged.get("y_axis_name") or "RPM")
+        try:
+            self.upper_item.setLabel("bottom", x_label)
+            self.upper_item.setLabel("left", y_label)
+        except Exception:
+            pass
+        if self.state is not None:
+            self.state["xlabel"] = x_label
+            self.state["ylabel"] = y_label
+
+        cmap_name = str(merged.get("colormap") or "viridis")
+        reverse = bool(merged.get("reverse_colors", False))
+        cm = get_pg_colormap(cmap_name, reverse=reverse)
+        vmin = float(merged.get("vmin", 0.0))
+        vmax = float(merged.get("vmax", 1.0))
+        if self._upper_image_item is not None:
+            try:
+                self._upper_image_item.setColorMap(cm)
+            except Exception:
+                pass
+            try:
+                self._upper_image_item.setLevels((vmin, vmax))
+            except Exception:
+                pass
+        if self._upper_color_bar is not None:
+            self._suspend_colorbar_sync = True
+            try:
+                if hasattr(self._upper_color_bar, "setColorMap"):
+                    self._upper_color_bar.setColorMap(cm)
+                self._upper_color_bar.setLevels((vmin, vmax))
+            except Exception:
+                pass
+            finally:
+                self._suspend_colorbar_sync = False
+
+        self._last_color_cfg.update({
+            "cmap": cmap_name,
+            "reverse": reverse,
+            "color_mode": "Continuous",
+            "manual_clim": bool(merged.get("manual_color_range", False)),
+            "vmin": vmin,
+            "vmax": vmax,
+            "dyn_range_db": float(merged.get("dynamic_range_db", 80.0)),
+        })
+        self.set_order_trace_visible(self.show_order_trace_panel)
+        return True
 
     def _clear_upper_colorbar(self):
         cbar = self._upper_color_bar
@@ -3802,6 +4023,18 @@ class WaterfallPlotWidget(QWidget):
     def set_state(self, state: dict, color_cfg=None, preserve_view=False, preserve_annotations=False):
         color_cfg = color_cfg or {}
         self._last_color_cfg = dict(color_cfg)
+        if hasattr(self, "waterfall_display_settings"):
+            self.waterfall_display_settings.update({
+                "x_axis_name": state.get("xlabel", self.waterfall_display_settings.get("x_axis_name", "Frequency (Hz)")),
+                "y_axis_name": state.get("ylabel", self.waterfall_display_settings.get("y_axis_name", "RPM")),
+                "colormap": color_cfg.get("cmap", self.waterfall_display_settings.get("colormap", "viridis")),
+                "reverse_colors": bool(color_cfg.get("reverse", self.waterfall_display_settings.get("reverse_colors", False))),
+                "dynamic_range_db": float(color_cfg.get("dyn_range_db", self.waterfall_display_settings.get("dynamic_range_db", 80.0))),
+                "manual_color_range": bool(color_cfg.get("manual_clim", self.waterfall_display_settings.get("manual_color_range", False))),
+                "vmin": color_cfg.get("vmin", self.waterfall_display_settings.get("vmin")),
+                "vmax": color_cfg.get("vmax", self.waterfall_display_settings.get("vmax")),
+                "show_order_trace_panel": bool(getattr(self, "show_order_trace_panel", True)),
+            })
 
         old_upper = None
         old_lower = None
@@ -3926,6 +4159,7 @@ class WaterfallPlotWidget(QWidget):
 
         if self._recompute_full_upper_display():
             self._set_upper_image_matrix(self.freqs_full_display, self.rpms_full_display, self.S_full_display)
+        self.apply_waterfall_display_settings(self.waterfall_display_settings)
 
         self._set_home()
 
@@ -4268,6 +4502,178 @@ class DetailPlotWidget(QWidget):
 
     def _emit_active(self):
         self.activated.emit(self.canvas, self.plot_key)
+
+
+class WaterfallAdvancedSettingsDialog(QDialog):
+    """Advanced display-only controls for the Waterfall View."""
+
+    _COLORMAPS = ("viridis", "turbo", "jet", "plasma", "inferno", "magma", "cividis", "gray")
+
+    def __init__(self, waterfall_widget, parent=None):
+        super().__init__(parent or waterfall_widget)
+        self.waterfall_widget = waterfall_widget
+        self.setWindowTitle("Waterfall View — Advanced Settings")
+        self.setModal(False)
+        self.setMinimumWidth(420)
+
+        self.edit_x_axis_name = QLineEdit()
+        self.edit_y_axis_name = QLineEdit()
+
+        self.cmb_render_mode = QComboBox()
+        self.cmb_render_mode.addItems(["ImageItem", "PColorMesh"])
+        pcolor_idx = self.cmb_render_mode.findText("PColorMesh")
+        if pcolor_idx >= 0:
+            self.cmb_render_mode.model().item(pcolor_idx).setEnabled(False)
+        self.cmb_render_mode.setToolTip("PColorMesh is reserved for a future renderer; ImageItem remains active.")
+
+        self.cmb_colormap = QComboBox()
+        for cmap_name in self._COLORMAPS:
+            try:
+                self.cmb_colormap.addItem(make_colormap_preview_icon(cmap_name), cmap_name)
+            except Exception:
+                self.cmb_colormap.addItem(cmap_name)
+
+        self.chk_reverse_colors = QCheckBox("Reverse colors")
+
+        self.cmb_color_mode = QComboBox()
+        self.cmb_color_mode.addItem("Continuous")
+        self.cmb_color_mode.addItem("Discrete / Bands")
+        idx = self.cmb_color_mode.findText("Discrete / Bands")
+        if idx >= 0:
+            self.cmb_color_mode.model().item(idx).setEnabled(False)
+        self.cmb_color_mode.setToolTip("Discrete color bands are not implemented for Waterfall View yet.")
+
+        self.spin_dynamic_range_db = QDoubleSpinBox()
+        self.spin_dynamic_range_db.setRange(1.0, 300.0)
+        self.spin_dynamic_range_db.setDecimals(1)
+        self.spin_dynamic_range_db.setSingleStep(1.0)
+
+        self.chk_manual_color_range = QCheckBox("Manual color range (vmin/vmax)")
+        self.spin_vmin = QDoubleSpinBox()
+        self.spin_vmin.setRange(-1.0e12, 1.0e12)
+        self.spin_vmin.setDecimals(6)
+        self.spin_vmax = QDoubleSpinBox()
+        self.spin_vmax.setRange(-1.0e12, 1.0e12)
+        self.spin_vmax.setDecimals(6)
+
+        self.chk_show_order_trace_panel = QCheckBox("Show order trace panel")
+        self.chk_show_order_trace_panel.setToolTip("Show or hide the lower order trace panel.")
+
+        self.btn_apply_plot_view = QPushButton("Apply Plot View")
+        self.btn_close = QPushButton("Close")
+
+        form = QFormLayout()
+        form.addRow("X Axis Name", self.edit_x_axis_name)
+        form.addRow("Y Axis Name", self.edit_y_axis_name)
+        form.addRow("Spectrogram render", self.cmb_render_mode)
+        form.addRow("Colormap", self.cmb_colormap)
+        form.addRow("", self.chk_reverse_colors)
+        form.addRow("Color Mode", self.cmb_color_mode)
+        form.addRow("Dynamic Range (dB)", self.spin_dynamic_range_db)
+        form.addRow("", self.chk_manual_color_range)
+        form.addRow("vmin", self.spin_vmin)
+        form.addRow("vmax", self.spin_vmax)
+        form.addRow("", self.chk_show_order_trace_panel)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        buttons.addWidget(self.btn_apply_plot_view)
+        buttons.addWidget(self.btn_close)
+
+        lay = QVBoxLayout(self)
+        lay.addLayout(form)
+        lay.addLayout(buttons)
+
+        self.chk_manual_color_range.toggled.connect(self._sync_manual_enabled)
+        self.chk_show_order_trace_panel.toggled.connect(self._on_order_trace_toggled)
+        self.btn_apply_plot_view.clicked.connect(self.apply_to_plot)
+        self.btn_close.clicked.connect(self.close)
+        self.refresh_from_widget()
+
+    def _sync_manual_enabled(self):
+        enabled = self.chk_manual_color_range.isChecked()
+        self.spin_vmin.setEnabled(enabled)
+        self.spin_vmax.setEnabled(enabled)
+
+    def refresh_from_widget(self):
+        wf = self.waterfall_widget
+        settings = dict(getattr(wf, "waterfall_display_settings", {}))
+        if getattr(wf, "state", None) is not None:
+            settings.setdefault("x_axis_name", wf.state.get("xlabel", "Frequency (Hz)"))
+            settings.setdefault("y_axis_name", wf.state.get("ylabel", "RPM"))
+        settings.setdefault("x_axis_name", "Frequency (Hz)")
+        settings.setdefault("y_axis_name", "RPM")
+        settings.setdefault("render_mode", "ImageItem")
+        settings.setdefault("colormap", "viridis")
+        settings.setdefault("reverse_colors", False)
+        settings.setdefault("color_mode", "Continuous")
+        settings.setdefault("dynamic_range_db", 80.0)
+        settings.setdefault("manual_color_range", False)
+        settings.setdefault("vmin", 0.0)
+        settings.setdefault("vmax", 1.0)
+        settings.setdefault("show_order_trace_panel", getattr(wf, "show_order_trace_panel", True))
+
+        widgets = [
+            self.edit_x_axis_name, self.edit_y_axis_name, self.cmb_render_mode,
+            self.cmb_colormap, self.chk_reverse_colors, self.cmb_color_mode,
+            self.spin_dynamic_range_db, self.chk_manual_color_range, self.spin_vmin,
+            self.spin_vmax, self.chk_show_order_trace_panel,
+        ]
+        old = []
+        for widget in widgets:
+            try:
+                old.append((widget, widget.blockSignals(True)))
+            except Exception:
+                pass
+        try:
+            self.edit_x_axis_name.setText(str(settings.get("x_axis_name") or "Frequency (Hz)"))
+            self.edit_y_axis_name.setText(str(settings.get("y_axis_name") or "RPM"))
+            self.cmb_render_mode.setCurrentText("ImageItem")
+            self.cmb_colormap.setCurrentText(str(settings.get("colormap") or "viridis"))
+            self.chk_reverse_colors.setChecked(bool(settings.get("reverse_colors", False)))
+            self.cmb_color_mode.setCurrentText("Continuous")
+            self.spin_dynamic_range_db.setValue(float(settings.get("dynamic_range_db", 80.0)))
+            self.chk_manual_color_range.setChecked(bool(settings.get("manual_color_range", False)))
+            vmin = settings.get("vmin", 0.0)
+            vmax = settings.get("vmax", 1.0)
+            self.spin_vmin.setValue(float(vmin) if vmin is not None and np.isfinite(float(vmin)) else 0.0)
+            self.spin_vmax.setValue(float(vmax) if vmax is not None and np.isfinite(float(vmax)) else 1.0)
+            self.chk_show_order_trace_panel.setChecked(bool(settings.get("show_order_trace_panel", True)))
+        finally:
+            for widget, state in old:
+                try:
+                    widget.blockSignals(state)
+                except Exception:
+                    pass
+        self._sync_manual_enabled()
+
+    def _collect_settings(self):
+        return {
+            "x_axis_name": self.edit_x_axis_name.text().strip() or "Frequency (Hz)",
+            "y_axis_name": self.edit_y_axis_name.text().strip() or "RPM",
+            "render_mode": "ImageItem",
+            "colormap": self.cmb_colormap.currentText() or "viridis",
+            "reverse_colors": self.chk_reverse_colors.isChecked(),
+            "color_mode": "Continuous",
+            "dynamic_range_db": float(self.spin_dynamic_range_db.value()),
+            "manual_color_range": self.chk_manual_color_range.isChecked(),
+            "vmin": float(self.spin_vmin.value()),
+            "vmax": float(self.spin_vmax.value()),
+            "show_order_trace_panel": self.chk_show_order_trace_panel.isChecked(),
+        }
+
+    def _on_order_trace_toggled(self, checked):
+        wf = self.waterfall_widget
+        if hasattr(wf, "set_order_trace_visible"):
+            wf.set_order_trace_visible(bool(checked))
+
+    def apply_to_plot(self):
+        wf = self.waterfall_widget
+        if not hasattr(wf, "apply_waterfall_display_settings"):
+            return
+        ok = wf.apply_waterfall_display_settings(self._collect_settings())
+        if ok:
+            self.refresh_from_widget()
 
 
 class WaterfallDetailWidget(QWidget):
@@ -7250,6 +7656,8 @@ class MainWindow(QMainWindow):
                 pass
 
         detail = WaterfallDetailWidget(state)
+        if hasattr(detail.canvas, "set_embedded_toolbar_mode"):
+            detail.canvas.set_embedded_toolbar_mode(True)
         detail.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         detail.activated.connect(self._set_active_canvas)
         self._connect_canvas_color_signals(detail.canvas)
@@ -8322,6 +8730,10 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
         self.btn_wfv_export = QPushButton("Export Current Plot")
         self.btn_wfv_open_3d = QPushButton("Open 3D")
         self.btn_wfv_open_2d = QPushButton("Open 2D Standalone")
+        self.btn_waterfall_advanced_settings = QPushButton("Advanced Settings")
+        self.btn_waterfall_advanced_settings.setToolTip(
+            "Open advanced display settings for the waterfall plot."
+        )
         self.btn_wfv_clear = QPushButton("Clear annotations/cursors")
 
         for btn in (
@@ -8332,6 +8744,7 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
             self.btn_wfv_export,
             self.btn_wfv_open_3d,
             self.btn_wfv_open_2d,
+            self.btn_waterfall_advanced_settings,
             self.btn_wfv_clear,
         ):
             toolbar.addWidget(btn)
@@ -8370,6 +8783,7 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
         self.btn_wfv_export.clicked.connect(self._export_current_plot)
         self.btn_wfv_open_3d.clicked.connect(self._open_active_waterfall_3d)
         self.btn_wfv_open_2d.clicked.connect(self._open_active_waterfall_2d)
+        self.btn_waterfall_advanced_settings.clicked.connect(self._open_waterfall_advanced_settings)
         self.btn_wfv_clear.clicked.connect(self._clear_active_waterfall_annotations)
 
     def _on_waterfall_view_rect_zoom_toggled(self, checked):
@@ -8385,6 +8799,15 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
             widget = getattr(self, "_waterfall_view_widget", None)
             if widget is not None:
                 self._set_active_canvas(widget.canvas, widget.plot_key)
+
+    def _open_waterfall_advanced_settings(self):
+        canvas = self._active_canvas
+        if canvas is None or not hasattr(canvas, "_open_waterfall_advanced_settings"):
+            canvas = getattr(getattr(self, "_waterfall_view_widget", None), "canvas", None)
+        if canvas is None or not hasattr(canvas, "_open_waterfall_advanced_settings"):
+            self._err("There is no active waterfall plot for advanced settings.")
+            return
+        canvas._open_waterfall_advanced_settings()
 
     def _open_active_waterfall_3d(self):
         canvas = self._active_canvas

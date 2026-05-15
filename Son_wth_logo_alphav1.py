@@ -2267,23 +2267,25 @@ def export_cropped_tdms(output_path: str,
 
 
 class Waterfall2DStandaloneWindow(QDialog):
-    """Standalone 2D waterfall colormap window with jet/turbo colormap.
+    """Standalone 2D waterfall colormap window.
 
-    Renders only the upper waterfall heatmap (no order trace subplot)
-    using a continuous jet-like colormap (blue -> green -> yellow -> red).
-    Captures the current viewport zoom if provided.
+    Renders only the upper waterfall heatmap (no order trace subplot) and
+    mirrors the live PyQtGraph color mapping, including manual levels and
+    custom color bands when supplied by the parent waterfall widget.
     """
 
     def __init__(self, state: dict, parent=None,
                  view_range=None, cmap_name="jet",
                  order_cursor_specs=None,
-                 color_limits=None):
+                 color_limits=None,
+                 color_cfg=None):
         super().__init__(parent)
         self.state = state
         self.view_range = view_range
         self.cmap_name = cmap_name
         self.order_cursor_specs = order_cursor_specs or []
         self.color_limits = color_limits
+        self.color_cfg = dict(color_cfg or {})
         self.setWindowTitle("Waterfall (standalone)")
         self.resize(1400, 800)
 
@@ -2296,7 +2298,12 @@ class Waterfall2DStandaloneWindow(QDialog):
         for cm in ["jet", "turbo", "nipy_spectral", "gist_rainbow",
                     "viridis", "plasma", "inferno", "hot", "coolwarm"]:
             self.cmb_cmap.addItem(cm)
-        self.cmb_cmap.setCurrentText(cmap_name)
+        base_cmap = str(cmap_name or "jet")
+        if base_cmap.endswith("_r"):
+            base_cmap = base_cmap[:-2]
+        if self.cmb_cmap.findText(base_cmap) < 0:
+            self.cmb_cmap.addItem(base_cmap)
+        self.cmb_cmap.setCurrentText(base_cmap)
         self.cmb_cmap.currentTextChanged.connect(self._rebuild)
         toolbar_lay.addWidget(self.cmb_cmap)
 
@@ -2338,6 +2345,22 @@ class Waterfall2DStandaloneWindow(QDialog):
         self.color_limits = None
         self._rebuild()
 
+    def _effective_color_cfg(self):
+        cfg = dict(self.color_cfg or {})
+        cmap_name = self.cmb_cmap.currentText().strip() or str(cfg.get("cmap") or "jet")
+        if cmap_name.endswith("_r"):
+            cmap_name = cmap_name[:-2]
+            cfg["reverse"] = True
+        cfg["cmap"] = cmap_name
+        if self.color_limits is not None and str(cfg.get("color_mode", "Continuous")).strip() != "Custom Bands":
+            try:
+                cfg["manual_clim"] = True
+                cfg["vmin"] = float(self.color_limits.get("vmin", cfg.get("vmin", 0.0)))
+                cfg["vmax"] = float(self.color_limits.get("vmax", cfg.get("vmax", 1.0)))
+            except Exception:
+                pass
+        return cfg
+
     def _rebuild(self):
         self.fig.clear()
         freqs = np.asarray(self.state["freqs"], dtype=np.float64)
@@ -2351,42 +2374,24 @@ class Waterfall2DStandaloneWindow(QDialog):
             self.canvas.draw_idle()
             return
 
-        cmap_name = self.cmb_cmap.currentText().strip() or "jet"
         use_log = self.chk_log.isChecked()
         is_db = str(self.state.get("scale", "")).strip().lower() == "db"
+        color_cfg = self._effective_color_cfg()
+        style = resolve_mpl_image_style(S, self.state.get("scale", "Linear"), color_cfg)
 
-        try:
-            cmap = matplotlib.colormaps.get_cmap(cmap_name)
-        except Exception:
-            cmap = matplotlib.colormaps.get_cmap("jet")
-
-        # Determine color limits (inherit from parent if available)
-        if self.color_limits is not None:
-            vmin = float(self.color_limits.get("vmin", 0.0))
-            vmax = float(self.color_limits.get("vmax", 1.0))
-            if vmax <= vmin:
-                vmax = vmin + 1.0
-        else:
-            finite = S[np.isfinite(S)]
-            if finite.size == 0:
-                vmin, vmax = 0.0, 1.0
-            else:
-                vmin = float(np.min(finite))
-                vmax = float(np.max(finite))
-                if vmax <= vmin:
-                    vmax = vmin + 1.0
-
-        # Render with bilinear interpolation so zooming in the standalone
-        # window stays visually smooth instead of showing flat-colored quads.
-        if use_log and not is_db:
-            S_plot = np.clip(S, max(vmin, 1e-20), None)
-            vmin_plot = max(vmin, 1e-20)
-            norm = mcolors.LogNorm(vmin=vmin_plot, vmax=vmax)
-            S_to_display = S_plot
-            norm_to_use = norm
-        else:
-            S_to_display = S
-            norm_to_use = None
+        S_to_display = S
+        norm_to_use = style.get("norm")
+        vmin = style.get("vmin")
+        vmax = style.get("vmax")
+        if style.get("mode") != "bands" and use_log and not is_db:
+            vmin_plot = max(float(vmin), 1e-20)
+            S_to_display = np.clip(S, vmin_plot, None)
+            norm_to_use = mcolors.LogNorm(vmin=vmin_plot, vmax=float(vmax))
+            vmin = None
+            vmax = None
+        elif norm_to_use is not None:
+            vmin = None
+            vmax = None
 
         mesh = ax.imshow(
             S_to_display,
@@ -2394,10 +2399,10 @@ class Waterfall2DStandaloneWindow(QDialog):
             origin="lower",
             extent=[float(freqs[0]), float(freqs[-1]), float(rpms[0]), float(rpms[-1])],
             interpolation="bilinear",
-            cmap=cmap,
+            cmap=style["cmap"],
             norm=norm_to_use,
-            vmin=(None if norm_to_use is not None else vmin),
-            vmax=(None if norm_to_use is not None else vmax),
+            vmin=vmin,
+            vmax=vmax,
         )
 
         cbar = self.fig.colorbar(mesh, ax=ax, pad=0.02)
@@ -2635,6 +2640,7 @@ class WaterfallPlotWidget(QWidget):
             "colormap": "viridis",
             "reverse_colors": False,
             "color_mode": "Continuous",
+            "custom_color_bands": default_custom_color_bands(),
             "dynamic_range_db": 80.0,
             "manual_color_range": False,
             "vmin": None,
@@ -2963,32 +2969,53 @@ class WaterfallPlotWidget(QWidget):
         merged.update(settings)
         merged["show_order_trace_panel"] = bool(merged.get("show_order_trace_panel", True))
         merged["reverse_colors"] = bool(merged.get("reverse_colors", False))
-        merged["manual_color_range"] = bool(merged.get("manual_color_range", False))
+        color_mode = str(merged.get("color_mode", "Continuous") or "Continuous").strip()
+        if color_mode not in ("Continuous", "Custom Bands"):
+            color_mode = "Custom Bands" if "Band" in color_mode else "Continuous"
+        merged["color_mode"] = color_mode
+        if color_mode == "Custom Bands":
+            merged["manual_color_range"] = False
+            try:
+                merged["custom_color_bands"] = normalize_custom_bands(
+                    merged.get("custom_color_bands", default_custom_color_bands())
+                )
+            except ValueError as exc:
+                QMessageBox.warning(self, "Custom Bands", str(exc))
+                return False
+        else:
+            merged["manual_color_range"] = bool(merged.get("manual_color_range", False))
         try:
             merged["dynamic_range_db"] = float(merged.get("dynamic_range_db", 80.0))
         except Exception:
             merged["dynamic_range_db"] = 80.0
 
-        if merged.get("manual_color_range", False):
-            try:
-                vmin = float(merged.get("vmin"))
-                vmax = float(merged.get("vmax"))
-            except Exception:
-                QMessageBox.warning(self, "Invalid color range", "Manual vmin/vmax values must be numeric.")
-                return False
-            if not (np.isfinite(vmin) and np.isfinite(vmax) and vmin < vmax):
-                QMessageBox.warning(self, "Invalid color range", "Manual color range requires vmin < vmax.")
-                return False
-        else:
-            valid = self._waterfall_color_data()
-            if valid.size:
-                vmax = float(np.nanmax(valid))
-                vmin = float(vmax - max(1.0, float(merged.get("dynamic_range_db", 80.0))))
-            else:
-                vmin, vmax = 0.0, 1.0
-            merged["vmin"] = vmin
-            merged["vmax"] = vmax
+        cmap_name = str(merged.get("colormap") or "viridis")
+        reverse = bool(merged.get("reverse_colors", False))
+        color_cfg = {
+            "cmap": cmap_name,
+            "reverse": reverse,
+            "color_mode": color_mode,
+            "manual_clim": bool(merged.get("manual_color_range", False)) and color_mode == "Continuous",
+            "vmin": merged.get("vmin", 0.0),
+            "vmax": merged.get("vmax", 1.0),
+            "dyn_range_db": float(merged.get("dynamic_range_db", 80.0)),
+            "custom_bands": merged.get("custom_color_bands", default_custom_color_bands()),
+        }
 
+        data = getattr(self, "S", None)
+        if not (isinstance(data, np.ndarray) and data.size):
+            data = getattr(self, "S_full_display", None)
+        if not (isinstance(data, np.ndarray) and data.size):
+            data = np.asarray([0.0, 1.0], dtype=np.float64)
+
+        try:
+            style = resolve_image_style(data, (self.state or {}).get("scale", "Linear"), color_cfg)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Custom Bands", str(exc))
+            return False
+
+        merged["vmin"] = float(style["vmin"])
+        merged["vmax"] = float(style["vmax"])
         self.waterfall_display_settings = merged
         self.show_order_trace_panel = bool(merged.get("show_order_trace_panel", True))
 
@@ -3003,26 +3030,21 @@ class WaterfallPlotWidget(QWidget):
             self.state["xlabel"] = x_label
             self.state["ylabel"] = y_label
 
-        cmap_name = str(merged.get("colormap") or "viridis")
-        reverse = bool(merged.get("reverse_colors", False))
-        cm = get_pg_colormap(cmap_name, reverse=reverse)
-        vmin = float(merged.get("vmin", 0.0))
-        vmax = float(merged.get("vmax", 1.0))
         if self._upper_image_item is not None:
             try:
-                self._upper_image_item.setColorMap(cm)
+                self._upper_image_item.setColorMap(style["cm"])
             except Exception:
                 pass
             try:
-                self._upper_image_item.setLevels((vmin, vmax))
+                self._upper_image_item.setLevels((style["vmin"], style["vmax"]))
             except Exception:
                 pass
         if self._upper_color_bar is not None:
             self._suspend_colorbar_sync = True
             try:
                 if hasattr(self._upper_color_bar, "setColorMap"):
-                    self._upper_color_bar.setColorMap(cm)
-                self._upper_color_bar.setLevels((vmin, vmax))
+                    self._upper_color_bar.setColorMap(style["cm"])
+                self._upper_color_bar.setLevels((style["vmin"], style["vmax"]))
             except Exception:
                 pass
             finally:
@@ -3031,11 +3053,12 @@ class WaterfallPlotWidget(QWidget):
         self._last_color_cfg.update({
             "cmap": cmap_name,
             "reverse": reverse,
-            "color_mode": "Continuous",
-            "manual_clim": bool(merged.get("manual_color_range", False)),
-            "vmin": vmin,
-            "vmax": vmax,
+            "color_mode": color_mode,
+            "manual_clim": bool(merged.get("manual_color_range", False)) and color_mode == "Continuous",
+            "vmin": float(style["vmin"]),
+            "vmax": float(style["vmax"]),
             "dyn_range_db": float(merged.get("dynamic_range_db", 80.0)),
+            "custom_bands": list(merged.get("custom_color_bands", default_custom_color_bands())),
         })
         self.set_order_trace_visible(self.show_order_trace_panel)
         return True
@@ -4280,6 +4303,7 @@ class WaterfallPlotWidget(QWidget):
             cmap_name=cmap_name,
             order_cursor_specs=cursor_specs,
             color_limits=color_limits,
+            color_cfg=dict(self._last_color_cfg or {}),
         )
         dlg.exec_()
 
@@ -4292,6 +4316,8 @@ class WaterfallPlotWidget(QWidget):
                 "y_axis_name": state.get("ylabel", self.waterfall_display_settings.get("y_axis_name", "RPM")),
                 "colormap": color_cfg.get("cmap", self.waterfall_display_settings.get("colormap", "viridis")),
                 "reverse_colors": bool(color_cfg.get("reverse", self.waterfall_display_settings.get("reverse_colors", False))),
+                "color_mode": color_cfg.get("color_mode", self.waterfall_display_settings.get("color_mode", "Continuous")),
+                "custom_color_bands": color_cfg.get("custom_bands", self.waterfall_display_settings.get("custom_color_bands", default_custom_color_bands())),
                 "dynamic_range_db": float(color_cfg.get("dyn_range_db", self.waterfall_display_settings.get("dynamic_range_db", 80.0))),
                 "manual_color_range": bool(color_cfg.get("manual_clim", self.waterfall_display_settings.get("manual_color_range", False))),
                 "vmin": color_cfg.get("vmin", self.waterfall_display_settings.get("vmin")),
@@ -4777,7 +4803,7 @@ class WaterfallAdvancedSettingsDialog(QDialog):
         self.waterfall_widget = waterfall_widget
         self.setWindowTitle("Waterfall View — Advanced Settings")
         self.setModal(False)
-        self.setMinimumWidth(420)
+        self.setMinimumWidth(460)
 
         self.edit_x_axis_name = QLineEdit()
         self.edit_y_axis_name = QLineEdit()
@@ -4799,12 +4825,8 @@ class WaterfallAdvancedSettingsDialog(QDialog):
         self.chk_reverse_colors = QCheckBox("Reverse colors")
 
         self.cmb_color_mode = QComboBox()
-        self.cmb_color_mode.addItem("Continuous")
-        self.cmb_color_mode.addItem("Discrete / Bands")
-        idx = self.cmb_color_mode.findText("Discrete / Bands")
-        if idx >= 0:
-            self.cmb_color_mode.model().item(idx).setEnabled(False)
-        self.cmb_color_mode.setToolTip("Discrete color bands are not implemented for Waterfall View yet.")
+        self.cmb_color_mode.addItems(["Continuous", "Custom Bands"])
+        self.btn_edit_bands = QPushButton("Edit Bands...")
 
         self.spin_dynamic_range_db = QDoubleSpinBox()
         self.spin_dynamic_range_db.setRange(1.0, 300.0)
@@ -4825,14 +4847,18 @@ class WaterfallAdvancedSettingsDialog(QDialog):
         self.btn_apply_plot_view = QPushButton("Apply Plot View")
         self.btn_close = QPushButton("Close")
 
+        band_row = QHBoxLayout()
+        band_row.addWidget(self.cmb_color_mode, 1)
+        band_row.addWidget(self.btn_edit_bands)
+
         form = QFormLayout()
         form.addRow("X Axis Name", self.edit_x_axis_name)
         form.addRow("Y Axis Name", self.edit_y_axis_name)
         form.addRow("Spectrogram render", self.cmb_render_mode)
         form.addRow("Colormap", self.cmb_colormap)
         form.addRow("", self.chk_reverse_colors)
-        form.addRow("Color Mode", self.cmb_color_mode)
-        form.addRow("Dynamic Range (dB)", self.spin_dynamic_range_db)
+        form.addRow("Color Mode", band_row)
+        form.addRow("Dynamic Range (dB):", self.spin_dynamic_range_db)
         form.addRow("", self.chk_manual_color_range)
         form.addRow("vmin", self.spin_vmin)
         form.addRow("vmax", self.spin_vmax)
@@ -4848,15 +4874,40 @@ class WaterfallAdvancedSettingsDialog(QDialog):
         lay.addLayout(buttons)
 
         self.chk_manual_color_range.toggled.connect(self._sync_manual_enabled)
+        self.cmb_color_mode.currentTextChanged.connect(self._on_color_mode_changed)
+        self.btn_edit_bands.clicked.connect(self._edit_bands)
         self.chk_show_order_trace_panel.toggled.connect(self._on_order_trace_toggled)
         self.btn_apply_plot_view.clicked.connect(self.apply_to_plot)
         self.btn_close.clicked.connect(self.close)
         self.refresh_from_widget()
 
     def _sync_manual_enabled(self):
-        enabled = self.chk_manual_color_range.isChecked()
-        self.spin_vmin.setEnabled(enabled)
-        self.spin_vmax.setEnabled(enabled)
+        custom_mode = self.cmb_color_mode.currentText().strip() == "Custom Bands"
+        if custom_mode and self.chk_manual_color_range.isChecked():
+            self.chk_manual_color_range.blockSignals(True)
+            self.chk_manual_color_range.setChecked(False)
+            self.chk_manual_color_range.blockSignals(False)
+        manual = self.chk_manual_color_range.isChecked() and not custom_mode
+        self.chk_manual_color_range.setEnabled(not custom_mode)
+        self.spin_vmin.setEnabled(manual)
+        self.spin_vmax.setEnabled(manual)
+        self.spin_dynamic_range_db.setEnabled((not manual) and (not custom_mode))
+        self.cmb_colormap.setEnabled(not custom_mode)
+        self.chk_reverse_colors.setEnabled(not custom_mode)
+        self.btn_edit_bands.setEnabled(custom_mode)
+
+    def _on_color_mode_changed(self, *_):
+        self._sync_manual_enabled()
+
+    def _edit_bands(self):
+        wf = self.waterfall_widget
+        current = getattr(wf, "waterfall_display_settings", {}).get("custom_color_bands", default_custom_color_bands())
+        dlg = BandEditorDialog(current, self)
+        if dlg.exec_() == QDialog.Accepted:
+            settings = dict(getattr(wf, "waterfall_display_settings", {}) or {})
+            settings["custom_color_bands"] = dlg.bands()
+            wf.waterfall_display_settings.update(settings)
+            self.apply_to_plot()
 
     def refresh_from_widget(self):
         wf = self.waterfall_widget
@@ -4870,6 +4921,7 @@ class WaterfallAdvancedSettingsDialog(QDialog):
         settings.setdefault("colormap", "viridis")
         settings.setdefault("reverse_colors", False)
         settings.setdefault("color_mode", "Continuous")
+        settings.setdefault("custom_color_bands", default_custom_color_bands())
         settings.setdefault("dynamic_range_db", 80.0)
         settings.setdefault("manual_color_range", False)
         settings.setdefault("vmin", 0.0)
@@ -4894,7 +4946,7 @@ class WaterfallAdvancedSettingsDialog(QDialog):
             self.cmb_render_mode.setCurrentText("ImageItem")
             self.cmb_colormap.setCurrentText(str(settings.get("colormap") or "viridis"))
             self.chk_reverse_colors.setChecked(bool(settings.get("reverse_colors", False)))
-            self.cmb_color_mode.setCurrentText("Continuous")
+            self.cmb_color_mode.setCurrentText("Custom Bands" if str(settings.get("color_mode", "Continuous")).strip() == "Custom Bands" else "Continuous")
             self.spin_dynamic_range_db.setValue(float(settings.get("dynamic_range_db", 80.0)))
             self.chk_manual_color_range.setChecked(bool(settings.get("manual_color_range", False)))
             vmin = settings.get("vmin", 0.0)
@@ -4911,15 +4963,18 @@ class WaterfallAdvancedSettingsDialog(QDialog):
         self._sync_manual_enabled()
 
     def _collect_settings(self):
+        wf_settings = dict(getattr(self.waterfall_widget, "waterfall_display_settings", {}) or {})
+        color_mode = self.cmb_color_mode.currentText().strip() or "Continuous"
         return {
             "x_axis_name": self.edit_x_axis_name.text().strip() or "Frequency (Hz)",
             "y_axis_name": self.edit_y_axis_name.text().strip() or "RPM",
             "render_mode": "ImageItem",
             "colormap": self.cmb_colormap.currentText() or "viridis",
             "reverse_colors": self.chk_reverse_colors.isChecked(),
-            "color_mode": "Continuous",
+            "color_mode": color_mode,
+            "custom_color_bands": wf_settings.get("custom_color_bands", default_custom_color_bands()),
             "dynamic_range_db": float(self.spin_dynamic_range_db.value()),
-            "manual_color_range": self.chk_manual_color_range.isChecked(),
+            "manual_color_range": self.chk_manual_color_range.isChecked() and color_mode == "Continuous",
             "vmin": float(self.spin_vmin.value()),
             "vmax": float(self.spin_vmax.value()),
             "show_order_trace_panel": self.chk_show_order_trace_panel.isChecked(),

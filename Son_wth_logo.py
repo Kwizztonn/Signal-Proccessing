@@ -292,6 +292,90 @@ def compute_spectrum_frame(
             spec = _amplitude_to_power(A_peak, nfft)
     return freqs, np.maximum(np.asarray(spec, dtype=np.float64), 0.0)
 
+
+
+def compute_spectrum_frames_vectorized(
+    signal: np.ndarray,
+    starts: np.ndarray,
+    nperseg: int,
+    fs: float,
+    nfft: int,
+    amp_conv: str = "Peak",
+    signal_kind: str = "acc",
+    output_type: str = "Amplitude",
+    *,
+    window_kind: str = "periodic",
+    max_chunk_frames: int = None,
+) -> np.ndarray:
+    """Compute one-sided spectra for many STFT frames using chunked NumPy FFTs.
+
+    This preserves ``compute_spectrum_frame`` scaling/window conventions while
+    replacing per-frame Python FFT calls with batched ``np.fft.rfft(..., axis=1)``.
+    Chunking limits temporary frame/FFT arrays for large TDMS files and retries
+    with smaller chunks if a MemoryError is raised.
+    """
+    y = np.nan_to_num(np.asarray(signal, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    starts = np.asarray(starts, dtype=np.int64)
+    fs = float(fs)
+    nfft = max(2, int(nfft))
+    nperseg = max(0, int(nperseg))
+    n_freq = nfft // 2 + 1
+    if starts.size == 0 or nperseg <= 1 or y.size == 0 or not np.isfinite(fs) or fs <= 0.0:
+        return np.empty((0, n_freq), dtype=np.float64)
+
+    w = _hann_window(nperseg, window_kind).astype(np.float64, copy=False)
+    out_type = normalize_output_type(output_type)
+    spectra = np.empty((starts.size, n_freq), dtype=np.float64)
+
+    if max_chunk_frames is None:
+        # Approximate temporary bytes per frame: indexed samples + complex FFT + output magnitude.
+        bytes_per_frame = max(1, nperseg * 8 + n_freq * (16 + 8))
+        max_chunk_frames = int(max(1, (256 * 1024 * 1024) // bytes_per_frame))
+    chunk_frames = int(max(1, min(starts.size, max_chunk_frames)))
+    sample_offsets = np.arange(nperseg, dtype=np.int64)
+
+    if out_type in ("PSD", "ASD"):
+        U = window_power(w) or float(nperseg)
+        one_sided = one_sided_correction(nfft)
+    else:
+        w_sum = float(np.sum(w)) or float(nperseg)
+        conv = 1.0
+        if out_type == "Amplitude":
+            conv, _ = get_amp_conv_factor_label(amp_conv, signal_kind)
+
+    pos = 0
+    while pos < starts.size:
+        stop = min(starts.size, pos + chunk_frames)
+        try:
+            idx = starts[pos:stop, None] + sample_offsets[None, :]
+            frames = y[idx] * w[None, :]
+            X = np.fft.rfft(frames, n=nfft, axis=1)
+            if out_type in ("PSD", "ASD"):
+                spec = (np.abs(X) ** 2) / (fs * U)
+                spec *= one_sided[None, :]
+                if out_type == "ASD":
+                    spec = np.sqrt(np.maximum(spec, 0.0))
+            else:
+                A_peak = (2.0 * np.abs(X)) / w_sum
+                A_peak[:, 0] *= 0.5
+                if nfft % 2 == 0 and A_peak.shape[1] > 1:
+                    A_peak[:, -1] *= 0.5
+                if out_type == "Amplitude":
+                    spec = A_peak * conv
+                else:
+                    spec = (A_peak / np.sqrt(2.0)) ** 2
+                    spec[:, 0] = A_peak[:, 0] * A_peak[:, 0]
+                    if nfft % 2 == 0 and spec.shape[1] > 1:
+                        spec[:, -1] = A_peak[:, -1] * A_peak[:, -1]
+            spectra[pos:stop, :] = np.maximum(np.asarray(spec, dtype=np.float64), 0.0)
+            pos = stop
+        except MemoryError:
+            if chunk_frames <= 1:
+                raise
+            chunk_frames = max(1, chunk_frames // 2)
+
+    return spectra
+
 def _hann_window(N: int, kind: str = "periodic") -> np.ndarray:
     """Hann window of length N.
 
@@ -2621,6 +2705,21 @@ class WaterfallPlotWidget(QWidget):
             "Inherits current colormap, color range (vmin/vmax), "
             "zoom viewport, and order cursors from the main view."
         )
+        self.edit_custom_order = QLineEdit()
+        self.edit_custom_order.setPlaceholderText("Order(s): 0.5, 1/3, 2/3, 1.5")
+        self.edit_custom_order.setFixedWidth(210)
+        self.edit_custom_order.setToolTip(
+            "Enter one or more visual order cursors. Separate multiple orders with "
+            "commas, semicolons, newlines, tabs, or spaces; examples: 0.5x, 1/3, ord 0.5."
+        )
+        self.btn_add_custom_order = QPushButton("Add order")
+        self.btn_add_custom_order.setToolTip(
+            "Add custom order cursor(s), including subharmonics such as 0.5x, 1/3x, 2/3x."
+        )
+        self.btn_add_subharmonics = QPushButton("Add subharmonics")
+        self.btn_add_subharmonics.setToolTip(
+            "Add common subharmonic cursors: 1/4x, 1/3x, 1/2x, 2/3x, 3/2x."
+        )
         self.lbl_order_info = QLabel("Active orders: -")
         self.lbl_order_info.setStyleSheet("color: #333; font-weight: 600;")
 
@@ -2679,6 +2778,12 @@ class WaterfallPlotWidget(QWidget):
         topbar = QHBoxLayout()
         topbar.addWidget(self.btn_add_cursor)
         topbar.addWidget(self.btn_clear_cursors)
+        topbar.addSpacing(10)
+        topbar.addWidget(QLabel("Order:"))
+        topbar.addWidget(self.edit_custom_order)
+        topbar.addWidget(self.btn_add_custom_order)
+        topbar.addWidget(self.btn_add_subharmonics)
+        topbar.addSpacing(10)
         topbar.addWidget(self.btn_open_3d)
         topbar.addWidget(self.btn_open_3d_help)
         topbar.addWidget(self.btn_open_2d_standalone)
@@ -2697,12 +2802,18 @@ class WaterfallPlotWidget(QWidget):
 
         self.btn_add_cursor.clicked.connect(self._add_cursor_default)
         self.btn_clear_cursors.clicked.connect(self.clear_cursors)
+        self.btn_add_custom_order.clicked.connect(self._add_custom_orders_from_input)
+        self.edit_custom_order.returnPressed.connect(self._add_custom_orders_from_input)
+        self.btn_add_subharmonics.clicked.connect(self._add_common_subharmonics)
         self.btn_open_3d.clicked.connect(self.open_3d_window)
         self.btn_open_2d_standalone.clicked.connect(self.open_2d_standalone_window)
 
         if self.mini:
             self.btn_add_cursor.hide()
             self.btn_clear_cursors.hide()
+            self.edit_custom_order.hide()
+            self.btn_add_custom_order.hide()
+            self.btn_add_subharmonics.hide()
             self.btn_open_3d.hide()
             self.btn_open_2d_standalone.hide()
             self.lbl_order_info.hide()
@@ -3586,11 +3697,134 @@ class WaterfallPlotWidget(QWidget):
         self.add_cursor(order)
 
     def add_cursor(self, order_value: float):
+        try:
+            order_value = float(order_value)
+        except Exception:
+            return
+        if not np.isfinite(order_value) or order_value <= 0.0:
+            return
         color = self._cursor_colors[len(self._cursors) % len(self._cursor_colors)]
         cursor = WaterfallOrderCursor(self, order_value, color)
         cursor.changed.connect(self._update_lower_plot)
         self._cursors.append(cursor)
         self._update_lower_plot()
+
+    def _parse_order_token(self, token: str):
+        token = str(token).strip().lower()
+        if not token:
+            return None
+        token = token.replace("order", "").replace("ord", "")
+        token = token.replace("×", "").replace("x", "").strip()
+        if not token:
+            return None
+        try:
+            if token.count("/") == 1:
+                num_txt, den_txt = token.split("/", 1)
+                num = float(num_txt.strip())
+                den = float(den_txt.strip())
+                if den == 0.0:
+                    return None
+                value = num / den
+            elif "/" in token:
+                return None
+            else:
+                value = float(token)
+        except Exception:
+            return None
+        if not np.isfinite(value) or value <= 0.0:
+            return None
+        return float(value)
+
+    def _parse_custom_orders(self, text: str):
+        cleaned = str(text)
+        for sep in (",", ";", "\n", "\t"):
+            cleaned = cleaned.replace(sep, " ")
+        orders = []
+        for token in cleaned.split():
+            value = self._parse_order_token(token)
+            if value is None:
+                continue
+            if not any(abs(value - existing) <= 1e-9 for existing in orders):
+                orders.append(value)
+        return orders
+
+    def _order_already_exists(self, order_value: float, tol: float = 1e-6):
+        try:
+            order_value = float(order_value)
+        except Exception:
+            return False
+        return any(abs(float(c.order) - order_value) <= float(tol) for c in self._cursors)
+
+    def _order_is_visible_somewhere(self, order_value: float):
+        try:
+            order_value = float(order_value)
+        except Exception:
+            return False
+        if not np.isfinite(order_value) or order_value <= 0.0:
+            return False
+        rpms = np.asarray(self.rpms, dtype=np.float64)
+        freqs = np.asarray(self.freqs, dtype=np.float64)
+        rpms = rpms[np.isfinite(rpms)]
+        freqs = freqs[np.isfinite(freqs)]
+        if rpms.size == 0 or freqs.size == 0:
+            return False
+        order_freqs = order_value * rpms / 60.0
+        order_freqs = order_freqs[np.isfinite(order_freqs)]
+        if order_freqs.size == 0:
+            return False
+        f_min = float(np.nanmin(freqs))
+        f_max = float(np.nanmax(freqs))
+        o_min = float(np.nanmin(order_freqs))
+        o_max = float(np.nanmax(order_freqs))
+        return bool(o_max >= f_min and o_min <= f_max)
+
+    def _add_custom_orders_from_input(self):
+        text = self.edit_custom_order.text()
+        orders = self._parse_custom_orders(text)
+        if not orders:
+            QMessageBox.warning(
+                self, "Add order",
+                "Enter one or more positive orders, for example: 0.5, 0.5x, 1/3, 2/3, 1.5, order 0.5."
+            )
+            return
+
+        skipped = []
+        added = 0
+        for order in orders:
+            label = f"{order:.6g}x"
+            if self._order_already_exists(order):
+                skipped.append(f"{label}: already active")
+                continue
+            if not self._order_is_visible_somewhere(order):
+                skipped.append(f"{label}: outside current waterfall frequency/RPM range")
+                continue
+            before = len(self._cursors)
+            self.add_cursor(order)
+            if len(self._cursors) > before:
+                added += 1
+
+        self.edit_custom_order.clear()
+        if skipped:
+            QMessageBox.information(
+                self, "Add order",
+                "Some order cursors were skipped:\n" + "\n".join(skipped)
+            )
+
+    def _add_common_subharmonics(self):
+        presets = [0.25, 1.0 / 3.0, 0.5, 2.0 / 3.0, 1.5]
+        added = 0
+        for order in presets:
+            if self._order_already_exists(order) or not self._order_is_visible_somewhere(order):
+                continue
+            before = len(self._cursors)
+            self.add_cursor(order)
+            if len(self._cursors) > before:
+                added += 1
+        if added == 0:
+            QMessageBox.information(
+                self, "Add subharmonics",
+                "No new subharmonic cursor was added. They may already exist or be outside the frequency range."
+            )
 
     def export_order_cursor_specs(self):
         out = []
@@ -4722,16 +4956,13 @@ class PlotWorker(QObject):
         if starts.size == 0:
             return freqs, np.array([], dtype=np.float64), np.empty((freqs.size, 0))
 
-        frames = []
-        for st in starts:
-            _, spec_i = compute_spectrum_frame(
-                y[st:st + nperseg], fs, nfft,
-                amp_conv=self.cfg.get("amp_conv", "Peak"),
-                signal_kind=signal_kind, output_type=output_type,
-                window_kind=window_kind,
-            )
-            frames.append(spec_i)
-        S = np.asarray(frames, dtype=np.float64).T
+        spectra_rows = compute_spectrum_frames_vectorized(
+            y, starts, nperseg, fs, nfft,
+            amp_conv=self.cfg.get("amp_conv", "Peak"),
+            signal_kind=signal_kind, output_type=output_type,
+            window_kind=window_kind,
+        )
+        S = np.asarray(spectra_rows, dtype=np.float64).T
 
         # Center-of-frame timestamps (matches MATLAB/nCode and the
         # window-weighted RPM labels used by _compute_waterfall_map).
@@ -4886,15 +5117,11 @@ class PlotWorker(QObject):
             raise RuntimeError("Could not build waterfall frames.")
 
         idx_t = starts[:, None] + np.arange(nperseg, dtype=np.int64)[None, :]
-        spectra_rows = []
-        for st in starts:
-            _, spec_i = compute_spectrum_frame(
-                acc[st:st + nperseg], fs, nfft,
-                amp_conv=self.cfg.get("amp_conv", "Peak"), signal_kind="acc",
-                output_type=output_type, window_kind=window_kind,
-            )
-            spectra_rows.append(spec_i)
-        spectra_per_frame = np.asarray(spectra_rows, dtype=np.float64)
+        spectra_per_frame = compute_spectrum_frames_vectorized(
+            acc, starts, nperseg, fs, nfft,
+            amp_conv=self.cfg.get("amp_conv", "Peak"), signal_kind="acc",
+            output_type=output_type, window_kind=window_kind,
+        )
 
         rpm_segs = rpm[idx_t]
         method = str(rpm_label_method).strip()
@@ -4921,6 +5148,12 @@ class PlotWorker(QObject):
         if frame_rpms.size < 2:
             raise RuntimeError("Not enough valid RPM frames for waterfall plotting.")
 
+        # Preserve the raw STFT analysis frames in original time order for future
+        # physical/event tracking. The plotted waterfall intentionally uses the
+        # existing RPM-domain order below for run-up/down visualization.
+        raw_frame_rpms_time = frame_rpms.copy()
+        raw_frame_spectra_linear_time = spectra.copy()
+
         order = np.argsort(frame_rpms)
         frame_rpms = frame_rpms[order]
         spectra = spectra[order]
@@ -4928,20 +5161,26 @@ class PlotWorker(QObject):
 
         num_buffers = max(1, min(int(num_buffers), n_valid))
         if num_buffers > 1:
+            # Number of buffers is RPM-neighbor averaging on the sorted raw STFT
+            # frame grid. It smooths adjacent physical spectra in RPM space; it
+            # does not change df, nfft, or the effective FFT window length.
             half = num_buffers // 2
             csum = np.vstack([
                 np.zeros((1, spectra.shape[1]), dtype=np.float64),
                 np.cumsum(spectra, axis=0, dtype=np.float64),
             ])
-            spectra_smoothed = np.empty_like(spectra)
-            for i in range(n_valid):
-                i0 = max(0, i - half)
-                i1 = min(n_valid, i + half + 1)
-                count = max(1, i1 - i0)
-                spectra_smoothed[i, :] = (csum[i1, :] - csum[i0, :]) / float(count)
+            i0 = np.maximum(0, np.arange(n_valid) - half)
+            i1 = np.minimum(n_valid, np.arange(n_valid) + half + 1)
+            counts = np.maximum(1, i1 - i0).astype(np.float64)
+            spectra_smoothed = (csum[i1, :] - csum[i0, :]) / counts[:, None]
         else:
             spectra_smoothed = spectra
 
+        # Number of spectra controls the RPM analysis/display slice count.
+        # It resamples already-computed FFT frames and therefore cannot improve
+        # true frequency resolution; df remains fs/nfft (or the effective FFT
+        # window length). Higher overlap increases frame density, not independent
+        # frequency-bin resolution.
         min_rpm = float(frame_rpms[0])
         max_rpm = float(frame_rpms[-1])
         if min_rpm == max_rpm:
@@ -4985,6 +5224,8 @@ class PlotWorker(QObject):
             "S_analysis": S_analysis,
             "frame_rpms": frame_rpms,
             "frame_spectra_linear": spectra_smoothed,
+            "raw_frame_rpms_time": raw_frame_rpms_time,
+            "raw_frame_spectra_linear_time": raw_frame_spectra_linear_time,
             "rpms_display": rpms_display if rpms_display.size else target_rpms,
             "S_display": S_display if S_display.size else S_analysis,
             "raw_frame_count": n_valid,
@@ -8306,11 +8547,12 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
         QMessageBox.information(
             self, "Number of Spectra — Explanation",
             "<b>Number of Spectra</b><br><br>"
-            "Controls how many RPM rows appear in the waterfall display after interpolation.<br><br>"
+            "Controls how many RPM rows appear in the waterfall analysis/display grid after interpolation.<br><br>"
+            "<b>Frequency resolution:</b> unchanged by this setting; Δf = fs / NFFT, and only NFFT/effective window length changes true frequency-bin spacing.<br><br>"
             "<b>What it does:</b> the raw FFT computation produces one spectrum per hop "
             "(frame), typically a few hundred to a few thousand frames. "
             "After sorting by RPM, the code interpolates those frames onto a uniform RPM grid "
-            "with <i>at least</i> this many rows.<br><br>"
+            "with this many analysis rows; denser image rows are display-only interpolation.<br><br>"
             "<b>Important:</b> increasing Num Spectra beyond the number of raw frames only "
             "adds <i>interpolated</i> rows — it does not create new physical information. "
             "The apparent smoothness of the waterfall increases, but the underlying data "
@@ -8517,9 +8759,9 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
         self.wf_num_spectra_spin.setRange(10, 5000)
         self.wf_num_spectra_spin.setValue(1000)
         self.wf_num_spectra_spin.setToolTip(
-            "Number of Spectra — minimum RPM rows shown in the waterfall after interpolation.\n"
-            "Larger = denser display, NOT more physical information.\n"
-            "True resolution depends on the number of raw FFT frames (hop-size driven).\n"
+            "Number of Spectra — RPM analysis/display rows after interpolation.\n"
+            "Larger = denser time/RPM sampling view, NOT finer frequency bins.\n"
+            "Frequency resolution remains Δf = fs / NFFT; overlap only increases frame density.\n"
             "Click the ? button for a full explanation."
         )
         self.btn_wf_num_spectra_help = self._make_help_button(
@@ -8530,7 +8772,7 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
         self.wf_num_buffers_spin.setRange(1, 500)
         self.wf_num_buffers_spin.setValue(1)
         self.wf_num_buffers_spin.setToolTip(
-            "Number of Buffers — sliding-window average width across neighboring FFT frames.\n"
+            "Number of Buffers — RPM-neighbor sliding average width across sorted raw FFT frames.\n"
             "1 = no smoothing. Larger = smoother spectra, but blurs narrow peaks and\n"
             "RPM-speed transitions. Keep ≤ 3–5 for typical run-up data.\n"
             "Click the ? button for a full explanation."

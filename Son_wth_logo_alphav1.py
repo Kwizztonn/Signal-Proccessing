@@ -98,6 +98,25 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 # External branding wrapper removed: the built-in _build_logo_header() is used instead.
 
+# --- Envelope / kurtogram backend + widget ---
+try:
+    from dsp_core.envelope_kurtogram import (
+        compute_envelope_spectrum,
+        compute_fast_kurtogram,
+        extract_bearing_fault_frequencies,
+    )
+    _HAVE_ENVELOPE_BACKEND = True
+except Exception:
+    compute_envelope_spectrum = None
+    compute_fast_kurtogram = None
+    extract_bearing_fault_frequencies = None
+    _HAVE_ENVELOPE_BACKEND = False
+
+try:
+    from gui_widgets.envelope_widget import EnvelopeKurtogramWidget
+except Exception:
+    EnvelopeKurtogramWidget = None
+
 # --- TDMS (npTDMS) ---
 try:
     from nptdms import TdmsFile
@@ -4735,7 +4754,10 @@ class PlotMiniWidget(QFrame):
         self.btn_open.setFixedWidth(95)
         self.btn_close.setFixedWidth(70)
 
-        self.canvas = InteractivePlotWidget(mini=True)
+        if str(state.get("kind", "")).lower() in ("kurtogram", "envelope_spectrum") and EnvelopeKurtogramWidget is not None:
+            self.canvas = EnvelopeKurtogramWidget(mini=True)
+        else:
+            self.canvas = InteractivePlotWidget(mini=True)
         self.canvas.setMinimumHeight(160)
 
         top = QHBoxLayout()
@@ -4775,12 +4797,13 @@ class DetailPlotWidget(QWidget):
         self.title.setWordWrap(True)
         self.title.setStyleSheet("font-weight: bold;")
 
-        # Use a plain InteractivePlotWidget for every non-waterfall kind so
-        # that the time-domain detail shows ONLY the time-domain trace —
-        # no stacked "visible-window FFT" subplot underneath.  The legacy
-        # TimeDomainZoomFFTWidget remains in the codebase for advanced use
-        # but is no longer the default detail renderer.
-        self.canvas = InteractivePlotWidget(mini=False)
+        # Use a plain InteractivePlotWidget for normal non-waterfall kinds so
+        # that the time-domain detail shows ONLY the time-domain trace.
+        # Envelope/Kurtogram states use their dedicated modular widget.
+        if str(state.get("kind", "")).lower() in ("kurtogram", "envelope_spectrum") and EnvelopeKurtogramWidget is not None:
+            self.canvas = EnvelopeKurtogramWidget(mini=False)
+        else:
+            self.canvas = InteractivePlotWidget(mini=False)
         self.canvas.setMinimumHeight(360)
 
         lay = QVBoxLayout(self)
@@ -6142,6 +6165,94 @@ class PlotWorker(QObject):
             print(f"[TRDSP] _align_waterfall_signals: {n_invalid} RPM samples remain NaN after cleaning.")
         return acc_clean, rpm_clean, fs_acc
 
+    def _build_envelope_analysis_state(self):
+        """Build Envelope/Kurtogram states in the worker thread.
+
+        Audit note: this localized dispatch calls the existing modular
+        dsp_core.envelope_kurtogram backend and returns normal TRDSP state
+        dictionaries; FFT/STFT/Waterfall/Order Tracking code paths are left
+        untouched.
+        """
+        if not _HAVE_ENVELOPE_BACKEND or compute_envelope_spectrum is None:
+            raise RuntimeError("Envelope/Kurtogram backend is not available.")
+
+        fs = float(self.cfg["fs"])
+        names = list(self.cfg.get("names", []))
+        if not names:
+            raise RuntimeError("No channel selected for Envelope/Kurtogram analysis.")
+        name = names[0]
+        group_or_sheet = self.cfg["group_or_sheet"]
+        file_base = os.path.splitext(os.path.basename(self.cfg["file_path"]))[0]
+        raw = self._load_selected_signals()[name]
+        y = self._prep_signal_with_fs(np.asarray(raw), fs)
+        y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64, copy=False)
+        if y.size < 16:
+            raise RuntimeError("Envelope/Kurtogram analysis needs at least 16 samples after preprocessing.")
+
+        band = self.cfg.get("envelope_band")
+        if band is not None:
+            band = (float(band[0]), float(band[1]))
+
+        bearing_freqs = self.cfg.get("bearing_freqs") or None
+        diagnostic_kind = str(self.cfg.get("diagnostic_kind", "envelope_spectrum"))
+
+        if diagnostic_kind == "kurtogram":
+            if compute_fast_kurtogram is None:
+                raise RuntimeError("Kurtogram backend is not available.")
+            n_levels = int(self.cfg.get("kurtogram_levels", 5))
+            kg = compute_fast_kurtogram(y, fs, n_levels=n_levels)
+            best = dict(kg["best_band"])
+            env = compute_envelope_spectrum(y, fs, band=(best["f_low"], best["f_high"]))
+            return [{
+                "key": f"kurtogram|{group_or_sheet}|{name}",
+                "kind": "kurtogram",
+                "name": name,
+                "short_title": f"Envelope / Kurtogram: {name}",
+                "title": (
+                    f"{file_base} | {group_or_sheet} | Envelope / Kurtogram | {name} | "
+                    f"levels={n_levels} | best band={best['f_low']:.6g}-{best['f_high']:.6g} Hz | "
+                    f"K={best['kurtosis']:.3g}"
+                ),
+                "xlabel": "Frequency [Hz]",
+                "ylabel": "Envelope amplitude [peak]",
+                "kurtosis_grid": kg["kurtosis_grid"],
+                "center_freq_grid": kg["center_freq_grid"],
+                "bandwidth_grid": kg["bandwidth_grid"],
+                "best_band": best,
+                "bands": kg.get("bands", []),
+                "envelope_freqs": env["freqs"],
+                "envelope_spectrum": env["spectrum"],
+                "fs": fs,
+                "n_levels": n_levels,
+                "band": env.get("band"),
+                "bearing_freqs": bearing_freqs,
+                "colorbar_label": "Excess kurtosis",
+                "scale": "Linear",
+                "stats_text": (
+                    f"Envelope/Kurtogram | {name} | fs={fs:g} Hz | samples={y.size} | "
+                    f"best={best['f_low']:.3g}-{best['f_high']:.3g} Hz | K={best['kurtosis']:.3g}"
+                ),
+            }]
+
+        env = compute_envelope_spectrum(y, fs, band=band)
+        band_txt = "none" if env.get("band") is None else f"{env['band'][0]:.6g}-{env['band'][1]:.6g} Hz"
+        return [{
+            "key": f"envelope_spectrum|{group_or_sheet}|{name}",
+            "kind": "envelope_spectrum",
+            "name": name,
+            "short_title": f"Envelope spectrum: {name}",
+            "title": f"{file_base} | {group_or_sheet} | Envelope Spectrum | {name} | band={band_txt}",
+            "xlabel": "Frequency [Hz]",
+            "ylabel": "Envelope amplitude [peak]",
+            "freqs": env["freqs"],
+            "spectrum": env["spectrum"],
+            "fs": fs,
+            "band": env.get("band"),
+            "scale": "Linear",
+            "bearing_freqs": bearing_freqs,
+            "stats_text": f"Envelope spectrum | {name} | fs={fs:g} Hz | samples={y.size} | band={band_txt}",
+        }]
+
     def _build_plot_states(self):
         fs = float(self.cfg["fs"])
         crop = bool(self.cfg["crop"])
@@ -6156,6 +6267,9 @@ class PlotWorker(QObject):
 
         if mode == "Waterfall (RPM + Acceleration)":
             return [self._build_waterfall_state()]
+
+        if mode == "Envelope / Kurtogram":
+            return self._build_envelope_analysis_state()
 
         raw_signals = self._load_selected_signals()
         states = []
@@ -6728,11 +6842,13 @@ class MainWindow(QMainWindow):
 
         self.tab_controls = QWidget()
         self.tab_waterfall = QWidget()
+        self.tab_envelope = QWidget()
         self.tab_waterfall_view = QWidget()
         self.tab_plot = QWidget()
         self.tab_info = QWidget()
         self.tabs.addTab(self.tab_controls, self._make_tab_icon("controls"), "Controls")
         self.tabs.addTab(self.tab_waterfall, self._make_tab_icon("waterfall"), "Waterfall")
+        self.tabs.addTab(self.tab_envelope, self._make_tab_icon("plot"), "Envelope / Kurtogram")
         self.tabs.addTab(self.tab_waterfall_view, self._make_tab_icon("waterfall"), "Waterfall View")
         self.tabs.addTab(self.tab_plot, self._make_tab_icon("plot"), "Plot View")
         self.tabs.addTab(self.tab_info, self._make_tab_icon("help"), "Help / Info")
@@ -6880,6 +6996,7 @@ class MainWindow(QMainWindow):
         ctl.addStretch(1)
 
         self._build_waterfall_tab_ui()
+        self._build_envelope_tab_ui()
         self._build_waterfall_view_tab()
         self._build_help_tab_ui()
 
@@ -7036,6 +7153,14 @@ class MainWindow(QMainWindow):
         export_ready = (self.list_channels.count() > 0) and not busy and bool(self.file_path)
         self.btn_export_cropped_tdms.setEnabled(export_ready)
 
+        if hasattr(self, "btn_env_compute"):
+            env_ready = (self.list_channels.count() > 0) and bool(self.file_path) and not busy
+            self.btn_env_compute.setEnabled(env_ready)
+            self.btn_env_kurtogram.setEnabled(env_ready)
+            self.btn_env_clear.setEnabled(not busy)
+            self.btn_env_export.setEnabled((self._active_plot_key in self._plot_states) and not busy)
+            self.cmb_env_channel.setEnabled(self.cmb_env_channel.count() > 0 and not busy)
+
         if hasattr(self, "btn_wf_plot"):
             wf_ready = (
                 bool(getattr(self, "wf_acc_path", None)) and
@@ -7080,7 +7205,7 @@ class MainWindow(QMainWindow):
 
     def _has_active_color_plot(self):
         state = self._plot_states.get(self._active_plot_key) if self._active_plot_key else None
-        return bool(state and state.get("kind") in ("stft", "waterfall"))
+        return bool(state and state.get("kind") in ("stft", "waterfall", "kurtogram"))
 
     def _on_canvas_color_levels_changed(self, vmin: float, vmax: float):
         if self._active_canvas is None or not self._has_active_color_plot():
@@ -7109,7 +7234,7 @@ class MainWindow(QMainWindow):
         if self._active_plot_key not in self._plot_states:
             return
         state = self._plot_states[self._active_plot_key]
-        if state.get("kind") not in ("stft", "waterfall"):
+        if state.get("kind") not in ("stft", "waterfall", "kurtogram"):
             return
         self._sync_spectrogram_controls()
         self._refresh_plot_views_for_key(
@@ -7345,6 +7470,7 @@ class MainWindow(QMainWindow):
         self.cmb_sheet.blockSignals(False)
 
         self.list_channels.clear()
+        self._sync_envelope_channel_combo()
         self.lbl_stats.setText("")
         self._reset_plot_workspace()
         self._refresh_enabled_state()
@@ -7412,6 +7538,7 @@ class MainWindow(QMainWindow):
 
         self._set_busy(True, f"Loading '{name}' in background...")
         self.list_channels.clear()
+        self._sync_envelope_channel_combo()
         self.lbl_stats.setText("")
         self._refresh_enabled_state()
 
@@ -7477,6 +7604,7 @@ class MainWindow(QMainWindow):
             self.list_channels.setCurrentRow(idx)
             self.list_channels.item(idx).setSelected(True)
 
+        self._sync_envelope_channel_combo()
         self._refresh_enabled_state()
 
     def _get_selected_names(self):
@@ -7614,7 +7742,7 @@ class MainWindow(QMainWindow):
 
     def _sync_spectrogram_controls(self):
         state = self._plot_states.get(self._active_plot_key) if self._active_plot_key else None
-        is_color_plot = bool(state and state.get("kind") in ("stft", "waterfall"))
+        is_color_plot = bool(state and state.get("kind") in ("stft", "waterfall", "kurtogram"))
         is_db = bool(is_color_plot and str(state.get("scale", "")).strip().lower() == "db")
         custom_mode = self.cmb_color_mode.currentText().strip() == "Custom Bands"
         manual = self.chk_manual_clim.isChecked() and not custom_mode
@@ -7851,7 +7979,13 @@ class MainWindow(QMainWindow):
                 f"Refusing to draw a waterfall state on {type(canvas).__name__}; "
                 "waterfall plots require WaterfallPlotWidget."
             )
-        if kind != "waterfall" and isinstance(canvas, WaterfallPlotWidget):
+        if kind in ("kurtogram", "envelope_spectrum"):
+            if EnvelopeKurtogramWidget is None or not isinstance(canvas, EnvelopeKurtogramWidget):
+                raise RuntimeError(
+                    f"Refusing to draw an Envelope/Kurtogram state on {type(canvas).__name__}; "
+                    "these states require EnvelopeKurtogramWidget."
+                )
+        elif isinstance(canvas, WaterfallPlotWidget):
             raise RuntimeError(
                 f"Refusing to draw a non-waterfall state (kind={kind!r}) "
                 "on a WaterfallPlotWidget."
@@ -8098,6 +8232,8 @@ class MainWindow(QMainWindow):
                 all_stats.append(st["stats_text"])
 
         self.lbl_stats.setText("\n".join(all_stats[:12]))
+        if any(st.get("kind") in ("envelope_spectrum", "kurtogram") for st in normal_states) and hasattr(self, "lbl_env_status"):
+            self.lbl_env_status.setText("Envelope/Kurtogram result ready in Plot View.")
         self._reflow_overview_grid()
         self.tabs.setCurrentWidget(self.tab_plot)
 
@@ -8110,6 +8246,8 @@ class MainWindow(QMainWindow):
         self.lbl_stats.setText("")
         if hasattr(self, "lbl_wf_status"):
             self.lbl_wf_status.setText("")
+        if hasattr(self, "lbl_env_status"):
+            self.lbl_env_status.setText("")
         self._err(f"Plot error:\n{msg}")
 
     def _start_plot_worker(self, cfg: dict):
@@ -8263,7 +8401,58 @@ class MainWindow(QMainWindow):
             return offsets[i % len(offsets)]
 
         try:
-            if state["kind"] == "waterfall":
+            if state["kind"] in ("envelope_spectrum", "kurtogram"):
+                if state["kind"] == "kurtogram":
+                    fig = Figure(figsize=(12, 8), dpi=150, constrained_layout=True)
+                    gs = fig.add_gridspec(2, 1, height_ratios=[3.0, 2.0])
+                    ax = fig.add_subplot(gs[0, 0])
+                    ax_env = fig.add_subplot(gs[1, 0])
+                    K = np.asarray(state.get("kurtosis_grid", []), dtype=np.float64)
+                    centers = np.asarray(state.get("center_freq_grid", []), dtype=np.float64)
+                    finite_centers = centers[np.isfinite(centers)]
+                    if finite_centers.size:
+                        x0, x1 = float(np.min(finite_centers)), float(np.max(finite_centers))
+                    else:
+                        x0, x1 = 0.0, float(state.get("fs", 2.0)) * 0.5
+                    mesh = ax.imshow(
+                        K, aspect="auto", origin="lower", interpolation="nearest",
+                        extent=[x0, x1, -0.5, max(0.5, K.shape[0] - 0.5)],
+                        cmap=self.cmb_spec_cmap.currentText().strip() or "viridis",
+                    )
+                    cbar = fig.colorbar(mesh, ax=ax)
+                    cbar.set_label(state.get("colorbar_label", "Excess kurtosis"))
+                    best = state.get("best_band") or {}
+                    if best:
+                        ax.axvspan(float(best["f_low"]), float(best["f_high"]), color="red", alpha=0.15)
+                        ax.axvline(float(best["center_freq"]), color="red", lw=1.0)
+                    ax.set_xlabel("Band center frequency [Hz]")
+                    ax.set_ylabel("Kurtogram level")
+                    ax.set_title(state["title"])
+                    env_x = np.asarray(state.get("envelope_freqs", []), dtype=np.float64)
+                    env_y = np.asarray(state.get("envelope_spectrum", []), dtype=np.float64)
+                else:
+                    fig = Figure(figsize=(12, 6), dpi=150, constrained_layout=True)
+                    ax = fig.add_subplot(111)
+                    ax_env = ax
+                    env_x = np.asarray(state.get("freqs", []), dtype=np.float64)
+                    env_y = np.asarray(state.get("spectrum", []), dtype=np.float64)
+
+                ax_env.plot(env_x, env_y, linewidth=0.9)
+                ax_env.set_xlabel(state.get("xlabel", "Frequency [Hz]"))
+                ax_env.set_ylabel(state.get("ylabel", "Envelope amplitude [peak]"))
+                ax_env.grid(True, alpha=0.3)
+                if state["kind"] != "kurtogram":
+                    ax_env.set_title(state["title"])
+                bearing = state.get("bearing_freqs") or {}
+                for label, freq in bearing.items():
+                    if label == "shaft_hz":
+                        continue
+                    try:
+                        ax_env.axvline(float(freq), color="red", ls="--", lw=0.8)
+                        ax_env.text(float(freq), ax_env.get_ylim()[1], label, rotation=90, va="top", color="red", fontsize=8)
+                    except Exception:
+                        pass
+            elif state["kind"] == "waterfall":
                 fig = Figure(figsize=(12, 9), dpi=150, constrained_layout=True)
                 gs = fig.add_gridspec(2, 1, height_ratios=[3.0, 1.6])
                 ax0 = fig.add_subplot(gs[0, 0])
@@ -9162,6 +9351,216 @@ before integration to suppress DC drift, then converted to mm/s.</p>""")
             canvas.clear_click_annotations()
         if hasattr(canvas, "clear_cursors"):
             canvas.clear_cursors()
+
+    def _build_envelope_tab_ui(self):
+        """Build the modular Envelope/Kurtogram diagnostic controls."""
+        lay = QVBoxLayout(self.tab_envelope)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(8)
+
+        self.lbl_env_status = QLabel("Load a data file, choose a vibration channel, then compute an envelope spectrum or kurtogram.")
+        self.lbl_env_status.setWordWrap(True)
+        self.lbl_env_status.setStyleSheet("color: #444;")
+        lay.addWidget(self.lbl_env_status)
+
+        grp_signal = QGroupBox("Signal")
+        sig = QGridLayout(grp_signal)
+        self.cmb_env_channel = QComboBox()
+        self.env_fs_spin = QDoubleSpinBox()
+        self.env_fs_spin.setRange(1e-9, 1_000_000_000.0)
+        self.env_fs_spin.setDecimals(6)
+        self.env_fs_spin.setValue(float(self.fs_spin.value()))
+        self.env_fs_spin.setToolTip("Sampling frequency used for this envelope/kurtogram computation.")
+        self.chk_env_crop = QCheckBox("Use crop window")
+        self.chk_env_crop.setChecked(False)
+        self.env_t0_spin = QDoubleSpinBox()
+        self.env_t0_spin.setRange(0.0, 1_000_000_000.0)
+        self.env_t0_spin.setDecimals(6)
+        self.env_t0_spin.setValue(0.0)
+        self.env_t1_spin = QDoubleSpinBox()
+        self.env_t1_spin.setRange(0.0, 1_000_000_000.0)
+        self.env_t1_spin.setDecimals(6)
+        self.env_t1_spin.setValue(1.0)
+        sig.addWidget(QLabel("Acceleration channel:"), 0, 0)
+        sig.addWidget(self.cmb_env_channel, 0, 1, 1, 3)
+        sig.addWidget(QLabel("Sampling frequency (Hz):"), 1, 0)
+        sig.addWidget(self.env_fs_spin, 1, 1)
+        sig.addWidget(self.chk_env_crop, 1, 2)
+        sig.addWidget(QLabel("Start (s):"), 2, 0)
+        sig.addWidget(self.env_t0_spin, 2, 1)
+        sig.addWidget(QLabel("End (s):"), 2, 2)
+        sig.addWidget(self.env_t1_spin, 2, 3)
+        lay.addWidget(grp_signal)
+
+        grp_analysis = QGroupBox("Envelope / Kurtogram settings")
+        ana = QGridLayout(grp_analysis)
+        self.env_band_low_spin = QDoubleSpinBox()
+        self.env_band_low_spin.setRange(0.0, 1_000_000_000.0)
+        self.env_band_low_spin.setDecimals(6)
+        self.env_band_low_spin.setSpecialValueText("None")
+        self.env_band_low_spin.setValue(0.0)
+        self.env_band_high_spin = QDoubleSpinBox()
+        self.env_band_high_spin.setRange(0.0, 1_000_000_000.0)
+        self.env_band_high_spin.setDecimals(6)
+        self.env_band_high_spin.setSpecialValueText("None")
+        self.env_band_high_spin.setValue(0.0)
+        self.env_levels_spin = QSpinBox()
+        self.env_levels_spin.setRange(1, 9)
+        self.env_levels_spin.setValue(5)
+        self.btn_env_compute = QPushButton("Compute Envelope Spectrum")
+        self.btn_env_kurtogram = QPushButton("Compute Kurtogram + Auto Band")
+        self.btn_env_clear = QPushButton("Clear")
+        self.btn_env_export = QPushButton("Export Figure")
+        ana.addWidget(QLabel("Bandpass low (Hz):"), 0, 0)
+        ana.addWidget(self.env_band_low_spin, 0, 1)
+        ana.addWidget(QLabel("Bandpass high (Hz):"), 0, 2)
+        ana.addWidget(self.env_band_high_spin, 0, 3)
+        ana.addWidget(QLabel("Kurtogram levels:"), 1, 0)
+        ana.addWidget(self.env_levels_spin, 1, 1)
+        ana.addWidget(self.btn_env_compute, 2, 0)
+        ana.addWidget(self.btn_env_kurtogram, 2, 1)
+        ana.addWidget(self.btn_env_clear, 2, 2)
+        ana.addWidget(self.btn_env_export, 2, 3)
+        lay.addWidget(grp_analysis)
+
+        grp_bearing = QGroupBox("Optional bearing fault frequencies")
+        brg = QGridLayout(grp_bearing)
+        self.env_rpm_spin = QDoubleSpinBox(); self.env_rpm_spin.setRange(0.0, 1_000_000_000.0); self.env_rpm_spin.setDecimals(6)
+        self.env_balls_spin = QSpinBox(); self.env_balls_spin.setRange(1, 1000); self.env_balls_spin.setValue(8)
+        self.env_ball_d_spin = QDoubleSpinBox(); self.env_ball_d_spin.setRange(0.0, 1_000_000_000.0); self.env_ball_d_spin.setDecimals(6); self.env_ball_d_spin.setValue(10.0)
+        self.env_pitch_d_spin = QDoubleSpinBox(); self.env_pitch_d_spin.setRange(0.0, 1_000_000_000.0); self.env_pitch_d_spin.setDecimals(6); self.env_pitch_d_spin.setValue(50.0)
+        self.env_angle_spin = QDoubleSpinBox(); self.env_angle_spin.setRange(-89.999, 89.999); self.env_angle_spin.setDecimals(6); self.env_angle_spin.setValue(0.0)
+        self.btn_env_bearing = QPushButton("Calculate BPFO/BPFI/BSF/FTF")
+        self.lbl_env_bearing = QLabel("Bearing frequencies: not calculated")
+        self.lbl_env_bearing.setWordWrap(True)
+        self._env_bearing_freqs = None
+        brg.addWidget(QLabel("RPM:"), 0, 0); brg.addWidget(self.env_rpm_spin, 0, 1)
+        brg.addWidget(QLabel("Number of balls:"), 0, 2); brg.addWidget(self.env_balls_spin, 0, 3)
+        brg.addWidget(QLabel("Ball diameter:"), 1, 0); brg.addWidget(self.env_ball_d_spin, 1, 1)
+        brg.addWidget(QLabel("Pitch diameter:"), 1, 2); brg.addWidget(self.env_pitch_d_spin, 1, 3)
+        brg.addWidget(QLabel("Contact angle (deg):"), 2, 0); brg.addWidget(self.env_angle_spin, 2, 1)
+        brg.addWidget(self.btn_env_bearing, 2, 2, 1, 2)
+        brg.addWidget(self.lbl_env_bearing, 3, 0, 1, 4)
+        lay.addWidget(grp_bearing)
+        lay.addStretch(1)
+
+        self.btn_env_compute.clicked.connect(lambda: self._start_envelope_diagnostic("envelope_spectrum"))
+        self.btn_env_kurtogram.clicked.connect(lambda: self._start_envelope_diagnostic("kurtogram"))
+        self.btn_env_clear.clicked.connect(self._clear_envelope_result)
+        self.btn_env_export.clicked.connect(self._export_current_plot)
+        self.btn_env_bearing.clicked.connect(self._calculate_env_bearing_freqs)
+        self.fs_spin.valueChanged.connect(lambda v: self.env_fs_spin.setValue(float(v)))
+        self._sync_envelope_channel_combo()
+
+    def _sync_envelope_channel_combo(self):
+        if not hasattr(self, "cmb_env_channel"):
+            return
+        current = self.cmb_env_channel.currentText()
+        self.cmb_env_channel.blockSignals(True)
+        self.cmb_env_channel.clear()
+        for i in range(self.list_channels.count()):
+            self.cmb_env_channel.addItem(self.list_channels.item(i).text())
+        if current:
+            idx = self.cmb_env_channel.findText(current)
+            if idx >= 0:
+                self.cmb_env_channel.setCurrentIndex(idx)
+        if self.cmb_env_channel.count() == 0 and self.list_channels.currentItem() is not None:
+            self.cmb_env_channel.addItem(self.list_channels.currentItem().text())
+        self.cmb_env_channel.blockSignals(False)
+
+    def _clear_envelope_result(self):
+        keys = [k for k, st in self._plot_states.items() if st.get("kind") in ("envelope_spectrum", "kurtogram")]
+        for key in keys:
+            self._close_plot_by_key(key)
+        if hasattr(self, "lbl_env_status"):
+            self.lbl_env_status.setText("Envelope/Kurtogram result cleared.")
+
+    def _calculate_env_bearing_freqs(self):
+        if extract_bearing_fault_frequencies is None:
+            self._err("Bearing frequency backend is not available.")
+            return
+        try:
+            freqs = extract_bearing_fault_frequencies(
+                rpm=float(self.env_rpm_spin.value()),
+                n_balls=int(self.env_balls_spin.value()),
+                d_ball=float(self.env_ball_d_spin.value()),
+                d_pitch=float(self.env_pitch_d_spin.value()),
+                contact_angle=float(self.env_angle_spin.value()),
+            )
+        except Exception as e:
+            self._err(f"Bearing frequency calculation failed:\n{e}")
+            return
+        self._env_bearing_freqs = freqs
+        self.lbl_env_bearing.setText(
+            "Bearing frequencies: " + ", ".join(f"{k}={v:.6g} Hz" for k, v in freqs.items())
+        )
+
+    def _envelope_band_from_ui(self):
+        low = float(self.env_band_low_spin.value())
+        high = float(self.env_band_high_spin.value())
+        if low <= 0.0 and high <= 0.0:
+            return None
+        if high <= low:
+            raise ValueError("Envelope bandpass high frequency must be greater than low frequency.")
+        return (low, high)
+
+    def _start_envelope_diagnostic(self, diagnostic_kind: str):
+        if not _HAVE_ENVELOPE_BACKEND:
+            self._err("Envelope/Kurtogram backend is not available.")
+            return
+        self._sync_envelope_channel_combo()
+        channel = self.cmb_env_channel.currentText().strip() if hasattr(self, "cmb_env_channel") else ""
+        if not channel:
+            self._err("No acceleration channel selected for Envelope/Kurtogram analysis.")
+            return
+        if not self.file_path or not self.file_type:
+            self._err("No data file is loaded.")
+            return
+        fs = float(self.env_fs_spin.value())
+        crop = self.chk_env_crop.isChecked()
+        t0 = float(self.env_t0_spin.value())
+        t1 = float(self.env_t1_spin.value())
+        if crop and t1 <= t0:
+            self._err("Envelope crop end time must be greater than start time.")
+            return
+        try:
+            band = self._envelope_band_from_ui()
+        except ValueError as e:
+            self._err(str(e))
+            return
+        cfg = {
+            "file_path": self.file_path,
+            "file_type": self.file_type,
+            "group_or_sheet": self.cmb_sheet.currentText(),
+            "names": [channel],
+            "fs": fs,
+            "crop": crop,
+            "t0": t0,
+            "t1": t1,
+            "skip_first": False,
+            "mode": "Envelope / Kurtogram",
+            "signal_kind": "acc",
+            "signal_name": "Acceleration",
+            "use_filtered": False,
+            "diagnostic_kind": str(diagnostic_kind),
+            "envelope_band": band,
+            "kurtogram_levels": int(self.env_levels_spin.value()),
+            "bearing_freqs": dict(self._env_bearing_freqs) if isinstance(self._env_bearing_freqs, dict) else None,
+            # Defaults required by shared worker helpers, not used in this diagnostic path.
+            "filter_enabled": False,
+            "filter_type": "Band-pass",
+            "filter_order": 4,
+            "cut1": 0.0,
+            "cut2": 0.0,
+            "nfft": self._get_nfft(),
+            "overlap_pct": float(self.ovl_spin.value()),
+            "out_type": self.cmb_out.currentText(),
+            "scale": self.cmb_scale.currentText(),
+            "amp_conv": self.cmb_amp_conv.currentText(),
+            "window_kind": self.cmb_window_kind.currentText().lower(),
+        }
+        self.lbl_env_status.setText("Envelope/Kurtogram processing in background...")
+        self._start_plot_worker(cfg)
 
     def _build_waterfall_tab_ui(self):
         self.btn_wf_acc_open = QPushButton("Open Acc file (.xlsx / .tdms / .csv)")
